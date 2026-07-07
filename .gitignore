@@ -1,0 +1,4 @@
+.env
+imports/rss/state.json
+imports/rss/runs/
+imports/rss/fulltext/
