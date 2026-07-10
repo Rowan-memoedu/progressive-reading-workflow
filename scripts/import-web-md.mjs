@@ -23,6 +23,21 @@ const csdiyRepoUrl = "https://github.com/PKUFlyingPig/cs-self-learning.git";
 const csdiyRawBase = "https://raw.githubusercontent.com/PKUFlyingPig/cs-self-learning/master/";
 const csPlanRepoUrl = "https://github.com/MingLLuo/CS-Plan.git";
 const csPlanRawBase = "https://raw.githubusercontent.com/MingLLuo/CS-Plan/main/";
+const githubReadableMarkdownExtensions = new Set([".md", ".mdx"]);
+const githubExcludedPathSegments = new Set([
+  ".git",
+  ".github",
+  ".trae",
+  ".vitepress",
+  "node_modules",
+  "dist",
+  "build",
+  "out",
+  "coverage",
+  ".next",
+  ".vite"
+]);
+const githubExcludedFileNames = new Set(["AGENTS.md", "CLAUDE.md"]);
 
 const args = process.argv.slice(2);
 const urls = [];
@@ -64,7 +79,7 @@ if (guidedWechat && outDir === defaultOutDir) {
 }
 
 if (urls.length === 0 && !importCsdiyFull && !importCsPlanFull) {
-  console.error("Usage: npm run import -- <url...> [--out <dir>]\n       npm run import:guided -- <wechat-url...> [--out <dir>] [--staging <dir>] [--instruction <text>]\n       npm run import:csdiy -- [--out <dir>]\n       npm run import:cs-plan -- [--out <dir>]");
+  console.error("Usage: npm run import -- <url...> [--out <dir>] [--instruction <text>]\n       npm run import:guided -- <wechat-url...> [--out <dir>] [--staging <dir>] [--instruction <text>]\n       npm run import:csdiy -- [--out <dir>]\n       npm run import:cs-plan -- [--out <dir>]");
   process.exit(1);
 }
 
@@ -180,7 +195,81 @@ function csdiyRawMarkdownUrl(url) {
   return `${csdiyRawBase}${encodeURI(docPath).replace(/%2F/g, "/")}`;
 }
 
+function githubRepoFromUrl(url) {
+  const parsed = new URL(url);
+  if (parsed.hostname !== "github.com" && parsed.hostname !== "www.github.com") return null;
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  if (parts.length < 2) return null;
+  if (parts[2] && !["tree", "blob"].includes(parts[2])) return null;
+  return { owner: parts[0], repo: parts[1].replace(/\.git$/i, "") };
+}
+
+function githubRepoRootFromUrl(url) {
+  const parsed = new URL(url);
+  if (parsed.hostname !== "github.com" && parsed.hostname !== "www.github.com") return null;
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  if (parts.length !== 2) return null;
+  return { owner: parts[0], repo: parts[1].replace(/\.git$/i, "") };
+}
+
+function isDirectMarkdownUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return /\.mdx?$/i.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function directMarkdownUrlSource(url) {
+  if (!isDirectMarkdownUrl(url)) return null;
+  const { response, text } = await fetchText(url, {
+    "Accept": "text/markdown,text/plain,*/*;q=0.8"
+  });
+  if (!response.ok || !String(text || "").trim() || /^<!doctype html/i.test(String(text || "").trim())) return null;
+  return {
+    method: "direct_markdown_url",
+    markdown: absolutizeMarkdownLinks(text.trim(), url),
+    rawUrl: url,
+    title: titleFromMarkdown(text, path.basename(new URL(url).pathname, path.extname(new URL(url).pathname)))
+  };
+}
+
+async function githubReadmeMarkdown(url) {
+  const repo = githubRepoFromUrl(url);
+  if (!repo) return null;
+  try {
+    const { stdout } = await execFileAsync("gh", [
+      "api",
+      `repos/${repo.owner}/${repo.repo}/readme`
+    ], {
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: 60000,
+      windowsHide: true
+    });
+    const data = JSON.parse(stdout);
+    if (!data?.content || data.encoding !== "base64") throw new Error("github_readme_api_missing_base64_content");
+    const markdown = Buffer.from(String(data.content).replace(/\s+/g, ""), "base64").toString("utf8");
+    if (!markdown.trim()) throw new Error("github_readme_empty");
+    return {
+      method: "github_api_readme",
+      markdown: absolutizeMarkdownLinks(markdown.trim(), data.html_url || url),
+      rawUrl: data.download_url || "",
+      title: titleFromMarkdown(markdown, `${repo.owner}/${repo.repo}`)
+    };
+  } catch (error) {
+    throw new Error(`github_readme_fetch_failed_${repo.owner}/${repo.repo}: ${error.message}`);
+  }
+}
+
 async function trySourceMarkdown(url) {
+  const directMarkdown = await directMarkdownUrlSource(url);
+  if (directMarkdown) return directMarkdown;
+
+  const githubReadme = await githubReadmeMarkdown(url);
+  if (githubReadme) return githubReadme;
+
   const rawUrl = csdiyRawMarkdownUrl(url);
   if (!rawUrl) return null;
 
@@ -968,6 +1057,893 @@ async function ensureGitRepo(cacheName, repoUrl, branch) {
   return { cloneDir, commit: stdout.trim() };
 }
 
+async function ghApiJson(endpoint, options = {}) {
+  try {
+    const { stdout } = await execFileAsync("gh", ["api", endpoint], {
+      encoding: "utf8",
+      maxBuffer: options.maxBuffer || 80 * 1024 * 1024,
+      timeout: options.timeout || 120000,
+      windowsHide: true
+    });
+    return JSON.parse(stdout);
+  } catch (error) {
+    throw new Error(`github_api_failed_${endpoint}: ${error.message}`);
+  }
+}
+
+function encodeGithubPath(filePath) {
+  return String(filePath || "")
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
+function githubBlobUrl(repo, branch, filePath) {
+  return `https://github.com/${repo.owner}/${repo.repo}/blob/${encodeURIComponent(branch)}/${encodeGithubPath(filePath)}`;
+}
+
+function githubRawUrl(repo, branch, filePath) {
+  return `https://raw.githubusercontent.com/${repo.owner}/${repo.repo}/${encodeURIComponent(branch)}/${encodeGithubPath(filePath)}`;
+}
+
+function isReadableGithubMarkdownPath(filePath) {
+  const normalized = String(filePath || "").replace(/\\/g, "/");
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.some((segment) => githubExcludedPathSegments.has(segment))) return false;
+  if (githubExcludedFileNames.has(path.posix.basename(normalized))) return false;
+  return githubReadableMarkdownExtensions.has(path.posix.extname(normalized).toLowerCase());
+}
+
+function isGithubLocaleSegment(segment) {
+  return /^[a-z]{2}(?:-[a-z]{2})?$/i.test(String(segment || ""));
+}
+
+function isGithubChineseLocaleSegment(segment) {
+  return /^zh(?:-|$)/i.test(String(segment || ""));
+}
+
+function preferredGithubChineseLocale(entries) {
+  const localeSegments = entries.flatMap((entry) => entry.path.split("/").filter(isGithubChineseLocaleSegment));
+  if (/繁体|正體|zh[-_]?TW|traditional/i.test(importInstruction) && localeSegments.some((segment) => /^zh-tw$/i.test(segment))) {
+    return "zh-tw";
+  }
+  if (/简体|簡體|zh[-_]?CN|simplified/i.test(importInstruction) && localeSegments.some((segment) => /^zh-cn$/i.test(segment))) {
+    return "zh-cn";
+  }
+  if (localeSegments.some((segment) => /^zh-cn$/i.test(segment))) return "zh-cn";
+  if (localeSegments.some((segment) => /^zh-tw$/i.test(segment))) return "zh-tw";
+  return "";
+}
+
+function shouldPreferGithubChineseSource(entries) {
+  if (/全部语言|所有语言|多语言|all\s+languages/i.test(importInstruction)) return false;
+  if (/中文|中文版|中文原文|不用双语|不要双语|Chinese|zh[-_]?CN|zh[-_]?TW/i.test(importInstruction)) return true;
+  return entries.some((entry) => entry.path.split("/").some(isGithubChineseLocaleSegment));
+}
+
+function chooseGithubMarkdownEntries(entries) {
+  const sorted = entries.slice().sort((a, b) => a.path.localeCompare(b.path));
+  if (!shouldPreferGithubChineseSource(sorted)) {
+    return { entries: sorted, selection: "all_readable_markdown" };
+  }
+
+  const preferredChinese = preferredGithubChineseLocale(sorted);
+  const filtered = sorted.filter((entry) => {
+    const segments = entry.path.split("/");
+    return !segments.some((segment) => {
+      if (!isGithubLocaleSegment(segment)) return false;
+      if (!isGithubChineseLocaleSegment(segment)) return true;
+      return preferredChinese && segment.toLowerCase() !== preferredChinese;
+    });
+  });
+  if (filtered.length) {
+    return { entries: filtered, selection: preferredChinese ? `chinese_source_markdown_${preferredChinese}` : "chinese_source_markdown" };
+  }
+  return { entries: sorted, selection: "all_readable_markdown_no_chinese_locale_found" };
+}
+
+function resolveGithubRelativeTarget(basePath, target) {
+  const value = String(target || "").trim();
+  const hashIndex = value.indexOf("#");
+  const beforeHash = hashIndex >= 0 ? value.slice(0, hashIndex) : value;
+  const hash = hashIndex >= 0 ? value.slice(hashIndex) : "";
+  const queryIndex = beforeHash.indexOf("?");
+  const rawPath = queryIndex >= 0 ? beforeHash.slice(0, queryIndex) : beforeHash;
+  const query = queryIndex >= 0 ? beforeHash.slice(queryIndex) : "";
+  if (!rawPath) return { path: "", suffix: `${query}${hash}` };
+
+  const rootRelative = rawPath.startsWith("/");
+  const baseDir = path.posix.dirname(String(basePath || "").replace(/\\/g, "/"));
+  const joined = rootRelative
+    ? rawPath.replace(/^\/+/, "")
+    : path.posix.join(baseDir === "." ? "" : baseDir, rawPath);
+  const normalized = path.posix.normalize(joined).replace(/^(\.\.\/)+/, "");
+  return { path: normalized, suffix: `${query}${hash}` };
+}
+
+function rewriteGithubMarkdownLinks(markdown, { repo, branch, filePath, importedPaths }) {
+  return String(markdown || "").replace(/(!?\[[^\]]*?\]\()([^) \t\n]+)(\))/g, (match, prefix, target, suffix) => {
+    if (/^(?:[a-z][a-z0-9+.-]*:|#)/i.test(target)) return match;
+    const resolved = resolveGithubRelativeTarget(filePath, target);
+    if (!resolved.path) return match;
+
+    const ext = path.posix.extname(resolved.path).toLowerCase();
+    if (!prefix.startsWith("!") && githubReadableMarkdownExtensions.has(ext) && importedPaths.has(resolved.path)) {
+      return match;
+    }
+
+    const absolute = prefix.startsWith("!")
+      ? githubRawUrl(repo, branch, resolved.path)
+      : githubBlobUrl(repo, branch, resolved.path);
+    return `${prefix}${absolute}${resolved.suffix}${suffix}`;
+  });
+}
+
+async function fetchGithubBlobMarkdown(repo, entry) {
+  const data = await ghApiJson(`repos/${repo.owner}/${repo.repo}/git/blobs/${entry.sha}`, {
+    maxBuffer: 120 * 1024 * 1024
+  });
+  if (!data?.content || data.encoding !== "base64") {
+    throw new Error("github_blob_missing_base64_content");
+  }
+  return Buffer.from(String(data.content).replace(/\s+/g, ""), "base64").toString("utf8");
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function githubRepoDirectoryMap(imported, maxLines = 80) {
+  const groups = new Map();
+  for (const item of imported) {
+    const parts = item.relativePath.split("/");
+    const key = parts.length >= 3 ? `${parts[0]}/${parts[1]}/${parts[2]}` : parts.slice(0, -1).join("/") || ".";
+    groups.set(key, (groups.get(key) || 0) + 1);
+  }
+  return [...groups.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, maxLines)
+    .map(([key, count]) => `- ${key}: ${count} 个文件`)
+    .join("\n");
+}
+
+function githubRepoBriefInput(imported, maxChars = 35000) {
+  const preferred = imported
+    .slice()
+    .sort((a, b) => {
+      const score = (item) => {
+        const lower = item.relativePath.toLowerCase();
+        if (/(^|\/)readme\.mdx?$/.test(lower)) return 0;
+        if (/(^|\/)(index|intro|introduction|guide|quickstart)\.mdx?$/.test(lower)) return 1;
+        if (lower.includes("docs/")) return 2;
+        return 3;
+      };
+      return score(a) - score(b) || a.relativePath.localeCompare(b.relativePath);
+    });
+
+  const parts = [];
+  let length = 0;
+  for (const item of preferred) {
+    const excerpt = textForGuide(item.markdown, 3000);
+    const block = [
+      `FILE: ${item.relativePath}`,
+      `TITLE: ${item.title}`,
+      "",
+      excerpt
+    ].join("\n");
+    if (length + block.length > maxChars) break;
+    parts.push(block);
+    length += block.length;
+  }
+  return parts.join("\n\n---\n\n");
+}
+
+function fallbackGithubRepoBrief({ repo, url, branch, imported, failures, reason = "" }) {
+  const sample = imported.slice(0, 40).map((item, index) => `${index + 1}. ${item.relativePath}`).join("\n");
+  const directoryMap = githubRepoDirectoryMap(imported);
+  return [
+    `# ${repo.owner}/${repo.repo} 项目导读`,
+    "",
+    "## 一句话项目核心",
+    "",
+    `- 这是一个从 GitHub 仓库导入的可读 Markdown 项目材料包，原文已按仓库目录结构落到本地阅读区。`,
+    "",
+    "## 材料地图",
+    "",
+    directoryMap || "- 未能生成目录地图。",
+    "",
+    "代表性文件：",
+    "",
+    sample || "- 未能列出文件。",
+    "",
+    "## 建议阅读顺序",
+    "",
+    "- 先读 README 或入口文档，再按目录进入教程、指南、案例或章节材料。",
+    "",
+    "## 最值得读的部分",
+    "",
+    "- 优先看 README、docs 目录、guide / intro / quickstart 类文件，以及标题最接近当前任务的章节。",
+    "",
+    "## 信息密度与价值判断",
+    "",
+    `- 待人工判断。已导入 ${imported.length} 个 Markdown 文件，失败 ${failures.length} 个。`,
+    "",
+    "## 对当前渐进阅读工作流的用途",
+    "",
+    "- 适合作为项目级材料包进入阅读区，后续可以按文件高亮、批注，再沉淀到 RemNote。",
+    "",
+    "## 导入注意事项",
+    "",
+    `- 仓库链接：${url}`,
+    `- 分支：${branch}`,
+    reason ? `- AI 项目导读生成失败，已使用保底导读：${reason}` : null
+  ].filter(Boolean).join("\n");
+}
+
+function validateGithubRepoBrief(brief) {
+  const required = [
+    "# ",
+    "## 一句话项目核心",
+    "## 材料地图",
+    "## 建议阅读顺序",
+    "## 最值得读的部分",
+    "## 信息密度与价值判断",
+    "## 对当前渐进阅读工作流的用途"
+  ];
+  const missing = required.filter((heading) => !String(brief || "").includes(heading));
+  if (missing.length) throw new Error(`github_repo_brief_missing_sections_${missing.join("_")}`);
+  if (String(brief || "").length < 300) throw new Error("github_repo_brief_too_short");
+}
+
+async function generateGithubRepoBrief({ repo, url, branch, imported, failures }) {
+  if (imported.length > 120) {
+    return {
+      markdown: fallbackGithubRepoBrief({
+        repo,
+        url,
+        branch,
+        imported,
+        failures,
+        reason: `仓库 Markdown 文件较多（${imported.length} 个），为避免导入阻塞，本次跳过 AI 项目导读，使用结构化保底导读。`
+      }),
+      method: "fallback_github_repo_brief_large_repo"
+    };
+  }
+
+  try {
+    const config = await loadProducerConfig();
+    const fileMap = imported.map((item) => `- ${item.relativePath} (${item.title})`).join("\n");
+    const prompt = [
+      "你要为一个即将进入本地渐进阅读区的 GitHub 项目材料包生成一份项目级导读。",
+      "这不是每篇文章的摘要，也不是双语翻译；只生成一份中文项目导读，帮助读者决定怎么读这个仓库里的 Markdown 材料。",
+      "不要补充外部事实，只基于仓库文件名、README 和提供的 Markdown 摘录判断。",
+      "原始材料已有中文版时，不要生成英文附录，不要做双语排版。",
+      "",
+      "必须使用以下 Markdown 结构：",
+      `# ${repo.owner}/${repo.repo} 项目导读`,
+      "## 一句话项目核心",
+      "## 材料地图",
+      "## 建议阅读顺序",
+      "## 最值得读的部分",
+      "## 信息密度与价值判断",
+      "## 对当前渐进阅读工作流的用途",
+      "## 导入注意事项",
+      "",
+      "具体要求：",
+      "- 一句话项目核心：只写 1 句话。",
+      "- 材料地图：按实际目录/文件组织说明这个项目包含哪些可读材料。",
+      "- 建议阅读顺序：给 3-7 步，面向真实阅读和高亮操作。",
+      "- 最值得读的部分：点名具体文件或目录，不要泛泛而谈。",
+      "- 信息密度与价值判断：给 高 / 中 / 低 之一，并说明理由。",
+      "- 对当前渐进阅读工作流的用途：说明它能怎样服务渐进阅读、AI 工作流、RemNote 卡片或学习/产品判断。",
+      "- 导入注意事项：说明这是 GitHub Markdown 全量导入、未下载图片和非 Markdown 附件；如果有失败文件，简要提醒。",
+      "- 不要输出 YAML，不要输出代码块。",
+      "",
+      "用户本次导入补充要求：",
+      importInstruction.trim() || "无",
+      "",
+      `仓库链接：${url}`,
+      `默认分支：${branch}`,
+      `已导入 Markdown 文件数：${imported.length}`,
+      `失败文件数：${failures.length}`,
+      "",
+      "文件地图：",
+      fileMap,
+      "",
+      "关键 Markdown 摘录：",
+      githubRepoBriefInput(imported)
+    ].join("\n");
+
+    const response = await fetch(chatCompletionsUrl(config.AI_PRODUCER_BASE_URL), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${config.AI_PRODUCER_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: config.AI_PRODUCER_MODEL,
+        temperature: 0.2,
+        messages: [
+          { role: "system", content: "你是面向渐进阅读的项目级材料导读编辑，只基于输入材料生成中文导读。" },
+          { role: "user", content: prompt }
+        ]
+      }),
+      signal: AbortSignal.timeout(90000)
+    });
+    if (!response.ok) throw new Error(`api_${response.status}_${(await response.text()).slice(0, 500)}`);
+    const data = await response.json();
+    const brief = stripModelFences(data?.choices?.[0]?.message?.content || "");
+    validateGithubRepoBrief(brief);
+    return { markdown: brief, method: "deepseek_github_repo_brief" };
+  } catch (error) {
+    return {
+      markdown: fallbackGithubRepoBrief({ repo, url, branch, imported, failures, reason: error.message }),
+      method: "fallback_github_repo_brief_after_ai_error"
+    };
+  }
+}
+
+async function importGithubRepoMarkdown(url, repo) {
+  const repoInfo = await ghApiJson(`repos/${repo.owner}/${repo.repo}`);
+  const branch = repoInfo.default_branch;
+  if (!branch) throw new Error("github_repo_missing_default_branch");
+
+  const tree = await ghApiJson(`repos/${repo.owner}/${repo.repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`);
+  const blobs = Array.isArray(tree.tree) ? tree.tree.filter((entry) => entry.type === "blob") : [];
+  const candidateEntries = blobs
+    .filter((entry) => isReadableGithubMarkdownPath(entry.path))
+    .sort((a, b) => a.path.localeCompare(b.path));
+  const { entries: markdownEntries, selection } = chooseGithubMarkdownEntries(candidateEntries);
+  if (!markdownEntries.length) throw new Error("github_repo_no_readable_markdown");
+
+  const targetRoot = path.join(outDir, `${sanitizePathSegment(repo.owner)}-${sanitizePathSegment(repo.repo)}`);
+  await fs.mkdir(targetRoot, { recursive: true });
+  const importedPaths = new Set(markdownEntries.map((entry) => entry.path.replace(/\\/g, "/")));
+  const results = await mapWithConcurrency(markdownEntries, 16, async (entry) => {
+    const relativePath = entry.path.replace(/\\/g, "/");
+    try {
+      const outputPath = path.join(targetRoot, outputRelativePathForDocsFile(relativePath));
+      let original = "";
+      if (await pathExists(outputPath)) {
+        original = await fs.readFile(outputPath, "utf8");
+      } else {
+        original = await fetchGithubBlobMarkdown(repo, entry);
+      }
+      const markdown = rewriteGithubMarkdownLinks(original.trim(), {
+        repo,
+        branch,
+        filePath: relativePath,
+        importedPaths
+      });
+      await fs.mkdir(path.dirname(outputPath), { recursive: true });
+      await fs.writeFile(outputPath, `${markdown}\n`, "utf8");
+      return {
+        ok: true,
+        relativePath,
+        sourceUrl: githubBlobUrl(repo, branch, relativePath),
+        sourceMarkdownUrl: githubRawUrl(repo, branch, relativePath),
+        target: outputPath,
+        title: titleFromMarkdown(original, path.basename(relativePath, path.extname(relativePath))),
+        markdown
+      };
+    } catch (error) {
+      return { ok: false, file: relativePath, reason: error.message };
+    }
+  });
+
+  const imported = results
+    .filter((item) => item?.ok)
+    .map(({ ok, ...item }) => item)
+    .sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  const failures = results
+    .filter((item) => item && !item.ok)
+    .map(({ ok, ...item }) => item)
+    .sort((a, b) => a.file.localeCompare(b.file));
+
+  if (!imported.length) throw new Error(`github_repo_markdown_fetch_failed_all_${failures.map((item) => `${item.file}: ${item.reason}`).join("; ")}`);
+
+  const brief = await generateGithubRepoBrief({ repo, url, branch, imported, failures });
+  const briefPath = path.join(targetRoot, "00 项目导读.md");
+  await fs.writeFile(briefPath, `${brief.markdown.trim()}\n`, "utf8");
+
+  const reportPath = path.join(targetRoot, "IMPORT-REPORT.md");
+  const reportLines = [
+    "# GitHub repo import report",
+    "",
+    `- Source repo: https://github.com/${repo.owner}/${repo.repo}`,
+    `- Default branch: ${branch}`,
+    `- Selection: ${selection}`,
+    `- Candidate markdown files: ${candidateEntries.length}`,
+    `- Imported markdown files: ${imported.length}`,
+    `- Skipped repository blobs: ${Math.max(0, blobs.length - markdownEntries.length)}`,
+    `- Failed markdown files: ${failures.length}`,
+    `- Output directory: ${targetRoot}`,
+    `- Project brief: ${briefPath}`,
+    `- Project brief method: ${brief.method}`,
+    tree.truncated ? "- Warning: GitHub tree response was truncated." : null
+  ].filter(Boolean);
+  if (failures.length) {
+    reportLines.push("", "## Failures", "", ...failures.map((item) => `- ${item.file}: ${item.reason}`));
+  }
+  await fs.writeFile(reportPath, `${reportLines.join("\n")}\n`, "utf8");
+
+  return {
+    url,
+    status: failures.length ? "partial" : "imported",
+    method: "github_repo_markdown_full",
+    target: targetRoot,
+    brief: briefPath,
+    report: reportPath,
+    files: imported.length,
+    skipped: Math.max(0, blobs.length - markdownEntries.length),
+    candidate_files: candidateEntries.length,
+    failures: failures.length,
+    default_branch: branch,
+    selection,
+    brief_method: brief.method
+  };
+}
+
+function easyVibeSiteFromUrl(url) {
+  const parsed = new URL(url);
+  if (parsed.hostname !== "datawhalechina.github.io") return null;
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  if (parts[0] !== "easy-vibe") return null;
+  const locale = (parts[1] || "zh-cn").toLowerCase();
+  if (!/^zh-cn$/i.test(locale)) return null;
+  if (/\.mdx?$/i.test(parsed.pathname)) return null;
+  return {
+    locale,
+    siteRoot: `https://datawhalechina.github.io/easy-vibe/${locale}/`,
+    publicBase: `https://datawhalechina.github.io/easy-vibe`,
+    routePrefix: `/${locale}/`
+  };
+}
+
+function normalizeEasyVibeRoute(value, site) {
+  if (!value) return "";
+  let route = String(value)
+    .replace(/&quot;/g, "\"")
+    .replace(/&amp;/g, "&")
+    .replace(/\\u002F/g, "/")
+    .trim();
+  if (/^https?:\/\//i.test(route)) {
+    try {
+      const parsed = new URL(route);
+      if (parsed.hostname !== "datawhalechina.github.io") return "";
+      route = parsed.pathname;
+    } catch {
+      return "";
+    }
+  }
+  route = route.split("#")[0].split("?")[0];
+  if (route.startsWith("/easy-vibe/")) route = route.slice("/easy-vibe".length);
+  if (!route.startsWith(site.routePrefix)) return "";
+  if (/\.(?:png|jpe?g|gif|svg|webp|css|js|json|ico|woff2?)$/i.test(route)) return "";
+  route = route.replace(/\/index\.html\/?$/i, "/");
+  route = route.replace(/\.html\/?$/i, "/");
+  if (!route.endsWith("/") && !route.endsWith(".html") && !/\/[^/]+$/i.test(route)) return "";
+  if (!route.endsWith("/")) route = `${route}/`;
+  return route || site.routePrefix;
+}
+
+function extractEasyVibeRoutes(html, site) {
+  const routes = new Set([site.routePrefix]);
+  const text = String(html || "");
+  const patterns = [
+    /href="([^"]+)"/g,
+    /"link":"([^"]+)"/g,
+    /"link":"(\\\/[^"]+)"/g
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const route = normalizeEasyVibeRoute(match[1], site);
+      if (route) routes.add(route);
+    }
+  }
+  return [...routes].sort((a, b) => a.localeCompare(b));
+}
+
+async function fetchEasyVibeSitemapRoutes(site) {
+  try {
+    const sitemapUrl = `${site.publicBase}/sitemap.xml`;
+    const { response, text } = await fetchText(sitemapUrl, {
+      "Accept": "application/xml,text/xml,text/plain,*/*;q=0.8"
+    });
+    if (!response.ok) return [];
+    const routes = new Set();
+    for (const match of String(text || "").matchAll(/<loc>\s*([^<]+?)\s*<\/loc>/gi)) {
+      const route = normalizeEasyVibeRoute(match[1], site);
+      if (route) routes.add(route);
+    }
+    return [...routes].sort((a, b) => a.localeCompare(b));
+  } catch {
+    return [];
+  }
+}
+
+function easyVibeMarkdownCandidates(route, site) {
+  let normalized = route.replace(/\/index\.html\/?$/i, "/");
+  normalized = normalized.replace(/\.html\/?$/i, "");
+  normalized = normalized.replace(/\/+$/g, "");
+  if (!normalized || normalized === `/${site.locale}`) {
+    return [`${site.publicBase}/${site.locale}/index.md`];
+  }
+  const withoutPrefix = normalized.replace(new RegExp(`^/${site.locale}/?`), "");
+  if (!withoutPrefix) return [`${site.publicBase}/${site.locale}/index.md`];
+  const base = `${site.publicBase}/${site.locale}/${withoutPrefix}`;
+  return [`${base}/index.md`, `${base}.md`];
+}
+
+const easyVibeHumanDirs = {
+  stage1: "01 零基础入门",
+  stage2: "02 初中级开发",
+  stage3: "03 高级开发",
+  appendix: "04 附录",
+  stories: "05 用户故事",
+  other: "99 其他",
+  introduction: "00 项目介绍.md",
+  overview: "00 概览.md",
+  learningMap: "00 学习地图.md",
+  stage2Groups: {
+    frontend: "01 前端开发",
+    backend: "02 后端开发",
+    assignments: "03 大作业",
+    "ai-capabilities": "04 AI 能力扩展"
+  },
+  stage3Groups: {
+    "core-skills": "01 核心技能",
+    "cross-platform": "02 多平台开发",
+    "personal-brand": "03 个人品牌",
+    "ai-advanced": "04 AI 能力附录"
+  },
+  appendixGroups: {
+    "1-computer-fundamentals": "01 计算机是怎么回事",
+    "2-development-tools": "02 开发环境与工具",
+    "3-browser-and-frontend": "03 浏览器与前端",
+    "4-server-and-backend": "04 服务器与后端",
+    "5-data": "05 数据",
+    "6-architecture-and-system-design": "06 架构与系统设计",
+    "7-infrastructure-and-operations": "07 基础设施与运维",
+    "8-artificial-intelligence": "08 人工智能",
+    "9-engineering-excellence": "09 工程素养"
+  }
+};
+
+function easyVibeFlattenIndex(parts) {
+  const copy = [...parts];
+  const last = copy.pop();
+  if (last === "index.md") {
+    const base = copy.pop();
+    return [...copy, `${base}.md`];
+  }
+  return parts;
+}
+
+function easyVibeHumanRelativePath(relativePath) {
+  const parts = relativePath.replace(/\\/g, "/").split("/").filter(Boolean);
+  const dirs = easyVibeHumanDirs;
+  if (parts[0] === "stage-1") {
+    if (parts.length === 3 && parts[2] === "index.md") {
+      return path.join(dirs.stage1, parts[1] === "learning-map" ? dirs.learningMap : `${parts[1]}.md`);
+    }
+    return path.join(dirs.stage1, ...easyVibeFlattenIndex(parts.slice(1)));
+  }
+  if (parts[0] === "stage-2") {
+    if (parts.length === 2 && parts[1] === "index.md") return path.join(dirs.stage2, dirs.overview);
+    return path.join(dirs.stage2, dirs.stage2Groups[parts[1]] || parts[1], ...easyVibeFlattenIndex(parts.slice(2)));
+  }
+  if (parts[0] === "stage-3") {
+    if (parts.length === 2 && parts[1] === "index.md") return path.join(dirs.stage3, dirs.overview);
+    return path.join(dirs.stage3, dirs.stage3Groups[parts[1]] || parts[1], ...easyVibeFlattenIndex(parts.slice(2)));
+  }
+  if (parts[0] === "appendix") {
+    if (parts.length === 2 && parts[1] === "index.md") return path.join(dirs.appendix, dirs.overview);
+    return path.join(dirs.appendix, dirs.appendixGroups[parts[1]] || parts[1], ...easyVibeFlattenIndex(parts.slice(2)));
+  }
+  if (parts[0] === "vibe-stories") return path.join(dirs.stories, ...easyVibeFlattenIndex(parts.slice(1)));
+  if (parts[0] === "guide" && parts[1] === "introduction.md") return dirs.introduction;
+  if (parts[0] === "guide") return path.join(dirs.other, ...easyVibeFlattenIndex(parts));
+  return path.join(dirs.other, ...easyVibeFlattenIndex(parts));
+}
+
+function easyVibeOutputRelativePath(route, mdUrl, site) {
+  const parsed = new URL(mdUrl);
+  let relative = decodeURIComponent(parsed.pathname)
+    .replace(/^\/easy-vibe\//, "")
+    .replace(new RegExp(`^${site.locale}/?`), "");
+  if (!relative) relative = "index.md";
+  return outputRelativePathForDocsFile(easyVibeHumanRelativePath(relative));
+}
+
+function transformMarkdownOutsideCodeFences(markdown, transform) {
+  const text = String(markdown || "");
+  const fencePattern = /^ {0,3}```[\s\S]*?^ {0,3}```[^\n]*\n?/gm;
+  let result = "";
+  let cursor = 0;
+  for (const match of text.matchAll(fencePattern)) {
+    result += transform(text.slice(cursor, match.index));
+    result += match[0];
+    cursor = match.index + match[0].length;
+  }
+  result += transform(text.slice(cursor));
+  return result;
+}
+
+function reportNumber(report, label) {
+  const escaped = String(label).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(report || "").match(new RegExp(`- ${escaped}:\\s*(\\d+)`, "i"));
+  return match ? Number(match[1]) : 0;
+}
+
+function cleanEasyVibeMarkdown(markdown) {
+  const withoutFrontmatter = String(markdown || "")
+    .replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---\s*/, "");
+  return transformMarkdownOutsideCodeFences(withoutFrontmatter, (part) => part
+    .replace(/<script\s+setup[^>]*>[\s\S]*?<\/script>\s*/gi, "")
+    .replace(/<ClientOnly>[\s\S]*?<\/ClientOnly>\s*/gi, "")
+    .replace(/<RelatedArticles[^>]*\/>\s*/gi, "")
+    .replace(/<[A-Z][A-Za-z0-9]*\b[^>]*\/>\s*/g, "")
+    .replace(/<\/?[A-Z][A-Za-z0-9]*\b[^>]*>\s*/g, "\n"))
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+async function archiveStaleEasyVibeOutput(targetRoot, relativePath, reason) {
+  const stalePath = path.join(targetRoot, relativePath);
+  try {
+    await fs.access(stalePath);
+  } catch {
+    return "";
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const archiveRoot = path.join(workflowRoot, "imports", "web", "easy-vibe-stale", stamp);
+  const archivePath = path.join(archiveRoot, relativePath);
+  await fs.mkdir(path.dirname(archivePath), { recursive: true });
+  await fs.rename(stalePath, archivePath);
+  const notePath = path.join(archiveRoot, "STALE-REASON.txt");
+  await fs.writeFile(notePath, `${reason}\nSource output: ${stalePath}\nArchived file: ${archivePath}\n`, "utf8");
+  return archivePath;
+}
+
+async function fetchEasyVibeMarkdownForRoute(route, site) {
+  const candidates = easyVibeMarkdownCandidates(route, site);
+  const attempts = [];
+  for (const mdUrl of candidates) {
+    try {
+      const { response, text } = await fetchText(mdUrl, {
+        "Accept": "text/markdown,text/plain,*/*;q=0.8"
+      });
+      attempts.push(`${mdUrl} -> ${response.status}`);
+      const trimmed = String(text || "").trim();
+      if (response.ok && trimmed && !/^<!doctype html/i.test(trimmed)) {
+        return { route, mdUrl, markdown: cleanEasyVibeMarkdown(trimmed) };
+      }
+    } catch (error) {
+      attempts.push(`${mdUrl} -> ${error.message}`);
+    }
+  }
+  throw new Error(`no_markdown_download_found: ${attempts.join("; ")}`);
+}
+
+function easyVibeSiteBrief({ url, site, imported, failures }) {
+  const groups = new Map();
+  for (const item of imported) {
+    const parts = item.relativePath.replace(/\\/g, "/").split("/");
+    const key = parts.length >= 2 ? parts.slice(0, 2).join("/") : ".";
+    groups.set(key, (groups.get(key) || 0) + 1);
+  }
+  const mapLines = [...groups.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([key, count]) => `- ${key}: ${count} 个文件`);
+  const samples = imported.slice(0, 50).map((item, index) => `${index + 1}. ${item.relativePath}`).join("\n");
+  return [
+    "# Easy-Vibe 站点导读",
+    "",
+    "## 一句话项目核心",
+    "",
+    "- 这是 Easy-Vibe 简体中文站点按公开 Markdown 下载入口导入的本地阅读材料包，结构更接近网站目录，而不是 GitHub 仓库源码目录。",
+    "",
+    "## 材料地图",
+    "",
+    ...mapLines,
+    "",
+    "## 建议阅读顺序",
+    "",
+    "- 先读 `index.md` 和 `stage-1`，建立 Vibe Coding 的学习地图。",
+    "- 再读 `stage-2` 的前端、后端和综合项目，抽取可复用工作流。",
+    "- 最后按需进入 `stage-3` 与 `appendix`，把工具、工程、AI 能力和系统设计拆成卡片。",
+    "",
+    "## 代表性文件",
+    "",
+    samples || "- 未能列出文件。",
+    "",
+    "## 导入注意事项",
+    "",
+    `- 来源站点：${url}`,
+    `- 语言：${site.locale}`,
+    `- 成功导入：${imported.length} 个 Markdown`,
+    `- 失败：${failures.length} 个`,
+    "- 本次通过站点公开 Markdown 下载入口导入；没有使用 GitHub repo tree/API 反查。",
+    "- 原文文件已清理 VitePress frontmatter、script setup 和 RelatedArticles 组件，便于直接阅读。"
+  ].join("\n");
+}
+
+async function importEasyVibeSiteMarkdown(url, site) {
+  let siteHtml = "";
+  let siteFetchError = "";
+  try {
+    const { response, text } = await fetchText(site.siteRoot);
+    if (response.ok) {
+      siteHtml = text;
+    } else {
+      siteFetchError = `easy_vibe_site_http_${response.status}`;
+    }
+  } catch (error) {
+    siteFetchError = error.message;
+  }
+  const routes = [...new Set([
+    ...await fetchEasyVibeSitemapRoutes(site),
+    ...extractEasyVibeRoutes(siteHtml, site)
+  ])].sort((a, b) => a.localeCompare(b));
+  if (!routes.length) throw new Error(siteFetchError ? `easy_vibe_no_routes_found: ${siteFetchError}` : "easy_vibe_no_routes_found");
+
+  const targetRoot = path.join(outDir, `easy-vibe-${site.locale}-site`);
+  await fs.mkdir(targetRoot, { recursive: true });
+  const results = await mapWithConcurrency(routes, 16, async (route) => {
+    try {
+      if (route === site.routePrefix) {
+        const relativePath = "index.md";
+        const archived = await archiveStaleEasyVibeOutput(targetRoot, relativePath, "root_home_page_has_no_readable_markdown_body");
+        return {
+          ok: false,
+          skipped: true,
+          route,
+          mdUrl: `${site.publicBase}/${site.locale}/index.md`,
+          relativePath,
+          reason: "root_home_page_has_no_readable_markdown_body",
+          archived
+        };
+      }
+      const item = await fetchEasyVibeMarkdownForRoute(route, site);
+      const relativePath = easyVibeOutputRelativePath(route, item.mdUrl, site);
+      if (!item.markdown) {
+        const archived = await archiveStaleEasyVibeOutput(targetRoot, relativePath, "empty_markdown_after_cleaning");
+        return {
+          ok: false,
+          skipped: true,
+          route,
+          mdUrl: item.mdUrl,
+          relativePath,
+          reason: "empty_markdown_after_cleaning",
+          archived
+        };
+      }
+      const outputPath = path.join(targetRoot, relativePath);
+      const pageUrl = new URL(route.replace(/^\//, ""), site.publicBase.endsWith("/") ? site.publicBase : `${site.publicBase}/`).toString();
+      const markdown = absolutizeMarkdownLinks(item.markdown, pageUrl);
+      await fs.mkdir(path.dirname(outputPath), { recursive: true });
+      await fs.writeFile(outputPath, `${markdown.trim()}\n`, "utf8");
+      return {
+        ok: true,
+        route,
+        mdUrl: item.mdUrl,
+        relativePath,
+        target: outputPath,
+        title: titleFromMarkdown(markdown, path.basename(relativePath, path.extname(relativePath))),
+        markdown
+      };
+    } catch (error) {
+      return { ok: false, route, reason: error.message };
+    }
+  });
+
+  const imported = results
+    .filter((item) => item?.ok)
+    .map(({ ok, ...item }) => item)
+    .sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  const skipped = results
+    .filter((item) => item?.skipped)
+    .map(({ skipped: _skipped, ...item }) => item)
+    .sort((a, b) => a.route.localeCompare(b.route));
+  const failures = results
+    .filter((item) => item && !item.ok && !item.skipped)
+    .map(({ ok, ...item }) => item)
+    .sort((a, b) => a.route.localeCompare(b.route));
+
+  const briefPath = path.join(targetRoot, "00 站点导读.md");
+  const reportPath = path.join(targetRoot, "IMPORT-REPORT.md");
+
+  if (!imported.length) {
+    const existingFiles = await listMarkdownFiles(targetRoot).catch(() => []);
+    const existingReadableFiles = existingFiles.filter((file) => {
+      const name = path.basename(file);
+      return name !== "IMPORT-REPORT.md" && !name.startsWith("00 ");
+    });
+    const existingReport = await fs.readFile(reportPath, "utf8").catch(() => "");
+    if (existingReadableFiles.length && existingReport.includes("vitepress_site_markdown_download")) {
+      return {
+        url,
+        status: "imported",
+        method: "vitepress_site_markdown_download",
+        target: targetRoot,
+        brief: briefPath,
+        report: reportPath,
+        files: reportNumber(existingReport, "Imported markdown files") || existingReadableFiles.length,
+        routes: reportNumber(existingReport, "Routes found") || routes.length,
+        failures: reportNumber(existingReport, "Failed routes"),
+        skipped: reportNumber(existingReport, "Skipped non-readable routes") || skipped.length,
+        locale: site.locale,
+        cached: true,
+        note: "used_existing_easy_vibe_site_output_after_fetch_failure"
+      };
+    }
+    throw new Error(`easy_vibe_markdown_fetch_failed_all_${failures.map((item) => `${item.route}: ${item.reason}`).join("; ")}`);
+  }
+
+  await fs.writeFile(briefPath, `${easyVibeSiteBrief({ url, site, imported, failures })}\n`, "utf8");
+
+  const reportLines = [
+    "# Easy-Vibe site Markdown import report",
+    "",
+    `- Source site: ${url}`,
+    `- Site root: ${site.siteRoot}`,
+    `- Method: vitepress_site_markdown_download`,
+    `- Routes found: ${routes.length}`,
+    `- Imported markdown files: ${imported.length}`,
+    `- Skipped non-readable routes: ${skipped.length}`,
+    `- Failed routes: ${failures.length}`,
+    `- Output directory: ${targetRoot}`,
+    `- Site brief: ${briefPath}`,
+    "",
+    "## Notes",
+    "",
+    "- Imported from public site Markdown download endpoints.",
+    "- Did not use GitHub repo tree/API fallback.",
+    "- VitePress frontmatter and local component wrappers were cleaned for reading."
+  ];
+  if (failures.length) {
+    reportLines.push("", "## Failures", "", ...failures.map((item) => `- ${item.route}: ${item.reason}`));
+  }
+  if (skipped.length) {
+    reportLines.push(
+      "",
+      "## Skipped non-readable routes",
+      "",
+      ...skipped.map((item) => {
+        const archived = item.archived ? `; archived stale file: ${item.archived}` : "";
+        return `- ${item.route}: ${item.reason}${archived}`;
+      })
+    );
+  }
+  await fs.writeFile(reportPath, `${reportLines.join("\n")}\n`, "utf8");
+
+  return {
+    url,
+    status: failures.length ? "partial" : "imported",
+    method: "vitepress_site_markdown_download",
+    target: targetRoot,
+    brief: briefPath,
+    report: reportPath,
+    files: imported.length,
+    routes: routes.length,
+    failures: failures.length,
+    skipped: skipped.length,
+    locale: site.locale
+  };
+}
+
 async function listMarkdownFiles(dir) {
   const entries = await fs.readdir(dir, { withFileTypes: true });
   const files = [];
@@ -1178,6 +2154,18 @@ for (const url of urls) {
   try {
     if (guidedWechat) {
       summary.push(await importGuidedWechatUrl(url));
+      continue;
+    }
+
+    const easyVibeSite = easyVibeSiteFromUrl(url);
+    if (easyVibeSite) {
+      summary.push(await importEasyVibeSiteMarkdown(url, easyVibeSite));
+      continue;
+    }
+
+    const githubRepo = githubRepoRootFromUrl(url);
+    if (githubRepo) {
+      summary.push(await importGithubRepoMarkdown(url, githubRepo));
       continue;
     }
 

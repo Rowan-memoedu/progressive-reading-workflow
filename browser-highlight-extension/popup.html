@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local IR</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    body {
+      width: 360px;
+      margin: 0;
+      padding: 14px;
+      color: #1d2430;
+      background: #f7f8fa;
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 16px;
+      line-height: 1.3;
+      font-weight: 650;
+    }
+    label {
+      display: block;
+      margin: 10px 0 5px;
+      font-size: 12px;
+      font-weight: 650;
+      color: #344054;
+    }
+    input[type="number"] {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #c9d0dc;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: 13px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+      background: #fff;
+    }
+    .switch {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin: 10px 0;
+      padding: 10px;
+      border: 1px solid #d9dee7;
+      border-radius: 8px;
+      background: #fff;
+    }
+    .switch span {
+      font-size: 13px;
+      font-weight: 650;
+    }
+    .hint {
+      margin: 6px 0 0;
+      color: #667085;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .meta {
+      display: grid;
+      gap: 3px;
+      margin: -4px 0 10px;
+      color: #667085;
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    button {
+      min-height: 32px;
+      border: 1px solid #1f5fbf;
+      border-radius: 6px;
+      padding: 0 10px;
+      background: #1f5fbf;
+      color: #fff;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button.secondary {
+      border-color: #c9d0dc;
+      background: #fff;
+      color: #1d2430;
+    }
+    button:disabled {
+      opacity: .6;
+      cursor: wait;
+    }
+    #status {
+      margin-top: 12px;
+      min-height: 34px;
+      border: 1px solid #d9dee7;
+      border-radius: 8px;
+      padding: 9px 10px;
+      background: #fff;
+      color: #344054;
+      font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <h1>Local IR Browser Highlight</h1>
+  <div class="meta">
+    <span id="version">v0.2.0</span>
+    <span>目录：browser-highlight-extension</span>
+  </div>
+  <label for="port">本地服务端口</label>
+  <input id="port" type="number" min="1" max="65535" step="1" value="37829">
+  <p class="hint">先在渐进阅读工作流目录运行 <code>npm run app</code>。插件会自动探测 37829-37849；这里也可以手动指定端口。</p>
+
+  <div class="switch">
+    <span>高亮模式</span>
+    <input id="enabled" type="checkbox">
+  </div>
+
+  <div class="buttons">
+    <button id="health" class="secondary">健康检查</button>
+    <button id="diagnose" class="secondary">运行诊断</button>
+    <button id="openTest" class="secondary">打开测试页</button>
+    <button id="importPage" class="secondary">导入当前页</button>
+    <button id="retryFailed">重试暂存</button>
+  </div>
+
+  <div id="status">popup HTML 已加载，等待脚本。</div>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -9,6 +9,9 @@
     "import:csdiy": "node scripts/import-web-md.mjs --csdiy-full",
     "import:cs-plan": "node scripts/import-web-md.mjs --cs-plan-full",
     "import:guided": "node scripts/import-web-md.mjs --guided-wechat",
+    "browser-highlight:sync-lib": "node scripts/sync-browser-highlight-extension.mjs",
+    "browser-highlight:test": "node scripts/test-browser-highlight-workflow.mjs",
+    "browser-highlight:check": "node scripts/sync-browser-highlight-extension.mjs && node --check scripts/progressive-reading-app.mjs && node --check browser-highlight-extension/background.js && node --check browser-highlight-extension/content.js && node --check browser-highlight-extension/popup.js && node --check scripts/test-browser-highlight-workflow.mjs && node scripts/check-browser-highlight-extension.mjs && node scripts/test-browser-highlight-workflow.mjs",
     "readwise:setup": "node scripts/setup-readwise-official-plugin.mjs",
     "readwise:migrate": "node scripts/migrate-readwise-obsidian.mjs",
     "readwise:migrate:dry": "node scripts/migrate-readwise-obsidian.mjs --dry-run",
@@ -41,6 +44,7 @@
     "rss-parser": "^3.13.0",
     "sanitize-filename": "^1.6.3",
     "turndown": "^7.2.0",
-    "turndown-plugin-gfm": "^1.0.2"
+    "turndown-plugin-gfm": "^1.0.2",
+    "web-highlighter": "^0.7.4"
   }
 }

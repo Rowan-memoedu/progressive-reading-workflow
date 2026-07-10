@@ -7,7 +7,7 @@ import { loadProducerConfig, resolvePackageData } from "./resolve-qa-queue.mjs";
 const DEFAULT_QUEUE_DIR = "RemNote 导出队列";
 const DEFAULT_MCP_URL = "http://127.0.0.1:3001/mcp";
 const PARENT_TITLE = "渐进阅读导入队列";
-const TARGET_DOCUMENTS = ["普通评论", "迷思 / 真相", "引用", "联想", "优化", "问答卡", "挖空卡"];
+const TARGET_DOCUMENTS = ["普通评论", "迷思 / 真相", "引用", "联想", "优化", "例子与观点", "问答卡", "挖空卡"];
 
 const args = parseArgs(process.argv.slice(2));
 const root = process.cwd();
@@ -142,6 +142,24 @@ async function createAnnotationNode(client, parentId, data, annotation) {
 
 function renderAnnotationContent(data, annotation) {
   const currentText = annotation.expandedText || annotation.currentText || annotation.originalText || "";
+  if (annotation.type === "example_viewpoint" || annotation.targetDocument === "例子与观点") {
+    const lines = [
+      "- 例子",
+      ...indentedText(currentText),
+      "- 观点",
+      ...indentedText(annotation.commentMarkdown || "待补充"),
+      "- 原文高亮文本",
+      ...indentedText(annotation.originalText || annotation.currentText || ""),
+      "- 对应英文原文",
+      ...indentedText(annotation.bilingual?.englishText || "无"),
+      `- 来源文章：${data.title}`,
+      `- Obsidian source path：${data.sourcePath}`
+    ];
+    if (annotation.bilingual?.detected) lines.push(`- bilingualConfidence：${annotation.bilingual.confidence || "none"}`);
+    if (annotation.bilingual?.needsApiResolution) lines.push("- bilingualNeedsApiResolution：true");
+    if (annotation.orphaned) lines.push("- orphaned：true");
+    return lines.join("\n");
+  }
   const lines = [
     "- 摘录 / 当前文本",
     ...indentedText(currentText),
@@ -352,6 +370,7 @@ function normalizeTargetDocument(value) {
   if (value === "引用" || value === "sample_quote") return "引用";
   if (value === "联想" || value === "add_viewpoint") return "联想";
   if (value === "优化" || value === "optimize") return "优化";
+  if (value === "例子与观点" || value === "example_viewpoint") return "例子与观点";
   return "普通评论";
 }
 

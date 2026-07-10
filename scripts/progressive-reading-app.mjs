@@ -3,8 +3,12 @@ import { createReadStream } from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { JSDOM } from "jsdom";
+import { Readability } from "@mozilla/readability";
+import TurndownService from "turndown";
+import { gfm } from "turndown-plugin-gfm";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const workflowRoot = path.resolve(__dirname, "..");
@@ -14,10 +18,18 @@ const localTranscribeScript = path.join(__dirname, "local-whispercpp-transcribe.
 const readingRoot = path.join(workflowRoot, "阅读区");
 const importsRoot = path.join(workflowRoot, "imports");
 const appRunsRoot = path.join(importsRoot, "app-runs");
+const browserHighlightRoot = path.join(readingRoot, "浏览器高亮");
 const defaultPort = Number(process.env.PROGRESSIVE_READING_APP_PORT || 37829);
 const producerConfigDir = path.join(process.env.USERPROFILE || process.env.HOME || "", "Documents", "New project");
 const producerConfigKeys = ["AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL"];
 const jobs = new Map();
+
+const browserTurndown = new TurndownService({
+  headingStyle: "atx",
+  bulletListMarker: "-",
+  codeBlockStyle: "fenced"
+});
+browserTurndown.use(gfm);
 
 function nowIso() {
   return new Date().toISOString();
@@ -37,6 +49,44 @@ function safeName(value, fallback = "untitled") {
 
 function yamlString(value) {
   return JSON.stringify(String(value ?? ""));
+}
+
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type"
+  };
+}
+
+function shortHash(value, length = 10) {
+  return createHash("sha256").update(String(value || "")).digest("hex").slice(0, length);
+}
+
+function normalizeMarkdownText(value, maxChars = 200000) {
+  return String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\u0000/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{4,}/g, "\n\n\n")
+    .trim()
+    .slice(0, maxChars);
+}
+
+function highlightMarkdown(value) {
+  const text = normalizeMarkdownText(value, 60000).replace(/==/g, "＝");
+  return text
+    .split(/\n{2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => `==${part}==`)
+    .join("\n\n");
+}
+
+function quoteMarkdown(value) {
+  const text = normalizeMarkdownText(value, 8000);
+  if (!text) return "";
+  return text.split(/\n/).map((line) => `> ${line}`).join("\n");
 }
 
 function cleanToolMessage(value) {
@@ -101,7 +151,7 @@ function chatCompletionsUrl(baseUrl) {
 function stripModelFences(text) {
   return String(text || "")
     .trim()
-    .replace(/^```(?:markdown|md)?\s*/i, "")
+    .replace(/^```(?:json|markdown|md)?\s*/i, "")
     .replace(/\s*```$/i, "")
     .trim();
 }
@@ -126,6 +176,161 @@ function instructionFromText(text, urls) {
     instruction = instruction.replaceAll(url, " ");
   }
   return instruction.replace(/\s+/g, " ").trim();
+}
+
+function classifyUrl(url) {
+  try {
+    if (isWechatUrl(url)) return "wechat";
+    if (isYouTubeUrl(url)) return "youtube";
+    if (isBilibiliUrl(url)) return "bilibili";
+    return "web";
+  } catch {
+    return "web";
+  }
+}
+
+function fallbackIntent(instruction, urls, reason = "") {
+  const text = String(instruction || "");
+  const wantsNoGuide = /不要.*导读|无需.*导读|no\s+guide/i.test(text);
+  const wantsBilingual = /双语|英文附录|中英|bilingual|English Appendix/i.test(text);
+  const wantsExternalLinks = /外链|链接.*也.*导入|递归|include.*links/i.test(text);
+  const directOnly = /只需要.*直接阅读|只要.*可读|不要.*外链|direct.*only/i.test(text);
+  return {
+    schema: "progressive-reading-import-intent/v1",
+    source: reason ? "fallback_after_ai_error" : "fallback_rules",
+    parseError: reason || "",
+    action: "import_reading_material",
+    outputTarget: "reading_area",
+    urlCount: urls.length,
+    urlTypes: [...new Set(urls.map(classifyUrl))],
+    processing: {
+      generateReadingGuide: !wantsNoGuide,
+      cleanMarkdown: true,
+      preserveOriginal: true,
+      languageMode: wantsBilingual ? "zh_main_en_appendix" : "source_body_with_chinese_guide",
+      guideStyle: "core_insights_value_density_pain_points_urgency",
+      linkPolicy: wantsExternalLinks && !directOnly ? "include_direct_readable_external_links" : "direct_urls_only"
+    },
+    userNotes: text,
+    warnings: reason ? [`AI 意图解析失败，已按默认规则继续：${reason}`] : []
+  };
+}
+
+function normalizeIntent(candidate, instruction, urls) {
+  const fallback = fallbackIntent(instruction, urls);
+  const value = candidate && typeof candidate === "object" ? candidate : {};
+  const processing = value.processing && typeof value.processing === "object" ? value.processing : {};
+  const allowedLanguageModes = new Set(["source_body_with_chinese_guide", "zh_main_en_appendix", "zh_only"]);
+  const allowedLinkPolicies = new Set(["direct_urls_only", "include_direct_readable_external_links", "skip_external_links"]);
+  const intent = {
+    ...fallback,
+    source: value.source || "deepseek",
+    action: value.action === "import_reading_material" ? value.action : fallback.action,
+    outputTarget: value.outputTarget === "reading_area" ? value.outputTarget : fallback.outputTarget,
+    urlCount: urls.length,
+    urlTypes: [...new Set(urls.map(classifyUrl))],
+    processing: {
+      ...fallback.processing,
+      generateReadingGuide: typeof processing.generateReadingGuide === "boolean" ? processing.generateReadingGuide : fallback.processing.generateReadingGuide,
+      cleanMarkdown: processing.cleanMarkdown !== false,
+      preserveOriginal: processing.preserveOriginal !== false,
+      languageMode: allowedLanguageModes.has(processing.languageMode) ? processing.languageMode : fallback.processing.languageMode,
+      guideStyle: String(processing.guideStyle || fallback.processing.guideStyle).slice(0, 160),
+      linkPolicy: allowedLinkPolicies.has(processing.linkPolicy) ? processing.linkPolicy : fallback.processing.linkPolicy
+    },
+    userNotes: String(value.userNotes || instruction || "").slice(0, 2000),
+    warnings: Array.isArray(value.warnings) ? value.warnings.map((item) => String(item).slice(0, 300)).slice(0, 8) : []
+  };
+  if (fallback.processing.languageMode === "zh_main_en_appendix") {
+    intent.processing.languageMode = "zh_main_en_appendix";
+  }
+  if (fallback.processing.linkPolicy !== "direct_urls_only") {
+    intent.processing.linkPolicy = fallback.processing.linkPolicy;
+  }
+  if (fallback.processing.generateReadingGuide === false) {
+    intent.processing.generateReadingGuide = false;
+  }
+  return intent;
+}
+
+async function parseImportIntent({ instruction, urls }) {
+  if (!String(instruction || "").trim()) return fallbackIntent("", urls);
+  const classifiedUrls = urls.map((url) => ({ url, type: classifyUrl(url) }));
+  const prompt = [
+    "你要把用户在本地渐进阅读导入网页中输入的自然语言要求解析成结构化 JSON。",
+    "你只负责理解意图，不执行文件操作，不添加外部事实，不决定不存在的能力。",
+    "返回必须是纯 JSON 对象，不要 Markdown，不要解释。",
+    "",
+    "JSON schema:",
+    JSON.stringify({
+      schema: "progressive-reading-import-intent/v1",
+      action: "import_reading_material",
+      outputTarget: "reading_area",
+      processing: {
+        generateReadingGuide: true,
+        cleanMarkdown: true,
+        preserveOriginal: true,
+        languageMode: "source_body_with_chinese_guide | zh_main_en_appendix | zh_only",
+        guideStyle: "core_insights_value_density_pain_points_urgency",
+        linkPolicy: "direct_urls_only | include_direct_readable_external_links | skip_external_links"
+      },
+      userNotes: "保留用户额外要求的中文短句",
+      warnings: ["如果用户要求当前系统不支持的事情，在这里写明"]
+    }, null, 2),
+    "",
+    "当前系统能力边界：",
+    "- 可以导入用户直接提供的 URL。",
+    "- 可以生成阅读前置卡。",
+    "- 可以把微信和普通网页输出为阅读区 Markdown。",
+    "- 视频工作流当前暂停，不要承诺视频转写。",
+    "- 不绕过登录、验证码、权限墙。",
+    "- AI 只负责解析意图和生成导读，文件写入由本地代码完成。",
+    "",
+    "用户输入中识别到的 URL：",
+    JSON.stringify(classifiedUrls, null, 2),
+    "",
+    "URL 之外的自然语言要求：",
+    instruction || "无"
+  ].join("\n");
+
+  try {
+    const config = await loadProducerConfig();
+    const response = await fetch(chatCompletionsUrl(config.AI_PRODUCER_BASE_URL), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${config.AI_PRODUCER_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: config.AI_PRODUCER_MODEL,
+        temperature: 0,
+        messages: [
+          { role: "system", content: "你是本地导入工具的意图解析器，只输出可解析 JSON。" },
+          { role: "user", content: prompt }
+        ]
+      }),
+      signal: AbortSignal.timeout(120000)
+    });
+    if (!response.ok) throw new Error(`api_${response.status}_${(await response.text()).slice(0, 300)}`);
+    const data = await response.json();
+    const parsed = JSON.parse(stripModelFences(data?.choices?.[0]?.message?.content || ""));
+    return normalizeIntent({ ...parsed, source: "deepseek" }, instruction, urls);
+  } catch (error) {
+    return fallbackIntent(instruction, urls, error.message);
+  }
+}
+
+function importerInstruction(job) {
+  const parts = [];
+  if (job.intent) {
+    parts.push("结构化导入意图：");
+    parts.push(JSON.stringify(job.intent, null, 2));
+  }
+  if (job.instruction) {
+    parts.push("用户原始补充要求：");
+    parts.push(job.instruction);
+  }
+  return parts.join("\n\n").trim();
 }
 
 function isWechatUrl(url) {
@@ -165,6 +370,7 @@ function publicJob(job) {
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     instruction: job.instruction,
+    intent: job.intent || null,
     urls: job.urls,
     runDir: job.runDir,
     outputs: job.outputs,
@@ -221,6 +427,19 @@ function parseSummary(stdout) {
   }
 }
 
+function isSuccessfulImportItem(item) {
+  return item?.status === "imported" || item?.status === "partial";
+}
+
+function outputDetails(item) {
+  const details = [];
+  if (typeof item.files === "number") details.push(`文件 ${item.files}`);
+  if (typeof item.skipped === "number") details.push(`跳过 ${item.skipped}`);
+  if (typeof item.failures === "number" && item.failures > 0) details.push(`失败 ${item.failures}`);
+  if (item.method) details.push(item.method);
+  return details.join(" / ");
+}
+
 function parseJsonOutput(stdout) {
   const text = String(stdout || "").trim();
   if (!text) return null;
@@ -275,6 +494,339 @@ async function writeFailureReport({ dir, url, stage, reason, detail = "" }) {
   return target;
 }
 
+async function browserHighlightTarget(sourceUrl, title) {
+  const parsed = new URL(sourceUrl);
+  const suffix = `--网页全文高亮--${shortHash(parsed.href)}.md`;
+  const entries = await fs.readdir(browserHighlightRoot, { withFileTypes: true }).catch(() => []);
+  const existing = entries.find((entry) => entry.isFile() && entry.name.endsWith(suffix));
+  if (existing) return path.join(browserHighlightRoot, existing.name);
+  const base = safeName(title || parsed.hostname || "browser-highlight");
+  return path.join(browserHighlightRoot, `${base}${suffix}`);
+}
+
+function isAbsoluteOrSpecialLink(target) {
+  return /^(?:[a-z][a-z0-9+.-]*:|#|\/)/i.test(target);
+}
+
+function absolutizeMarkdownLinks(markdown, baseUrl) {
+  return String(markdown || "").replace(/(!?\[[^\]]*?\]\()([^) \t\n]+)(\))/g, (match, prefix, target, suffix) => {
+    if (isAbsoluteOrSpecialLink(target)) return match;
+    try {
+      return `${prefix}${new URL(target, baseUrl).href}${suffix}`;
+    } catch {
+      return match;
+    }
+  });
+}
+
+function unwrapElement(element) {
+  const parent = element.parentNode;
+  if (!parent) return;
+  while (element.firstChild) parent.insertBefore(element.firstChild, element);
+  parent.removeChild(element);
+  if (typeof parent.normalize === "function") parent.normalize();
+}
+
+function cleanBrowserCaptureDocument(document) {
+  document.querySelectorAll("#local-ir-browser-toast").forEach((element) => element.remove());
+  document.querySelectorAll(".local-ir-browser-highlight").forEach((element) => unwrapElement(element));
+}
+
+function pageTextToMarkdown(pageText) {
+  return normalizeMarkdownText(pageText, 300000)
+    .split(/\n{2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function browserPageToMarkdown({ html, pageText, sourceUrl, title }) {
+  if (html) {
+    try {
+      const dom = new JSDOM(html, { url: sourceUrl });
+      cleanBrowserCaptureDocument(dom.window.document);
+      const article = new Readability(dom.window.document).parse();
+      if (article?.content && article?.textContent?.trim().length >= 80) {
+        return {
+          method: "readability_html",
+          title: article.title || title,
+          markdown: absolutizeMarkdownLinks(browserTurndown.turndown(article.content).trim(), sourceUrl)
+        };
+      }
+    } catch {
+      // Fall back to page text below.
+    }
+  }
+
+  const fallbackMarkdown = pageTextToMarkdown(pageText);
+  if (!fallbackMarkdown) throw new Error("empty_page_content");
+  return {
+    method: "page_text_fallback",
+    title,
+    markdown: fallbackMarkdown
+  };
+}
+
+function browserHighlightFrontmatter({ sourceUrl, title, createdAt, updatedAt, conversionMethod }) {
+  return [
+    "---",
+    `source_url: ${yamlString(sourceUrl)}`,
+    `source_title: ${yamlString(title)}`,
+    `imported_at: ${yamlString(createdAt)}`,
+    `updated_at: ${yamlString(updatedAt || createdAt)}`,
+    "import_method: browser_page_highlight",
+    "highlight_mode: full_page",
+    `conversion_method: ${yamlString(conversionMethod)}`,
+    "status: imported",
+    "---",
+    "",
+    `# ${title || new URL(sourceUrl).hostname}`,
+    "",
+    `Source: [${sourceUrl}](${sourceUrl})`,
+    ""
+  ].join("\n");
+}
+
+function browserPageHighlightDocument({ sourceUrl, title, createdAt, converted }) {
+  const effectiveTitle = converted.title || title || new URL(sourceUrl).hostname;
+  const frontmatter = browserHighlightFrontmatter({
+    sourceUrl,
+    title: effectiveTitle,
+    createdAt,
+    updatedAt: createdAt,
+    conversionMethod: converted.method
+  });
+  const body = normalizeMarkdownText(converted.markdown || "", 300000);
+  return `${frontmatter}\n${body}\n`;
+}
+
+function browserHighlightEntry(payload) {
+  const selected = highlightMarkdown(payload.selectionText);
+  const context = quoteMarkdown(payload.context || "");
+  const lines = [
+    `### ${payload.createdAt}`,
+    "",
+    selected,
+    "",
+    `- Source URL: ${payload.url}`,
+    payload.title ? `- Page title: ${payload.title}` : "",
+    payload.sourceId ? `- Browser highlight id: ${payload.sourceId}` : "",
+    context ? "" : "",
+    context ? "Context:" : "",
+    context,
+    ""
+  ];
+  return lines.filter((line) => line !== "").join("\n");
+}
+
+function normalizedIndex(value) {
+  const text = String(value || "");
+  const chars = [];
+  const map = [];
+  let previousWasSpace = true;
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (/\s/.test(char)) {
+      if (!previousWasSpace) {
+        chars.push(" ");
+        map.push(i);
+        previousWasSpace = true;
+      }
+    } else {
+      chars.push(char);
+      map.push(i);
+      previousWasSpace = false;
+    }
+  }
+  while (chars.length && chars[chars.length - 1] === " ") {
+    chars.pop();
+    map.pop();
+  }
+  return { text: chars.join(""), map };
+}
+
+function findNormalizedRange(haystack, needle) {
+  const cleanNeedle = normalizeMarkdownText(needle || "", 60000);
+  if (!cleanNeedle) return null;
+
+  const exactIndex = haystack.indexOf(cleanNeedle);
+  if (exactIndex >= 0) return { start: exactIndex, end: exactIndex + cleanNeedle.length };
+
+  const normalizedHaystack = normalizedIndex(haystack);
+  const normalizedNeedle = normalizedIndex(cleanNeedle);
+  if (!normalizedNeedle.text) return null;
+  const normalizedIndexOfNeedle = normalizedHaystack.text.indexOf(normalizedNeedle.text);
+  if (normalizedIndexOfNeedle < 0) return null;
+
+  const normalizedEnd = normalizedIndexOfNeedle + normalizedNeedle.text.length - 1;
+  const start = normalizedHaystack.map[normalizedIndexOfNeedle];
+  const end = normalizedHaystack.map[normalizedEnd] + 1;
+  if (!Number.isInteger(start) || !Number.isInteger(end) || end <= start) return null;
+  return { start, end };
+}
+
+function trimMarkdownRange(markdown, range) {
+  let { start, end } = range;
+  while (start < end && /\s/.test(markdown[start])) start += 1;
+  while (end > start && /\s/.test(markdown[end - 1])) end -= 1;
+  return { start, end };
+}
+
+function isRangeAlreadyHighlighted(markdown, range) {
+  const { start, end } = range;
+  if (markdown.slice(Math.max(0, start - 2), start) === "==" && markdown.slice(end, end + 2) === "==") return true;
+  const markersBeforeStart = (markdown.slice(0, start).match(/==/g) || []).length;
+  const markersBeforeEnd = (markdown.slice(0, end).match(/==/g) || []).length;
+  return markersBeforeStart % 2 === 1 && markersBeforeEnd % 2 === 1;
+}
+
+function wrapMarkdownHighlightRange(value) {
+  return String(value || "")
+    .split(/(\n{2,})/)
+    .map((part) => {
+      if (!part || /^\n{2,}$/.test(part) || !part.trim()) return part;
+      const match = part.match(/^(\s*)([\s\S]*?)(\s*)$/);
+      const leading = match?.[1] || "";
+      const body = (match?.[2] || part).replace(/==/g, "＝");
+      const trailing = match?.[3] || "";
+      return `${leading}==${body}==${trailing}`;
+    })
+    .join("");
+}
+
+function findHighlightRange(markdown, selectionText, context) {
+  if (context) {
+    const contextRange = findNormalizedRange(markdown, context);
+    if (contextRange) {
+      const selectedInsideContext = findNormalizedRange(markdown.slice(contextRange.start, contextRange.end), selectionText);
+      if (selectedInsideContext) {
+        return {
+          start: contextRange.start + selectedInsideContext.start,
+          end: contextRange.start + selectedInsideContext.end
+        };
+      }
+    }
+  }
+  return findNormalizedRange(markdown, selectionText);
+}
+
+function applyInlineBrowserHighlight(markdown, payload) {
+  const range = findHighlightRange(markdown, payload.selectionText, payload.context);
+  if (!range) return { markdown, highlightStatus: "unlocated" };
+
+  const trimmed = trimMarkdownRange(markdown, range);
+  if (trimmed.end <= trimmed.start) return { markdown, highlightStatus: "unlocated" };
+  if (isRangeAlreadyHighlighted(markdown, trimmed)) {
+    return { markdown, highlightStatus: "already_highlighted" };
+  }
+
+  return {
+    markdown: `${markdown.slice(0, trimmed.start)}${wrapMarkdownHighlightRange(markdown.slice(trimmed.start, trimmed.end))}${markdown.slice(trimmed.end)}`,
+    highlightStatus: "inline_highlighted"
+  };
+}
+
+function appendUnlocatedHighlight(markdown, payload) {
+  const sectionHeading = "## 未定位高亮";
+  const prefix = markdown.includes(sectionHeading) ? "" : `\n\n${sectionHeading}\n`;
+  const sourceIdLine = payload.sourceId ? `\n- Browser highlight id: ${payload.sourceId}` : "";
+  const context = quoteMarkdown(payload.context || "");
+  const entry = [
+    prefix,
+    `\n### ${payload.createdAt}`,
+    "",
+    highlightMarkdown(payload.selectionText),
+    sourceIdLine,
+    context ? "\nContext:" : "",
+    context
+  ].filter((line) => line !== "").join("\n");
+  return `${markdown.trimEnd()}\n${entry}\n`;
+}
+
+function updateFrontmatterFields(markdown, fields) {
+  if (!markdown.startsWith("---\n")) return markdown;
+  const end = markdown.indexOf("\n---", 4);
+  if (end < 0) return markdown;
+  const lines = markdown.slice(4, end).split("\n");
+  for (const [key, value] of Object.entries(fields)) {
+    const line = `${key}: ${yamlString(value)}`;
+    const index = lines.findIndex((existing) => existing.startsWith(`${key}:`));
+    if (index >= 0) {
+      lines[index] = line;
+    } else {
+      lines.push(line);
+    }
+  }
+  return `---\n${lines.join("\n")}${markdown.slice(end)}`;
+}
+
+async function writeBrowserHighlightCapture(rawPayload) {
+  const payload = {
+    url: String(rawPayload?.url || "").trim(),
+    title: String(rawPayload?.title || "").trim(),
+    selectionText: normalizeMarkdownText(rawPayload?.selectionText || "", 60000),
+    context: normalizeMarkdownText(rawPayload?.context || "", 8000),
+    pageText: normalizeMarkdownText(rawPayload?.pageText || "", 300000),
+    html: normalizeMarkdownText(rawPayload?.html || "", 1000000),
+    createdAt: String(rawPayload?.createdAt || nowIso()),
+    sourceId: String(rawPayload?.sourceId || "").trim()
+  };
+
+  let parsed;
+  try {
+    parsed = new URL(payload.url);
+  } catch {
+    throw new Error("invalid_url");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("unsupported_url_protocol");
+  if (!payload.selectionText) throw new Error("empty_selection");
+
+  await fs.mkdir(browserHighlightRoot, { recursive: true });
+  const target = await browserHighlightTarget(parsed.href, payload.title);
+  const exists = await fs.stat(target).then(() => true).catch(() => false);
+  let markdown;
+  let conversionMethod = "existing_file";
+
+  if (!exists) {
+    const converted = browserPageToMarkdown({
+      html: payload.html,
+      pageText: payload.pageText,
+      sourceUrl: parsed.href,
+      title: payload.title
+    });
+    conversionMethod = converted.method;
+    markdown = browserPageHighlightDocument({
+      sourceUrl: parsed.href,
+      title: payload.title,
+      createdAt: payload.createdAt,
+      converted
+    });
+  } else {
+    markdown = await fs.readFile(target, "utf8");
+  }
+
+  const applied = applyInlineBrowserHighlight(markdown, { ...payload, url: parsed.href });
+  markdown = applied.highlightStatus === "unlocated"
+    ? appendUnlocatedHighlight(applied.markdown, { ...payload, url: parsed.href })
+    : applied.markdown;
+  markdown = updateFrontmatterFields(markdown, { updated_at: payload.createdAt });
+  if (!exists) {
+    markdown = updateFrontmatterFields(markdown, { conversion_method: conversionMethod });
+  }
+  await fs.writeFile(target, markdown.endsWith("\n") ? markdown : `${markdown}\n`, "utf8");
+
+  return {
+    status: "captured",
+    mode: "full_page",
+    target,
+    sourceUrl: parsed.href,
+    title: payload.title,
+    selectedChars: payload.selectionText.length,
+    highlightStatus: applied.highlightStatus,
+    conversionMethod
+  };
+}
+
 async function moveWebFailures(results, failureDir) {
   await fs.mkdir(failureDir, { recursive: true });
   for (const result of results) {
@@ -303,33 +855,37 @@ async function importWechat(job, urls, runName) {
     "--staging",
     stagingDir
   ];
-  if (job.instruction) args.push("--instruction", job.instruction);
+  const instruction = importerInstruction(job);
+  if (instruction) args.push("--instruction", instruction);
   const result = await runProcess(process.execPath, args);
   await fs.writeFile(path.join(stagingDir, "command.stdout.txt"), result.stdout, "utf8").catch(() => {});
   await fs.writeFile(path.join(stagingDir, "command.stderr.txt"), result.stderr, "utf8").catch(() => {});
   const summary = parseSummary(result.stdout) || [];
   for (const item of summary) {
-    if (item.status === "imported") job.outputs.push(item);
+    if (isSuccessfulImportItem(item)) job.outputs.push(item);
     else job.failures.push(item);
   }
   if (result.code !== 0 && summary.length === 0) {
     job.failures.push({ status: "failed", stage: "command", reason: result.stderr || `exit_${result.code}` });
   }
-  await log(job, `微信导入完成：成功 ${summary.filter((item) => item.status === "imported").length}，失败 ${summary.filter((item) => item.status !== "imported").length}`);
+  await log(job, `微信导入完成：成功 ${summary.filter(isSuccessfulImportItem).length}，失败 ${summary.filter((item) => !isSuccessfulImportItem(item)).length}`);
 }
 
 async function importWeb(job, urls, runName) {
   const outDir = path.join(readingRoot, "网页", runName);
   const failureDir = path.join(job.runDir, "web-failures");
   await log(job, `普通网页导入开始：${urls.length} 个链接`);
-  const result = await runProcess(process.execPath, [importScript, ...urls, "--out", outDir]);
+  const args = [importScript, ...urls, "--out", outDir];
+  const instruction = importerInstruction(job);
+  if (instruction) args.push("--instruction", instruction);
+  const result = await runProcess(process.execPath, args);
   await fs.mkdir(path.join(job.runDir, "web"), { recursive: true });
   await fs.writeFile(path.join(job.runDir, "web", "command.stdout.txt"), result.stdout, "utf8");
   await fs.writeFile(path.join(job.runDir, "web", "command.stderr.txt"), result.stderr, "utf8");
   const summary = parseSummary(result.stdout) || [];
   await moveWebFailures(summary, failureDir);
   for (const item of summary) {
-    if (item.status === "imported") job.outputs.push(item);
+    if (isSuccessfulImportItem(item)) job.outputs.push(item);
     else job.failures.push(item);
   }
   if (result.code !== 0 && summary.length === 0) {
@@ -341,7 +897,7 @@ async function importWeb(job, urls, runName) {
     });
     job.failures.push({ url: urls[0], status: "failed", stage: "command", reason: result.stderr || `exit_${result.code}`, target });
   }
-  await log(job, `普通网页导入完成：成功 ${summary.filter((item) => item.status === "imported").length}，失败 ${summary.filter((item) => item.status !== "imported").length}`);
+  await log(job, `普通网页导入完成：成功 ${summary.filter(isSuccessfulImportItem).length}，失败 ${summary.filter((item) => !isSuccessfulImportItem(item)).length}`);
 }
 
 async function readAgentReachDoctor(job) {
@@ -707,7 +1263,7 @@ async function importYouTube(job, url, runName, doctor) {
       info,
       url,
       transcript,
-      instruction: job.instruction
+      instruction: importerInstruction(job)
     });
     guidePath = path.join(stageDir, `${safeName(info.id || "youtube")}.guide.md`);
     await fs.writeFile(guidePath, `${guide.trim()}\n`, "utf8");
@@ -810,7 +1366,7 @@ async function importBilibili(job, url, runName, doctor) {
       info,
       url,
       transcript,
-      instruction: job.instruction
+      instruction: importerInstruction(job)
     });
     guidePath = path.join(stageDir, `${safeName(bv)}.guide.md`);
     await fs.writeFile(guidePath, `${guide.trim()}\n`, "utf8");
@@ -857,6 +1413,10 @@ async function runJob(job) {
 
   try {
     const runName = `${today()}-app-import`;
+    job.intent = await parseImportIntent({ instruction: job.instruction, urls: job.urls });
+    await fs.writeFile(path.join(job.runDir, "intent.json"), `${JSON.stringify(job.intent, null, 2)}\n`, "utf8");
+    await log(job, `意图解析完成：${job.intent.source} / ${job.intent.processing?.languageMode || ""} / ${job.intent.processing?.linkPolicy || ""}`);
+
     const wechat = [];
     const web = [];
     const video = [];
@@ -882,12 +1442,12 @@ async function runJob(job) {
   }
 }
 
-function readRequest(req) {
+function readRequest(req, { maxBytes = 1024 * 1024 } = {}) {
   return new Promise((resolve, reject) => {
     let body = "";
     req.on("data", (chunk) => {
       body += chunk.toString();
-      if (body.length > 1024 * 1024) {
+      if (body.length > maxBytes) {
         reject(new Error("request_too_large"));
         req.destroy();
       }
@@ -898,8 +1458,44 @@ function readRequest(req) {
 }
 
 function sendJson(res, status, data) {
-  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", ...corsHeaders() });
   res.end(JSON.stringify(data, null, 2));
+}
+
+function browserHighlightTestHtml() {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local IR Browser Highlight Test</title>
+  <style>
+    :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; }
+    body { margin: 0; color: #1d2430; background: #f7f8fa; }
+    main { max-width: 760px; margin: 0 auto; padding: 32px 20px; }
+    h1 { margin: 0 0 8px; font-size: 24px; line-height: 1.25; font-weight: 650; letter-spacing: 0; }
+    p, li { font-size: 16px; line-height: 1.75; }
+    section { margin-top: 18px; padding: 18px; border: 1px solid #d9dee7; border-radius: 8px; background: #fff; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Local IR 浏览器高亮测试页</h1>
+    <p>这是一个普通的本地 HTTP 页面，用来验证浏览器扩展是否能注入、选区是否能高亮、摘录是否能写入本地 Markdown。</p>
+    <section>
+      <h2>测试文本</h2>
+      <p>请开启 Local IR Browser Highlight 的高亮模式，然后选中这一整句话。成功时，页面会出现视觉高亮，并且阅读区的浏览器高亮文件夹会出现一条 Obsidian 旧高亮格式摘录。</p>
+      <p>你也可以从右往左选择这句话，检查反向选择是否能正常保存。</p>
+      <ul>
+        <li>目标目录：<code>阅读区/浏览器高亮</code></li>
+        <li>保存格式：<code>==选中文本==</code></li>
+        <li>后续加工：回到 Obsidian Local IR 里处理。</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>`;
 }
 
 function html() {
@@ -912,21 +1508,32 @@ function html() {
   <style>
     :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; }
     body { margin: 0; background: #f6f7f9; color: #1d2430; }
-    main { max-width: 1120px; margin: 0 auto; padding: 24px; }
-    h1 { font-size: 24px; line-height: 1.2; margin: 0 0 16px; font-weight: 650; }
-    .layout { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(320px, .9fr); gap: 16px; align-items: start; }
+    main { max-width: 1180px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 24px; line-height: 1.2; margin: 0 0 6px; font-weight: 650; letter-spacing: 0; }
+    .subtitle { margin: 0 0 18px; color: #667085; font-size: 14px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.16fr) minmax(340px, .84fr); gap: 16px; align-items: start; }
     section { background: #fff; border: 1px solid #d9dee7; border-radius: 8px; padding: 16px; }
+    .rss-panel { grid-column: 1 / -1; }
     label { display: block; font-size: 13px; font-weight: 650; margin-bottom: 8px; color: #384253; }
     textarea, input, select { width: 100%; box-sizing: border-box; border: 1px solid #c9d0dc; border-radius: 6px; padding: 10px 12px; font: 14px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
-    textarea { min-height: 320px; resize: vertical; }
+    textarea { min-height: 300px; resize: vertical; }
     button { margin-top: 12px; min-height: 36px; border: 1px solid #1f5fbf; background: #1f5fbf; color: #fff; border-radius: 6px; padding: 0 14px; font-size: 14px; cursor: pointer; }
     button.secondary { border-color: #c9d0dc; background: #fff; color: #1d2430; }
     button:disabled { opacity: .55; cursor: wait; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     .row { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 10px; align-items: end; margin-top: 10px; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .hint { color: #667085; font-size: 13px; line-height: 1.55; margin: -2px 0 10px; }
+    .url-preview { margin-top: 12px; border: 1px solid #eef1f5; background: #fafbfc; border-radius: 8px; padding: 12px; }
+    .preview-title { display: flex; justify-content: space-between; gap: 12px; color: #384253; font-size: 13px; font-weight: 650; margin-bottom: 8px; }
+    .url-chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 26px; }
+    .chip { max-width: 100%; border: 1px solid #c9d0dc; background: #fff; border-radius: 999px; padding: 4px 9px; color: #344054; font-size: 12px; overflow-wrap: anywhere; }
+    .intent-box { margin-top: 12px; border: 1px solid #eef1f5; background: #fafbfc; border-radius: 8px; padding: 10px 12px; font-size: 13px; line-height: 1.55; color: #344054; }
+    .intent-box strong { color: #1d2430; }
     .status { font-size: 14px; line-height: 1.6; }
     .paths { display: grid; gap: 8px; margin-top: 12px; }
     .item { border-top: 1px solid #eef1f5; padding-top: 8px; overflow-wrap: anywhere; }
+    .item a { color: inherit; }
     .ok { color: #116329; }
     .fail { color: #9b1c1c; }
     .muted { color: #667085; font-size: 13px; }
@@ -936,15 +1543,40 @@ function html() {
 </head>
 <body>
   <main>
-    <h1>渐进阅读导入</h1>
+    <h1>渐进阅读导入台</h1>
+    <p class="subtitle">粘贴网页、微信、知乎、RSS 文章链接，也可以同时写上导入要求；完成后会把可读 Markdown 放进阅读区。</p>
     <div class="layout">
-      <section>
-        <label for="input">链接和要求</label>
-        <textarea id="input" placeholder="粘贴一个或多个链接，也可以写自然语言要求。"></textarea>
-        <button id="run">导入</button>
+      <section class="import-panel">
+        <label for="input">链接和导入要求</label>
+        <p class="hint">每行一个链接最稳，也可以把一段自然语言说明一起粘进来。系统会自动抽取链接，正文导入和导读卡仍由后端工作流处理。</p>
+        <textarea id="input" placeholder="例如：
+https://mp.weixin.qq.com/s/...
+https://example.com/article
+
+导入到渐进阅读区，生成阅读前置卡，保留原文。"></textarea>
+        <div class="toolbar">
+          <button id="run">导入到阅读区</button>
+          <button class="secondary" id="parseIntent">先解析要求</button>
+          <button class="secondary" id="clearInput">清空</button>
+        </div>
+        <div class="url-preview">
+          <div class="preview-title">
+            <span>识别到的链接</span>
+            <span id="urlCount">0</span>
+          </div>
+          <div class="url-chips" id="urlPreview"><span class="muted">还没有识别到链接。</span></div>
+        </div>
       </section>
-      <section>
+      <section class="status-panel">
+        <label>任务结果</label>
+        <div class="status" id="status">空闲</div>
+        <div class="intent-box" id="intentBox">还没有解析导入意图。</div>
+        <div class="paths" id="paths"></div>
+        <pre id="logs"></pre>
+      </section>
+      <section class="rss-panel">
         <label>RSS</label>
+        <p class="hint">RSS 这边处理订阅源、日报、周报和三状态归档；普通链接直接用左侧导入区。</p>
         <div class="actions">
           <button class="secondary" id="rssHealth">健康检查</button>
           <button class="secondary" id="rssSources">刷新源</button>
@@ -980,31 +1612,83 @@ function html() {
         <div class="paths" id="rssSourceList"></div>
         <pre id="rssOutput"></pre>
       </section>
-      <section>
-        <div class="status" id="status">空闲</div>
-        <div class="paths" id="paths"></div>
-        <pre id="logs"></pre>
-      </section>
     </div>
   </main>
   <script>
     const run = document.getElementById('run');
+    const parseIntentButton = document.getElementById('parseIntent');
+    const clearInput = document.getElementById('clearInput');
     const input = document.getElementById('input');
     const statusEl = document.getElementById('status');
+    const intentBox = document.getElementById('intentBox');
     const pathsEl = document.getElementById('paths');
     const logsEl = document.getElementById('logs');
+    const urlPreview = document.getElementById('urlPreview');
+    const urlCount = document.getElementById('urlCount');
     const rssOutput = document.getElementById('rssOutput');
     const rssSourceList = document.getElementById('rssSourceList');
     const rssButtons = ['rssHealth', 'rssSources', 'rssSourceSetup', 'rssSourceSync', 'rssSync', 'rssPromote', 'rssAdd'].map(id => document.getElementById(id));
     let timer = null;
 
+    function extractClientUrls(text) {
+      return Array.from(new Set(String(text || '').match(/https?:\/\/[^\s<>"']+/g) || []))
+        .map(url => url.replace(/[),.;，。！？!?]+$/g, ''));
+    }
+
+    function renderInputPreview() {
+      const urls = extractClientUrls(input.value);
+      urlCount.textContent = String(urls.length);
+      if (!urls.length) {
+        urlPreview.innerHTML = '<span class="muted">还没有识别到链接。</span>';
+        return urls;
+      }
+      urlPreview.innerHTML = urls.map(url => '<span class="chip">' + escapeHtml(url) + '</span>').join('');
+      return urls;
+    }
+
+    function fileHref(target) {
+      return '/files/' + encodeURIComponent(target);
+    }
+
+    function outputLink(target) {
+      if (!target) return '';
+      return '<a href="' + fileHref(target) + '" target="_blank" rel="noreferrer">' + escapeHtml(target) + '</a>';
+    }
+
+    function renderIntent(intent) {
+      if (!intent) {
+        intentBox.textContent = '还没有解析导入意图。';
+        return;
+      }
+      const processing = intent.processing || {};
+      const rows = [
+        '<strong>理解来源：</strong>' + escapeHtml(intent.source || ''),
+        '<strong>输出位置：</strong>' + escapeHtml(intent.outputTarget || ''),
+        '<strong>导读卡：</strong>' + (processing.generateReadingGuide === false ? '关闭' : '开启'),
+        '<strong>语言模式：</strong>' + escapeHtml(processing.languageMode || ''),
+        '<strong>外链策略：</strong>' + escapeHtml(processing.linkPolicy || '')
+      ];
+      if (intent.userNotes) rows.push('<strong>补充要求：</strong>' + escapeHtml(intent.userNotes));
+      if (Array.isArray(intent.warnings) && intent.warnings.length) rows.push('<strong>注意：</strong>' + escapeHtml(intent.warnings.join('；')));
+      intentBox.innerHTML = rows.map(row => '<div>' + row + '</div>').join('');
+    }
+
     function render(job) {
       statusEl.textContent = '状态：' + job.status + '｜链接：' + job.urls.length + '｜运行目录：' + (job.runDir || '');
+      renderIntent(job.intent);
       logsEl.textContent = (job.logs || []).map(x => '[' + x.at + '] ' + x.message).join('\\n');
       const rows = [];
-      for (const item of job.outputs || []) rows.push('<div class="item ok">成功：' + escapeHtml(item.target || item.url || '') + '</div>');
+      for (const item of job.outputs || []) {
+        const main = item.target ? outputLink(item.target) : escapeHtml(item.url || '');
+        const parts = ['成功：' + main];
+        const details = outputDetails(item);
+        if (details) parts.push('<div class="muted">' + escapeHtml(details) + '</div>');
+        if (item.brief) parts.push('<div>导读：' + outputLink(item.brief) + '</div>');
+        if (item.report) parts.push('<div>报告：' + outputLink(item.report) + '</div>');
+        rows.push('<div class="item ok">' + parts.join('') + '</div>');
+      }
       for (const item of job.failures || []) rows.push('<div class="item fail">失败：' + escapeHtml((item.reason || '') + ' ' + (item.target || item.url || '')) + '</div>');
-      pathsEl.innerHTML = rows.join('');
+      pathsEl.innerHTML = rows.join('') || '<div class="item muted">还没有输出文件。</div>';
       if (!['queued', 'running'].includes(job.status)) {
         run.disabled = false;
         if (timer) clearInterval(timer);
@@ -1050,11 +1734,43 @@ function html() {
       render(await res.json());
     }
 
+    async function previewIntent() {
+      const urls = renderInputPreview();
+      if (!urls.length) {
+        statusEl.textContent = '没有识别到链接。';
+        return;
+      }
+      parseIntentButton.disabled = true;
+      intentBox.textContent = '正在解析导入意图。';
+      try {
+        const res = await fetch('/api/intent', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: input.value })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'intent_failed');
+        statusEl.textContent = '意图解析完成。';
+        renderIntent(data.intent);
+      } catch (error) {
+        statusEl.textContent = '意图解析失败：' + error.message;
+      } finally {
+        parseIntentButton.disabled = false;
+      }
+    }
+
     run.addEventListener('click', async () => {
+      const urls = renderInputPreview();
+      if (!urls.length) {
+        statusEl.textContent = '没有识别到链接。';
+        return;
+      }
       run.disabled = true;
       statusEl.textContent = '提交中';
+      intentBox.textContent = '正在解析导入意图。';
       pathsEl.innerHTML = '';
       logsEl.textContent = '';
+      if (timer) clearInterval(timer);
       try {
         const res = await fetch('/api/import', {
           method: 'POST',
@@ -1069,6 +1785,17 @@ function html() {
         statusEl.textContent = '提交失败：' + error.message;
         run.disabled = false;
       }
+    });
+
+    input.addEventListener('input', renderInputPreview);
+    parseIntentButton.addEventListener('click', previewIntent);
+    clearInput.addEventListener('click', () => {
+      input.value = '';
+      renderInputPreview();
+      statusEl.textContent = '空闲';
+      intentBox.textContent = '还没有解析导入意图。';
+      pathsEl.innerHTML = '';
+      logsEl.textContent = '';
     });
 
     document.getElementById('rssHealth').addEventListener('click', () => rssCall('/api/rss/health'));
@@ -1086,6 +1813,7 @@ function html() {
         feedUrl: document.getElementById('rssFeedUrl').value
       }).then(() => rssCall('/api/rss/sources'));
     });
+    renderInputPreview();
     rssCall('/api/rss/sources');
   </script>
 </body>
@@ -1094,9 +1822,27 @@ function html() {
 
 async function handle(req, res) {
   const url = new URL(req.url || "/", "http://127.0.0.1");
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, corsHeaders());
+    res.end();
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/") {
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.writeHead(200, {
+      ...corsHeaders(),
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store, max-age=0"
+    });
     res.end(html());
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/browser-highlight-test") {
+    res.writeHead(200, {
+      ...corsHeaders(),
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store, max-age=0"
+    });
+    res.end(browserHighlightTestHtml());
     return;
   }
   if (req.method === "GET" && url.pathname.startsWith("/api/jobs/")) {
@@ -1110,6 +1856,37 @@ async function handle(req, res) {
     if (!target.startsWith(workflowRoot)) return sendJson(res, 403, { error: "forbidden" });
     createReadStream(target).pipe(res);
     return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/highlights/health") {
+    return sendJson(res, 200, {
+      status: "ok",
+      service: "local-ir-browser-highlight",
+      readingRoot,
+      browserHighlightRoot,
+      now: nowIso()
+    });
+  }
+  if (req.method === "POST" && url.pathname === "/api/highlights/capture") {
+    try {
+      const body = JSON.parse(await readRequest(req, { maxBytes: 8 * 1024 * 1024 }) || "{}");
+      return sendJson(res, 200, await writeBrowserHighlightCapture(body));
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/intent") {
+    try {
+      const body = JSON.parse(await readRequest(req) || "{}");
+      const text = String(body.text || "").trim();
+      if (!text) return sendJson(res, 400, { error: "empty_input" });
+      const urls = extractUrls(text);
+      if (!urls.length) return sendJson(res, 400, { error: "no_url_found" });
+      const instruction = instructionFromText(text, urls);
+      const intent = await parseImportIntent({ instruction, urls });
+      return sendJson(res, 200, { instruction, urls, intent });
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message });
+    }
   }
   if (req.method === "GET" && url.pathname === "/api/rss/health") {
     try {
@@ -1186,6 +1963,7 @@ async function handle(req, res) {
         createdAt: nowIso(),
         updatedAt: nowIso(),
         instruction: instructionFromText(text, urls),
+        intent: null,
         urls,
         runDir: "",
         outputs: [],
@@ -1207,16 +1985,12 @@ async function listen(port) {
     handle(req, res).catch((error) => sendJson(res, 500, { error: error.message }));
   });
   return new Promise((resolve, reject) => {
-    server.once("error", async (error) => {
-      if (error.code === "EADDRINUSE" && port < defaultPort + 20) {
-        try {
-          resolve(await listen(port + 1));
-        } catch (inner) {
-          reject(inner);
-        }
-      } else {
-        reject(error);
+    server.once("error", (error) => {
+      if (error.code === "EADDRINUSE") {
+        reject(new Error(`port_${port}_in_use_close_existing_progressive_reading_app`));
+        return;
       }
+      reject(error);
     });
     server.listen(port, "127.0.0.1", async () => {
       const info = { url: `http://127.0.0.1:${port}`, port, startedAt: nowIso(), pid: process.pid };

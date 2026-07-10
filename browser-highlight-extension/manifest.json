@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Local IR Browser Highlight",
+  "version": "0.2.0",
+  "description": "Highlight browser text into full-page Markdown for the local incremental reading workflow.",
+  "permissions": [
+    "activeTab",
+    "contextMenus",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Local IR"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "lib/web-highlighter.min.js",
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
