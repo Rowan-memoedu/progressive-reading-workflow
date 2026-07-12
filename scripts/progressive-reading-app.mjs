@@ -9,6 +9,17 @@ import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
+import {
+  addMaterialCandidate,
+  createLearningProject,
+  defaultLearningRoot,
+  doctorLearningProject,
+  getProjectStatus,
+  listLearningProjects,
+  promoteMaterialCandidate,
+  recordLearningEvidence,
+  resolveProject
+} from "./learning-project-core.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const workflowRoot = path.resolve(__dirname, "..");
@@ -18,6 +29,7 @@ const localTranscribeScript = path.join(__dirname, "local-whispercpp-transcribe.
 const readingRoot = path.join(workflowRoot, "阅读区");
 const importsRoot = path.join(workflowRoot, "imports");
 const appRunsRoot = path.join(importsRoot, "app-runs");
+const learningRoot = path.resolve(process.env.LEARNING_PROJECT_ROOT || defaultLearningRoot);
 const browserHighlightRoot = path.join(readingRoot, "浏览器高亮");
 const defaultPort = Number(process.env.PROGRESSIVE_READING_APP_PORT || 37829);
 const producerConfigDir = path.join(process.env.USERPROFILE || process.env.HOME || "", "Documents", "New project");
@@ -1513,9 +1525,10 @@ function html() {
     .subtitle { margin: 0 0 18px; color: #667085; font-size: 14px; }
     .layout { display: grid; grid-template-columns: minmax(0, 1.16fr) minmax(340px, .84fr); gap: 16px; align-items: start; }
     section { background: #fff; border: 1px solid #d9dee7; border-radius: 8px; padding: 16px; }
-    .rss-panel { grid-column: 1 / -1; }
+    .rss-panel, .learning-panel { grid-column: 1 / -1; }
     label { display: block; font-size: 13px; font-weight: 650; margin-bottom: 8px; color: #384253; }
     textarea, input, select { width: 100%; box-sizing: border-box; border: 1px solid #c9d0dc; border-radius: 6px; padding: 10px 12px; font: 14px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    input[type="checkbox"] { width: auto; }
     textarea { min-height: 300px; resize: vertical; }
     button { margin-top: 12px; min-height: 36px; border: 1px solid #1f5fbf; background: #1f5fbf; color: #fff; border-radius: 6px; padding: 0 14px; font-size: 14px; cursor: pointer; }
     button.secondary { border-color: #c9d0dc; background: #fff; color: #1d2430; }
@@ -1574,6 +1587,30 @@ https://example.com/article
         <div class="paths" id="paths"></div>
         <pre id="logs"></pre>
       </section>
+      <section class="learning-panel">
+        <label>项目学习编排</label>
+        <p class="hint">从 GitHub 仓库建立可恢复的学习项目：复用现有阅读导入，记录环境、先修关系、学习证据、下一任务与材料候选。</p>
+        <div class="row">
+          <div>
+            <label for="learningRepo">GitHub 仓库</label>
+            <input id="learningRepo" placeholder="https://github.com/owner/repo">
+          </div>
+          <div>
+            <label for="learningGoal">实际成果目标</label>
+            <input id="learningGoal" value="理解项目并完成一项可验证改动">
+          </div>
+        </div>
+        <div class="toolbar">
+          <label><input type="checkbox" id="learningClone" checked> 克隆可执行源码</label>
+          <label><input type="checkbox" id="learningReading" checked> 导入 Markdown 阅读材料</label>
+        </div>
+        <div class="actions">
+          <button id="learningCreate">创建学习项目</button>
+          <button class="secondary" id="learningRefresh">刷新项目</button>
+        </div>
+        <div class="paths" id="learningProjects"></div>
+        <pre id="learningOutput"></pre>
+      </section>
       <section class="rss-panel">
         <label>RSS</label>
         <p class="hint">RSS 这边处理订阅源、日报、周报和三状态归档；普通链接直接用左侧导入区。</p>
@@ -1627,6 +1664,9 @@ https://example.com/article
     const urlCount = document.getElementById('urlCount');
     const rssOutput = document.getElementById('rssOutput');
     const rssSourceList = document.getElementById('rssSourceList');
+    const learningOutput = document.getElementById('learningOutput');
+    const learningProjects = document.getElementById('learningProjects');
+    const learningButtons = ['learningCreate', 'learningRefresh'].map(id => document.getElementById(id));
     const rssButtons = ['rssHealth', 'rssSources', 'rssSourceSetup', 'rssSourceSync', 'rssSync', 'rssPromote', 'rssAdd'].map(id => document.getElementById(id));
     let timer = null;
 
@@ -1725,6 +1765,32 @@ https://example.com/article
       return null;
     }
 
+    async function learningCall(path, body) {
+      learningButtons.forEach(button => button.disabled = true);
+      try {
+        const res = await fetch(path, body ? {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        } : undefined);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'learning_project_failed');
+        learningOutput.textContent = JSON.stringify(data, null, 2);
+        if (Array.isArray(data.projects)) {
+          learningProjects.innerHTML = data.projects.map(project => (
+            '<div class="item"><strong>' + escapeHtml(project.title || project.id) + '</strong>' +
+            '<div class="muted">' + escapeHtml((project.status || '') + ' / ' + (project.goal || '')) + '</div></div>'
+          )).join('') || '<div class="item muted">还没有学习项目。</div>';
+        }
+        return data;
+      } catch (error) {
+        learningOutput.textContent = error.message;
+      } finally {
+        learningButtons.forEach(button => button.disabled = false);
+      }
+      return null;
+    }
+
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     }
@@ -1813,8 +1879,16 @@ https://example.com/article
         feedUrl: document.getElementById('rssFeedUrl').value
       }).then(() => rssCall('/api/rss/sources'));
     });
+    document.getElementById('learningRefresh').addEventListener('click', () => learningCall('/api/learning/projects'));
+    document.getElementById('learningCreate').addEventListener('click', () => learningCall('/api/learning/projects', {
+      repoUrl: document.getElementById('learningRepo').value,
+      goal: document.getElementById('learningGoal').value,
+      clone: document.getElementById('learningClone').checked,
+      fetchReading: document.getElementById('learningReading').checked
+    }).then(() => learningCall('/api/learning/projects')));
     renderInputPreview();
     rssCall('/api/rss/sources');
+    learningCall('/api/learning/projects');
   </script>
 </body>
 </html>`;
@@ -1884,6 +1958,44 @@ async function handle(req, res) {
       const instruction = instructionFromText(text, urls);
       const intent = await parseImportIntent({ instruction, urls });
       return sendJson(res, 200, { instruction, urls, intent });
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message });
+    }
+  }
+  if (req.method === "GET" && url.pathname === "/api/learning/projects") {
+    try {
+      return sendJson(res, 200, { projects: await listLearningProjects(learningRoot) });
+    } catch (error) {
+      return sendJson(res, 500, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/learning/projects") {
+    try {
+      const body = JSON.parse(await readRequest(req) || "{}");
+      return sendJson(res, 201, await createLearningProject({
+        repoUrl: body.repoUrl,
+        goal: body.goal,
+        clone: body.clone === true,
+        fetchReading: body.fetchReading === true,
+        root: learningRoot
+      }));
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message });
+    }
+  }
+  const learningMatch = /^\/api\/learning\/projects\/([^/]+)(?:\/(doctor|evidence|material|promote))?$/.exec(url.pathname);
+  if (learningMatch) {
+    try {
+      const projectDir = await resolveProject(decodeURIComponent(learningMatch[1]), learningRoot);
+      const action = learningMatch[2] || "status";
+      if (req.method === "GET" && action === "status") return sendJson(res, 200, await getProjectStatus(projectDir));
+      if (req.method !== "POST") return sendJson(res, 405, { error: "method_not_allowed" });
+      const body = JSON.parse(await readRequest(req) || "{}");
+      if (action === "doctor") return sendJson(res, 200, await doctorLearningProject(projectDir, { apply: body.apply === true }));
+      if (action === "evidence") return sendJson(res, 200, await recordLearningEvidence(projectDir, body));
+      if (action === "material") return sendJson(res, 200, await addMaterialCandidate(projectDir, body));
+      if (action === "promote") return sendJson(res, 200, await promoteMaterialCandidate(projectDir, body.materialId, body.evidence));
+      return sendJson(res, 404, { error: "learning_action_not_found" });
     } catch (error) {
       return sendJson(res, 400, { error: error.message });
     }
@@ -1995,7 +2107,9 @@ async function listen(port) {
     server.listen(port, "127.0.0.1", async () => {
       const info = { url: `http://127.0.0.1:${port}`, port, startedAt: nowIso(), pid: process.pid };
       await fs.mkdir(importsRoot, { recursive: true });
-      await fs.writeFile(path.join(importsRoot, "app-server.json"), `${JSON.stringify(info, null, 2)}\n`, "utf8");
+      if (process.env.PROGRESSIVE_READING_WRITE_SERVER_INFO !== "false") {
+        await fs.writeFile(path.join(importsRoot, "app-server.json"), `${JSON.stringify(info, null, 2)}\n`, "utf8");
+      }
       console.log(`Progressive reading app: ${info.url}`);
       resolve(server);
     });

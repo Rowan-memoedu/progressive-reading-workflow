@@ -48,7 +48,7 @@ async function run() {
   await fs.rm(serverInfoPath, { force: true }).catch(() => {});
   const child = spawn(process.execPath, [appScript], {
     cwd: workflowRoot,
-    env: { ...process.env, PROGRESSIVE_READING_APP_PORT: String(port) },
+    env: { ...process.env, PROGRESSIVE_READING_APP_PORT: String(port), PROGRESSIVE_READING_WRITE_SERVER_INFO: "false" },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true
   });
