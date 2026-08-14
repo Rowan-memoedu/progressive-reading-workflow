@@ -12,6 +12,8 @@
     "browser-highlight:sync-lib": "node scripts/sync-browser-highlight-extension.mjs",
     "browser-highlight:test": "node scripts/test-browser-highlight-workflow.mjs",
     "browser-highlight:check": "node scripts/sync-browser-highlight-extension.mjs && node --check scripts/progressive-reading-app.mjs && node --check browser-highlight-extension/background.js && node --check browser-highlight-extension/content.js && node --check browser-highlight-extension/popup.js && node --check scripts/test-browser-highlight-workflow.mjs && node scripts/check-browser-highlight-extension.mjs && node scripts/test-browser-highlight-workflow.mjs",
+    "canary:youtube-subtitles": "node scripts/import-youtube-subtitle-canary.mjs",
+    "test:network-import-canary": "node --test tests/network-import-canary.test.mjs",
     "learning-project": "node scripts/learning-project.mjs",
     "learning-project:check": "node --check scripts/learning-project-core.mjs && node --check scripts/learning-project.mjs && node --check scripts/progressive-reading-app.mjs && node scripts/test-learning-project-workflow.mjs && node scripts/test-learning-project-app.mjs",
     "readwise:setup": "node scripts/setup-readwise-official-plugin.mjs",
