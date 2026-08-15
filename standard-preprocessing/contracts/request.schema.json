@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "progressive-reading.preprocess.request/v1",
+  "title": "Progressive reading preprocessing request v1",
+  "type": "object",
+  "required": ["schema_version", "source_type", "source_metadata", "user_instruction"],
+  "properties": {
+    "schema_version": { "const": "progressive-reading.preprocess.request/v1" },
+    "contract_version": { "const": "1.0.0" },
+    "material_id": { "type": "string", "minLength": 1 },
+    "idempotency_key": { "type": "string", "minLength": 1 },
+    "source_type": { "type": "string", "minLength": 1 },
+    "source_metadata": {
+      "type": "object",
+      "properties": {
+        "source_url": { "type": ["string", "null"] },
+        "canonical_url": { "type": ["string", "null"] },
+        "original_url": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] },
+        "author": { "type": ["string", "null"] },
+        "published_at": { "type": ["string", "null"] },
+        "source_is_original": { "type": "boolean" },
+        "translation": {
+          "type": "object",
+          "properties": {
+            "is_translation": { "type": "boolean" },
+            "original_url": { "type": ["string", "null"] },
+            "original_language": { "type": "string" },
+            "translation_language": { "type": "string" }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "user_instruction": { "type": "string" },
+    "processing_options": {
+      "type": "object",
+      "properties": {
+        "insight_soft_min": { "type": "integer", "minimum": 0, "maximum": 24 },
+        "insight_soft_max": { "type": "integer", "minimum": 1, "maximum": 24 },
+        "insight_safety_cap": { "type": "integer", "minimum": 1, "maximum": 24 }
+      },
+      "additionalProperties": false
+    },
+    "material": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        {
+          "type": "object",
+          "required": ["markdown"],
+          "properties": {
+            "markdown": { "type": "string", "minLength": 1 },
+            "original_markdown": { "type": "string" }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "input": { "type": "string", "minLength": 1 }
+  },
+  "anyOf": [
+    { "required": ["material"] },
+    { "required": ["input"] }
+  ],
+  "additionalProperties": false
+}
+

@@ -1,0 +1,21 @@
+{
+  "schema_version": "progressive-reading.preprocess.request/v1",
+  "contract_version": "1.0.0",
+  "material": {
+    "markdown": "# 合成译文\n\n可靠的接口把模型生成与确定性链接分开。\n\n不确定的对应关系必须保留为待处理状态。",
+    "original_markdown": "# Synthetic Original\n\nA reliable interface separates model generation from deterministic links.\n\nUncertain alignments must remain explicitly pending."
+  },
+  "source_type": "synthetic_translation",
+  "source_metadata": {
+    "source_url": "https://example.invalid/synthetic/translation",
+    "original_url": "https://example.invalid/synthetic/original",
+    "title": "恢复原文后的合成译文",
+    "translation": {
+      "is_translation": true,
+      "original_language": "en",
+      "translation_language": "zh"
+    }
+  },
+  "user_instruction": "整篇清洗；验证原文注入后恢复到正常阅读池。"
+}
+

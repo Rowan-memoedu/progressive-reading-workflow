@@ -1,0 +1,19 @@
+{
+  "schema_version": "progressive-reading.preprocess.request/v1",
+  "contract_version": "1.0.0",
+  "material": {
+    "markdown": "# 合成译文\n\n可靠的接口把模型生成与确定性链接分开。\n\n不确定的对应关系必须保留为待处理状态。"
+  },
+  "source_type": "synthetic_translation",
+  "source_metadata": {
+    "source_url": "https://example.invalid/synthetic/translation",
+    "title": "缺少原文链接的合成译文",
+    "translation": {
+      "is_translation": true,
+      "original_language": "en",
+      "translation_language": "zh"
+    }
+  },
+  "user_instruction": "整篇清洗；缺少原文链接时不得进入正常阅读池。"
+}
+
