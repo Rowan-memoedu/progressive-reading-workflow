@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
@@ -22,7 +22,29 @@ import {
 } from "./learning-project-core.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const workflowRoot = path.resolve(__dirname, "..");
+const codeWorkflowRoot = path.resolve(__dirname, "..");
+
+function resolveWorkflowRoot() {
+  const configuredRoot = String(process.env.PROGRESSIVE_READING_WORKFLOW_ROOT || "").trim();
+  if (configuredRoot) return path.resolve(configuredRoot);
+
+  try {
+    const gitCommonDir = execFileSync(
+      "git",
+      ["-C", codeWorkflowRoot, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { encoding: "utf8", windowsHide: true }
+    ).trim();
+    const workspaceRoot = path.dirname(path.resolve(gitCommonDir));
+    const canonicalWorkflowRoot = path.join(workspaceRoot, "04 Projects", "渐进阅读工作流");
+    if (existsSync(canonicalWorkflowRoot)) return canonicalWorkflowRoot;
+  } catch {
+    // Non-Git deployments keep using the directory that contains this script.
+  }
+
+  return codeWorkflowRoot;
+}
+
+const workflowRoot = resolveWorkflowRoot();
 const importScript = path.join(__dirname, "import-web-md.mjs");
 const rssScript = path.join(__dirname, "rss-workflow.mjs");
 const localTranscribeScript = path.join(__dirname, "local-whispercpp-transcribe.py");
@@ -31,6 +53,7 @@ const importsRoot = path.join(workflowRoot, "imports");
 const appRunsRoot = path.join(importsRoot, "app-runs");
 const learningRoot = path.resolve(process.env.LEARNING_PROJECT_ROOT || defaultLearningRoot);
 const browserHighlightRoot = path.join(readingRoot, "浏览器高亮");
+const browserCompletedRoot = path.join(workflowRoot, "待归档原文");
 const defaultPort = Number(process.env.PROGRESSIVE_READING_APP_PORT || 37829);
 const producerConfigDir = path.join(process.env.USERPROFILE || process.env.HOME || "", "Documents", "New project");
 const producerConfigKeys = ["AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL"];
@@ -836,6 +859,125 @@ async function writeBrowserHighlightCapture(rawPayload) {
     selectedChars: payload.selectionText.length,
     highlightStatus: applied.highlightStatus,
     conversionMethod
+  };
+}
+
+async function browserDraftTarget(root, sourceUrl, title, destination) {
+  const parsed = new URL(sourceUrl);
+  const label = destination === "completed" ? "浏览器完成阅读" : "浏览器加工";
+  const suffix = `--${label}--${shortHash(parsed.href)}.md`;
+  const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+  const existing = entries.find((entry) => entry.isFile() && entry.name.endsWith(suffix));
+  if (existing) return path.join(root, existing.name);
+  return path.join(root, `${safeName(title || parsed.hostname || "browser-reading")}${suffix}`);
+}
+
+function browserDraftDocument({ draft, converted, destination, metadataFileName }) {
+  const title = converted.title || draft.title || new URL(draft.url).hostname;
+  const now = nowIso();
+  return [
+    "---",
+    `source_url: ${yamlString(draft.url)}`,
+    `source_title: ${yamlString(title)}`,
+    `imported_at: ${yamlString(now)}`,
+    `updated_at: ${yamlString(now)}`,
+    `import_method: ${destination === "completed" ? "browser_complete_reading" : "browser_draft_commit"}`,
+    "highlight_mode: virtual_metadata",
+    `conversion_method: ${yamlString(converted.method)}`,
+    `browser_draft_id: ${yamlString(draft.id)}`,
+    `browser_draft_revision: ${Number(draft.revision || 0)}`,
+    `browser_metadata_file: ${yamlString(metadataFileName)}`,
+    `status: ${destination === "completed" ? "done" : "imported"}`,
+    "---",
+    "",
+    `# ${title}`,
+    "",
+    `Source: [${draft.url}](${draft.url})`,
+    "",
+    normalizeMarkdownText(converted.markdown || "", 300000),
+    ""
+  ].join("\n");
+}
+
+async function writeBrowserDraftCommit(rawBody, destination = "reading") {
+  const rawDraft = rawBody?.draft || {};
+  const draft = {
+    ...rawDraft,
+    url: String(rawDraft.url || "").trim(),
+    title: String(rawDraft.title || "").trim(),
+    pageText: normalizeMarkdownText(rawDraft.pageText || "", 300000),
+    html: normalizeMarkdownText(rawDraft.html || "", 1000000),
+    annotations: Array.isArray(rawDraft.annotations) ? rawDraft.annotations : [],
+    qaCards: Array.isArray(rawDraft.qaCards) ? rawDraft.qaCards : [],
+    articleMusing: rawDraft.articleMusing || null,
+    sourceType: String(rawDraft.sourceType || "browser_page"),
+    sourceMetadata: rawDraft.sourceMetadata && typeof rawDraft.sourceMetadata === "object" ? rawDraft.sourceMetadata : {},
+    userInstruction: String(rawDraft.userInstruction || "")
+  };
+  let parsed;
+  try {
+    parsed = new URL(draft.url);
+  } catch {
+    throw new Error("invalid_url");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("unsupported_url_protocol");
+  if (!draft.html && !draft.pageText) throw new Error("empty_page_content");
+
+  const converted = browserPageToMarkdown({
+    html: draft.html,
+    pageText: draft.pageText,
+    sourceUrl: parsed.href,
+    title: draft.title
+  });
+  const root = destination === "completed" ? browserCompletedRoot : browserHighlightRoot;
+  await fs.mkdir(root, { recursive: true });
+  const target = await browserDraftTarget(root, parsed.href, converted.title || draft.title, destination);
+  const metadataTarget = `${target}.browser-ir.json`;
+  const markdown = browserDraftDocument({
+    draft: { ...draft, url: parsed.href },
+    converted,
+    destination,
+    metadataFileName: path.basename(metadataTarget)
+  });
+  const rawMarkdownSha256 = createHash("sha256").update(converted.markdown).digest("hex");
+  const finalMarkdownSha256 = createHash("sha256").update(markdown).digest("hex");
+  const metadata = {
+    schema_version: 1,
+    status: destination === "completed" ? "completed_pending_archive" : "saved_locked",
+    destination,
+    draft_id: draft.id,
+    revision: Number(draft.revision || 0),
+    source_type: draft.sourceType,
+    source_metadata: {
+      ...draft.sourceMetadata,
+      source_url: parsed.href,
+      source_title: converted.title || draft.title,
+      conversion_method: converted.method,
+      raw_markdown_sha256: rawMarkdownSha256
+    },
+    user_instruction: draft.userInstruction,
+    annotations: draft.annotations,
+    article_musing: draft.articleMusing,
+    qa_cards: draft.qaCards,
+    completion_intent: destination === "completed" ? "pending_archive" : null,
+    created_at: nowIso()
+  };
+  await fs.writeFile(target, markdown, "utf8");
+  await fs.writeFile(metadataTarget, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+  return {
+    status: destination === "completed" ? "completed_pending_archive" : "saved_locked",
+    artifacts: [
+      { kind: "markdown", path: target, sha256: finalMarkdownSha256 },
+      { kind: "browser_ir_metadata", path: metadataTarget }
+    ],
+    source_metadata: metadata.source_metadata,
+    receipt: {
+      draft_id: draft.id,
+      revision: Number(draft.revision || 0),
+      destination,
+      committed_at: nowIso()
+    },
+    errors: []
   };
 }
 
@@ -1937,6 +2079,7 @@ async function handle(req, res) {
       service: "local-ir-browser-highlight",
       readingRoot,
       browserHighlightRoot,
+      browserCompletedRoot,
       now: nowIso()
     });
   }
@@ -1944,6 +2087,22 @@ async function handle(req, res) {
     try {
       const body = JSON.parse(await readRequest(req, { maxBytes: 8 * 1024 * 1024 }) || "{}");
       return sendJson(res, 200, await writeBrowserHighlightCapture(body));
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/highlights/commit") {
+    try {
+      const body = JSON.parse(await readRequest(req, { maxBytes: 8 * 1024 * 1024 }) || "{}");
+      return sendJson(res, 200, await writeBrowserDraftCommit(body, "reading"));
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/highlights/complete") {
+    try {
+      const body = JSON.parse(await readRequest(req, { maxBytes: 8 * 1024 * 1024 }) || "{}");
+      return sendJson(res, 200, await writeBrowserDraftCommit(body, "completed"));
     } catch (error) {
       return sendJson(res, 400, { error: error.message });
     }

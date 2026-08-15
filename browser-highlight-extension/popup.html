@@ -38,21 +38,6 @@
       font: 13px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
       background: #fff;
     }
-    .switch {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      margin: 10px 0;
-      padding: 10px;
-      border: 1px solid #d9dee7;
-      border-radius: 8px;
-      background: #fff;
-    }
-    .switch span {
-      font-size: 13px;
-      font-weight: 650;
-    }
     .hint {
       margin: 6px 0 0;
       color: #667085;
@@ -110,23 +95,21 @@
 <body>
   <h1>Local IR Browser Highlight</h1>
   <div class="meta">
-    <span id="version">v0.2.0</span>
+    <span id="version">v0.4.0</span>
     <span>目录：browser-highlight-extension</span>
   </div>
   <label for="port">本地服务端口</label>
   <input id="port" type="number" min="1" max="65535" step="1" value="37829">
   <p class="hint">先在渐进阅读工作流目录运行 <code>npm run app</code>。插件会自动探测 37829-37849；这里也可以手动指定端口。</p>
 
-  <div class="switch">
-    <span>高亮模式</span>
-    <input id="enabled" type="checkbox">
-  </div>
+  <p class="hint">网页初始化、加工模式与挖空模式均在页面右下角操作面板中完成。</p>
 
   <div class="buttons">
     <button id="health" class="secondary">健康检查</button>
     <button id="diagnose" class="secondary">运行诊断</button>
     <button id="openTest" class="secondary">打开测试页</button>
-    <button id="importPage" class="secondary">导入当前页</button>
+    <button id="saveDraft">保存当前版本</button>
+    <button id="completeReading" class="secondary">完成阅读</button>
     <button id="retryFailed">重试暂存</button>
   </div>
 

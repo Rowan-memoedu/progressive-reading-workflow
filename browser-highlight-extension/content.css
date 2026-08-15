@@ -2,14 +2,25 @@
   background: #fff2a8;
   color: inherit;
   border-radius: 2px;
+  cursor: pointer;
   box-decoration-break: clone;
   -webkit-box-decoration-break: clone;
+}
+
+.local-ir-browser-highlight.is-cloze {
+  background: #dbeafe;
+  border-bottom: 2px dashed #2563eb;
+}
+
+.local-ir-browser-highlight.is-merge-selected {
+  outline: 2px solid #7c3aed;
+  outline-offset: 1px;
 }
 
 .local-ir-browser-toast {
   position: fixed;
   right: 18px;
-  bottom: 18px;
+  bottom: 78px;
   z-index: 2147483647;
   max-width: min(420px, calc(100vw - 36px));
   border: 1px solid rgba(28, 35, 45, 0.14);

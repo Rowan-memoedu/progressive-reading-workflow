@@ -1,13 +1,13 @@
-const VERSION = "0.2.0";
+const VERSION = "0.4.0";
 const DEFAULT_PORT = 37829;
 const PORT_SCAN_LABEL = "37829-37849";
 
 const portInput = document.getElementById("port");
-const enabledInput = document.getElementById("enabled");
 const healthButton = document.getElementById("health");
 const diagnoseButton = document.getElementById("diagnose");
 const openTestButton = document.getElementById("openTest");
-const importPageButton = document.getElementById("importPage");
+const saveDraftButton = document.getElementById("saveDraft");
+const completeReadingButton = document.getElementById("completeReading");
 const retryFailedButton = document.getElementById("retryFailed");
 const statusEl = document.getElementById("status");
 
@@ -108,6 +108,9 @@ async function ensureContentScript(tab, report = () => {}) {
   const css = await insertCss(tab.id);
   if (!css.ok) return { ok: false, error: `CSS 注入失败：${readableError(css.error)}` };
 
+  const core = await executeScript(tab.id, ["draft-core.js"]);
+  if (!core.ok) return { ok: false, error: `draft core 注入失败：${readableError(core.error)}` };
+
   const highlighter = await executeScript(tab.id, ["lib/web-highlighter.min.js"]);
   if (!highlighter.ok) return { ok: false, error: `web-highlighter 注入失败：${readableError(highlighter.error)}` };
 
@@ -117,12 +120,6 @@ async function ensureContentScript(tab, report = () => {}) {
   const injected = await sendTabMessageTo(tab.id, { type: "get-content-status" });
   if (injected && injected.ok) return injected;
   return { ok: false, error: `注入后 content script 仍未响应：${readableError(injected && injected.error)}` };
-}
-
-async function sendTabMessage(message) {
-  const tab = await activeTab();
-  if (!tab || !tab.id) return { ok: false, error: "no_active_tab" };
-  return sendTabMessageTo(tab.id, message);
 }
 
 async function refreshFailedCount() {
@@ -184,7 +181,7 @@ async function runDiagnostics() {
 
   const injected = await ensureContentScript(tab, (line) => appendStatus(`4. ${line}`));
   if (injected.ok) {
-    appendStatus("5. content script：正常，可开启高亮模式。");
+    appendStatus(`5. content script：正常，${injected.initialized ? "当前页已有草稿" : "请在网页操作面板点击初始化加工"}；模式 ${injected.mode || "off"}。`);
   } else {
     appendStatus(`5. content script：失败，${readableError(injected.error)}`);
   }
@@ -193,13 +190,11 @@ async function runDiagnostics() {
 async function loadState() {
   setStatus(`popup 脚本已加载 v${VERSION}\n正在初始化。`);
   const data = await storageGet({
-    localIrPort: DEFAULT_PORT,
-    localIrHighlightEnabled: false
+    localIrPort: DEFAULT_PORT
   });
   portInput.value = String(data.localIrPort || DEFAULT_PORT);
-  enabledInput.checked = Boolean(data.localIrHighlightEnabled);
   await refreshFailedCount();
-  appendStatus("初始化完成。点击“运行诊断”可查看每一步。");
+  appendStatus("popup 初始化完成。网页草稿请从页面右下角手动初始化；加工/挖空模式也在页面面板切换。");
 }
 
 async function withButton(button, action) {
@@ -223,34 +218,6 @@ portInput.addEventListener("change", () => {
   });
 });
 
-enabledInput.addEventListener("change", () => {
-  withButton(enabledInput, async () => {
-    const enabled = enabledInput.checked;
-
-    if (enabled) {
-      setStatus("正在注入当前页。");
-      const tab = await activeTab();
-      const injected = await ensureContentScript(tab, (line) => appendStatus(line));
-      if (!injected.ok) {
-        enabledInput.checked = false;
-        await storageSet({ localIrHighlightEnabled: false });
-        setStatus(`高亮模式开启失败：${readableError(injected.error)}`);
-        return;
-      }
-    }
-
-    await storageSet({ localIrHighlightEnabled: enabled });
-    const response = await sendTabMessage({ type: "set-highlight-enabled", enabled });
-    if (!response.ok && enabled) {
-      enabledInput.checked = false;
-      await storageSet({ localIrHighlightEnabled: false });
-      setStatus(`高亮模式开启失败：${readableError(response.error)}`);
-    } else {
-      setStatus(enabled ? "高亮模式已开启。选中文本后会保存到本地阅读区。" : "高亮模式已关闭。");
-    }
-  });
-});
-
 healthButton.addEventListener("click", () => withButton(healthButton, () => refreshHealthStatus(true)));
 
 diagnoseButton.addEventListener("click", () => withButton(diagnoseButton, runDiagnostics));
@@ -266,22 +233,31 @@ openTestButton.addEventListener("click", () => {
     const port = healthPort(health);
     portInput.value = String(port);
     const opened = await createTab(`http://127.0.0.1:${port}/browser-highlight-test`);
-    setStatus(opened.ok ? "已打开测试页。请在测试页上开启高亮模式并选中文本。" : `打开测试页失败：${readableError(opened.error)}`);
+    setStatus(opened.ok ? "已打开测试页。请在页面右下角点击初始化加工，再选择加工或挖空模式。" : `打开测试页失败：${readableError(opened.error)}`);
   });
 });
 
-importPageButton.addEventListener("click", () => {
-  withButton(importPageButton, async () => {
-    setStatus("正在提交当前页导入。");
-    const tab = await activeTab();
-    if (!tab || !tab.url || !isSupportedPage(tab.url)) {
-      setStatus("当前页不是可导入的 http/https 页面。");
-      return;
-    }
-    const response = await sendRuntimeMessage({ type: "import-current-url", url: tab.url });
-    setStatus(response.ok ? `已提交导入任务：${response.result.id || "queued"}` : `提交失败：${readableError(response.error)}`);
-  });
-});
+async function submitCurrentDraft(destination) {
+  const tab = await activeTab();
+  if (!tab || !tab.id || !tab.url || !isSupportedPage(tab.url)) {
+    setStatus("当前页不是可加工的 http/https 页面。");
+    return;
+  }
+  const injected = await ensureContentScript(tab);
+  if (!injected.ok) {
+    setStatus(`当前页不可用：${readableError(injected.error)}`);
+    return;
+  }
+  const response = await sendTabMessageTo(tab.id, { type: "save-draft", destination });
+  if (!response.ok) {
+    setStatus(`提交失败：${readableError(response.error)}`);
+    return;
+  }
+  setStatus(destination === "completed" ? "已完成阅读，Markdown 已进入待归档原文。" : "当前版本已保存并锁定。");
+}
+
+saveDraftButton.addEventListener("click", () => withButton(saveDraftButton, () => submitCurrentDraft("reading")));
+completeReadingButton.addEventListener("click", () => withButton(completeReadingButton, () => submitCurrentDraft("completed")));
 
 retryFailedButton.addEventListener("click", () => {
   withButton(retryFailedButton, async () => {

@@ -163,6 +163,57 @@ async function run() {
       if (!unlocatedContent.includes(expected)) throw new Error(`missing_unlocated_content:${expected}`);
     }
 
+    const draftPayload = {
+      id: "synthetic-browser-draft",
+      url: "https://local.test/browser-draft-commit",
+      title: "Browser Draft Commit Test",
+      sourceType: "browser_page",
+      sourceMetadata: { source_url: "https://local.test/browser-draft-commit", capture_id: "synthetic-draft" },
+      userInstruction: "保留技术术语",
+      pageText: "Browser Draft Commit Test\n\nThis body stays unchanged while virtual highlight metadata remains separate.",
+      html: "<!doctype html><html><body><main><article><h1>Browser Draft Commit Test</h1><p>This body stays unchanged while virtual highlight metadata remains separate.</p><p>Additional prose keeps the article conversion stable for the synthetic test.</p></article></main></body></html>",
+      annotations: [{
+        id: "annotation-a",
+        selectedText: "virtual highlight metadata",
+        currentText: "virtual highlight metadata",
+        type: "comment",
+        commentMarkdown: "本地批注",
+        rewriteMarkdown: "",
+        markKind: "highlight",
+        ranges: [{ start: 57, end: 83 }],
+        createdAt: "2026-08-15T00:00:01.000Z",
+        updatedAt: "2026-08-15T00:00:01.000Z"
+      }],
+      articleMusing: { id: "musing-a", bodyMarkdown: "合成随想" },
+      qaCards: [{ id: "qa-a", questionMarkdown: "What stays separate?", answerMarkdown: "Metadata." }],
+      revision: 3,
+      createdAt: "2026-08-15T00:00:00.000Z",
+      updatedAt: "2026-08-15T00:00:02.000Z"
+    };
+    const committed = await requestJson(`${baseUrl}/api/highlights/commit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ draft: draftPayload })
+    });
+    if (committed.status !== "saved_locked") throw new Error("draft_commit_not_locked");
+    for (const artifact of committed.artifacts || []) createdTargets.add(artifact.path);
+    const committedMarkdown = await fs.readFile(committed.artifacts[0].path, "utf8");
+    if (!committedMarkdown.includes("highlight_mode: virtual_metadata")) throw new Error("draft_commit_missing_virtual_mode");
+    if (committedMarkdown.includes("==virtual highlight metadata==")) throw new Error("draft_commit_embedded_virtual_highlight");
+    const committedMetadata = JSON.parse(await fs.readFile(committed.artifacts[1].path, "utf8"));
+    if (committedMetadata.annotations.length !== 1) throw new Error("draft_commit_missing_annotations");
+    if (committedMetadata.user_instruction !== "保留技术术语") throw new Error("draft_commit_missing_instruction");
+
+    const completed = await requestJson(`${baseUrl}/api/highlights/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ draft: { ...draftPayload, id: "synthetic-browser-complete", url: "https://local.test/browser-draft-complete" } })
+    });
+    if (completed.status !== "completed_pending_archive") throw new Error("complete_status_invalid");
+    for (const artifact of completed.artifacts || []) createdTargets.add(artifact.path);
+    if (!completed.artifacts[0].path.includes(`${path.sep}待归档原文${path.sep}`)) throw new Error("complete_not_in_pending_archive");
+    if (completed.artifacts[0].path.includes(`${path.sep}阅读区${path.sep}`)) throw new Error("complete_wrote_reading_area");
+
     let invalidRejected = false;
     try {
       await requestJson(`${baseUrl}/api/highlights/capture`, {
@@ -179,7 +230,7 @@ async function run() {
       status: "passed",
       health: health.status,
       target: first.target,
-      checks: ["health", "test_page", "cors_preflight", "full_page_capture", "same_url_update", "inline_highlight_markdown", "unlocated_fallback", "invalid_payload"]
+      checks: ["health", "test_page", "cors_preflight", "legacy_full_page_capture", "same_url_update", "legacy_inline_highlight", "unlocated_fallback", "draft_commit", "virtual_metadata_separation", "complete_to_pending_archive", "invalid_payload"]
     }, null, 2));
   } finally {
     for (const target of createdTargets) {

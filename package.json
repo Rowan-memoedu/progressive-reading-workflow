@@ -11,7 +11,7 @@
     "import:guided": "node scripts/import-web-md.mjs --guided-wechat",
     "browser-highlight:sync-lib": "node scripts/sync-browser-highlight-extension.mjs",
     "browser-highlight:test": "node scripts/test-browser-highlight-workflow.mjs",
-    "browser-highlight:check": "node scripts/sync-browser-highlight-extension.mjs && node --check scripts/progressive-reading-app.mjs && node --check browser-highlight-extension/background.js && node --check browser-highlight-extension/content.js && node --check browser-highlight-extension/popup.js && node --check scripts/test-browser-highlight-workflow.mjs && node scripts/check-browser-highlight-extension.mjs && node scripts/test-browser-highlight-workflow.mjs",
+    "browser-highlight:check": "node scripts/sync-browser-highlight-extension.mjs && node --check scripts/progressive-reading-app.mjs && node --check browser-highlight-extension/draft-core.js && node --check browser-highlight-extension/background.js && node --check browser-highlight-extension/content.js && node --check browser-highlight-extension/popup.js && node --check scripts/test-browser-draft-core.mjs && node --check scripts/test-browser-initialization-ui.mjs && node --check scripts/test-browser-highlight-workflow.mjs && node scripts/check-browser-highlight-extension.mjs && node scripts/test-browser-draft-core.mjs && node scripts/test-browser-initialization-ui.mjs && node scripts/test-browser-highlight-workflow.mjs",
     "learning-project": "node scripts/learning-project.mjs",
     "learning-project:check": "node --check scripts/learning-project-core.mjs && node --check scripts/learning-project.mjs && node --check scripts/progressive-reading-app.mjs && node scripts/test-learning-project-workflow.mjs && node scripts/test-learning-project-app.mjs",
     "readwise:setup": "node scripts/setup-readwise-official-plugin.mjs",
@@ -20,6 +20,10 @@
     "readwise:manifest": "node scripts/migrate-readwise-obsidian.mjs --manifest-only",
     "remnote:import": "node scripts/import-remnote-queue.mjs",
     "remnote:import:dry": "node scripts/import-remnote-queue.mjs --dry-run",
+    "remnote:archive": "node scripts/import-remnote-queue.mjs",
+    "remnote:archive:dry": "node scripts/import-remnote-queue.mjs --dry-run",
+    "remnote:archive:dry:json": "node scripts/import-remnote-queue.mjs --dry-run --json",
+    "remnote:archive:check": "node --check scripts/import-remnote-queue.mjs && node --check remnote-formal-archive/core.mjs && node --test remnote-formal-archive/tests/*.test.mjs",
     "bilingual:resolve": "node scripts/resolve-bilingual-queue.mjs",
     "bilingual:resolve:dry": "node scripts/resolve-bilingual-queue.mjs --dry-run",
     "qa:resolve": "node scripts/resolve-qa-queue.mjs",
@@ -37,7 +41,8 @@
     "rss:schedule": "node scripts/rss-workflow.mjs schedule",
     "rss:services:up": "node scripts/rss-workflow.mjs services-up",
     "rss:services:down": "node scripts/rss-workflow.mjs services-down",
-    "rss:services:ps": "node scripts/rss-workflow.mjs services-ps"
+    "rss:services:ps": "node scripts/rss-workflow.mjs services-ps",
+    "social-archive:check": "node %USERPROFILE%/.codex/skills/archive-social-reading/scripts/offline-check.mjs --project-root . --receipt imports/social-reading-archive/phase-1-2026-08-14/validation.json"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
