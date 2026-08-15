@@ -5,6 +5,10 @@
   "type": "module",
   "scripts": {
     "app": "node scripts/progressive-reading-app.mjs",
+    "preprocess": "node standard-preprocessing/cli.mjs",
+    "preprocess:test": "node --test standard-preprocessing/test/*.test.mjs",
+    "preprocess:canary": "node standard-preprocessing/canary/run-canary.mjs",
+    "preprocess:canary:live": "node standard-preprocessing/canary/run-live-canary.mjs",
     "import": "node scripts/import-web-md.mjs",
     "import:csdiy": "node scripts/import-web-md.mjs --csdiy-full",
     "import:cs-plan": "node scripts/import-web-md.mjs --cs-plan-full",

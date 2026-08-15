@@ -1,0 +1,16 @@
+{
+  "schema_version": "progressive-reading.preprocess.request/v1",
+  "contract_version": "1.0.0",
+  "material": {
+    "markdown": "# 合成材料：小步验证\n\n一个可靠的处理接口应把语义判断与确定性渲染分开。模型可以提出洞察，但不能猜测正文锚点。\n\n幂等性需要同时考虑材料身份、输入内容、合同版本和用户补充指令。重复请求应复用相同产物，而不是复制文件。\n\n失败降级必须保留原文，并明确标记待判断项，不能用看似完整的内容掩盖模型失败。"
+  },
+  "source_type": "synthetic_markdown",
+  "source_metadata": {
+    "source_url": "https://example.invalid/synthetic/monolingual",
+    "title": "合成材料：小步验证",
+    "author": "Synthetic Fixture",
+    "source_is_original": true
+  },
+  "user_instruction": "保留技术术语，输出适合渐进阅读的正式 Markdown。"
+}
+

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "progressive-reading.preprocess.result/v1",
+  "title": "Progressive reading preprocessing result v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "contract_version",
+    "status",
+    "material_id",
+    "idempotency_key",
+    "processing_state",
+    "translation_state",
+    "artifacts",
+    "source_metadata",
+    "receipt",
+    "errors"
+  ],
+  "properties": {
+    "schema_version": { "const": "progressive-reading.preprocess.result/v1" },
+    "contract_version": { "const": "1.0.0" },
+    "status": {
+      "enum": ["completed", "completed_with_warnings", "quarantined", "failed", "idempotent_replay"]
+    },
+    "material_id": { "type": ["string", "null"] },
+    "idempotency_key": { "type": ["string", "null"] },
+    "processing_state": {
+      "enum": ["rendered", "degraded", "quarantined", "failed"]
+    },
+    "translation_state": {
+      "enum": ["not_translation", "translation_original_missing", "alignment_pending", "aligned", "unknown"]
+    },
+    "artifacts": { "type": "object" },
+    "source_metadata": { "type": "object" },
+    "receipt": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "stage", "message", "retryable", "severity"]
+      }
+    }
+  },
+  "additionalProperties": false
+}
+
