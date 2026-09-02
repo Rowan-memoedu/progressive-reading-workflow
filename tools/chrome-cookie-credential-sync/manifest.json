@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Local IR Chrome Cookie Credential Sync",
+  "version": "1.0.0",
+  "description": "Manually synchronize the current Chrome profile's accessible HTTP/HTTPS cookies to the local progressive-reading service.",
+  "permissions": [
+    "cookies"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "同步全部 Chrome Cookie"
+  },
+  "background": {
+    "service_worker": "service-worker.js"
+  }
+}

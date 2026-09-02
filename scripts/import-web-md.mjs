@@ -47,6 +47,8 @@ let importCsdiyFull = false;
 let importCsPlanFull = false;
 let guidedWechat = false;
 let importInstruction = "";
+let browserContentPath = "";
+let receiptPath = "";
 
 for (let i = 0; i < args.length; i += 1) {
   if (args[i] === "--out" && args[i + 1]) {
@@ -57,6 +59,12 @@ for (let i = 0; i < args.length; i += 1) {
     i += 1;
   } else if (args[i] === "--instruction" && args[i + 1]) {
     importInstruction = args[i + 1];
+    i += 1;
+  } else if (args[i] === "--browser-content" && args[i + 1]) {
+    browserContentPath = path.resolve(args[i + 1]);
+    i += 1;
+  } else if (args[i] === "--receipt" && args[i + 1]) {
+    receiptPath = path.resolve(args[i + 1]);
     i += 1;
   } else if (args[i] === "--csdiy-full") {
     importCsdiyFull = true;
@@ -78,8 +86,8 @@ if (guidedWechat && outDir === defaultOutDir) {
   outDir = defaultGuidedOutDir;
 }
 
-if (urls.length === 0 && !importCsdiyFull && !importCsPlanFull) {
-  console.error("Usage: npm run import -- <url...> [--out <dir>] [--instruction <text>]\n       npm run import:guided -- <wechat-url...> [--out <dir>] [--staging <dir>] [--instruction <text>]\n       npm run import:csdiy -- [--out <dir>]\n       npm run import:cs-plan -- [--out <dir>]");
+if (urls.length === 0 && !importCsdiyFull && !importCsPlanFull && !browserContentPath) {
+  console.error("Usage: npm run import -- <url...> [--out <dir>] [--instruction <text>] [--receipt <path>]\n       npm run import -- --browser-content <capture.json> [--out <dir>] [--instruction <text>] [--receipt <path>]\n       npm run import:guided -- <wechat-url...> [--out <dir>] [--staging <dir>] [--instruction <text>]\n       npm run import:csdiy -- [--out <dir>]\n       npm run import:cs-plan -- [--out <dir>]");
   process.exit(1);
 }
 
@@ -318,6 +326,44 @@ function htmlToMarkdown(html, url) {
   };
 }
 
+function browserExtractedHtmlToMarkdown(record) {
+  const url = String(record?.url || "");
+  const title = String(record?.title || "").trim();
+  const html = String(record?.html || "");
+  if (!url || !title || !html) throw new Error("browser_capture_missing_url_title_or_html");
+
+  const dom = new JSDOM(`<article id="browser-captured-content">${html}</article>`, { url });
+  const content = dom.window.document.querySelector("#browser-captured-content");
+  content.querySelectorAll("script, style, button, noscript").forEach((element) => element.remove());
+  content.querySelectorAll("img").forEach((img) => {
+    const src = img.getAttribute("data-original")
+      || img.getAttribute("data-actualsrc")
+      || img.getAttribute("data-src")
+      || img.getAttribute("src");
+    if (src) img.setAttribute("src", src);
+  });
+
+  const textLength = (content.textContent || "").replace(/\s+/g, "").length;
+  if (textLength < 20) throw new Error(`browser_capture_body_too_short_${textLength}`);
+  const converted = absolutizeMarkdownLinks(turndown.turndown(content.innerHTML).trim(), url);
+  return {
+    method: "browser_authenticated_dom",
+    title,
+    author: String(record?.author || "").trim(),
+    publishedAt: String(record?.publishedAt || "").trim(),
+    sourceColumn: String(record?.columnName || "").trim(),
+    sourceColumnUrl: String(record?.columnUrl || "").trim(),
+    sourceColumns: (Array.isArray(record?.sourceColumns) ? record.sourceColumns : [record?.columnName])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean),
+    sourceColumnUrls: (Array.isArray(record?.sourceColumnUrls) ? record.sourceColumnUrls : [record?.columnUrl])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean),
+    sourceItemId: String(record?.sourceItemId || "").trim(),
+    markdown: `# ${title}\n\n${converted}`
+  };
+}
+
 function firstMetaContent(document, selectors) {
   for (const selector of selectors) {
     const element = document.querySelector(selector);
@@ -393,8 +439,17 @@ async function writeMarkdown(url, result) {
   await fs.mkdir(outDir, { recursive: true });
   const parsed = new URL(url);
   const title = result.title || result.markdown.match(/^#\s+(.+)$/m)?.[1] || parsed.hostname;
-  const filename = `${slugFromTitle(title, parsed.hostname)}.md`;
-  const target = path.join(outDir, filename);
+  const titleSlug = slugFromTitle(title, parsed.hostname);
+  let target = path.join(outDir, `${titleSlug}.md`);
+  try {
+    const existing = await fs.readFile(target, "utf8");
+    if (!existing.includes(`source_url: ${yamlString(url)}`)) {
+      const sourceId = sanitizePathSegment(parsed.pathname.split("/").filter(Boolean).at(-1) || slugFromUrl(url));
+      target = path.join(outDir, `${titleSlug} [${sourceId}].md`);
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
   const now = new Date().toISOString();
   const sourceLine = result.rawUrl ? `source_markdown_url: ${yamlString(result.rawUrl)}\n` : "";
   const outline = await ensureMarkdownOutline({
@@ -419,6 +474,11 @@ async function writeMarkdown(url, result) {
     `import_method: ${yamlString(result.method)}`,
     `outline_method: ${yamlString(outline.method)}`,
     `reading_guide_method: ${yamlString(guide.method)}`,
+    result.sourceColumn ? `source_column: ${yamlString(result.sourceColumn)}` : null,
+    result.sourceColumnUrl ? `source_column_url: ${yamlString(result.sourceColumnUrl)}` : null,
+    result.sourceColumns?.length ? `source_columns: ${yamlString(JSON.stringify(result.sourceColumns))}` : null,
+    result.sourceColumnUrls?.length ? `source_column_urls: ${yamlString(JSON.stringify(result.sourceColumnUrls))}` : null,
+    result.sourceItemId ? `source_item_id: ${yamlString(result.sourceItemId)}` : null,
     "status: imported",
     "reading_guide: true",
     "---",
@@ -2150,6 +2210,47 @@ if (importCsPlanFull) {
   }
 }
 
+if (browserContentPath) {
+  const capture = JSON.parse(await fs.readFile(browserContentPath, "utf8"));
+  if (!Array.isArray(capture?.items) || capture.items.length === 0) {
+    throw new Error("browser_capture_items_missing");
+  }
+  const baseOutDir = outDir;
+  for (let index = 0; index < capture.items.length; index += 1) {
+    const item = capture.items[index];
+    const sourceUrl = String(item?.url || "");
+    const itemIndex = Number(item?.index) || index + 1;
+    outDir = capture.layout === "column_folders"
+      ? path.join(baseOutDir, sanitizePathSegment(String(item?.columnName || "未分类专栏")))
+      : capture.layout === "flat"
+        ? baseOutDir
+        : path.join(baseOutDir, String(itemIndex).padStart(3, "0"));
+    console.error(`[browser-content ${index + 1}/${capture.items.length}] ${sourceUrl}`);
+    try {
+      const converted = browserExtractedHtmlToMarkdown(item);
+      const target = await writeMarkdown(sourceUrl, converted);
+      summary.push({
+        index: itemIndex,
+        url: sourceUrl,
+        status: "imported",
+        method: converted.method,
+        column: converted.sourceColumn || "",
+        target
+      });
+    } catch (error) {
+      const target = await writeFailure(sourceUrl, error.message);
+      summary.push({
+        index: itemIndex,
+        url: sourceUrl,
+        status: "failed",
+        reason: error.message,
+        target
+      });
+    }
+  }
+  outDir = baseOutDir;
+}
+
 for (const url of urls) {
   try {
     if (guidedWechat) {
@@ -2201,6 +2302,17 @@ for (const url of urls) {
     const target = await writeFailure(url, error.message);
     summary.push({ url, status: "failed", reason: error.message, target });
   }
+}
+
+if (receiptPath) {
+  await fs.mkdir(path.dirname(receiptPath), { recursive: true });
+  await fs.writeFile(receiptPath, `${JSON.stringify({
+    schemaVersion: 1,
+    createdAt: new Date().toISOString(),
+    browserContentPath: browserContentPath || null,
+    outDir,
+    summary
+  }, null, 2)}\n`, "utf8");
 }
 
 console.log(JSON.stringify(summary, null, 2));

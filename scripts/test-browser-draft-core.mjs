@@ -34,6 +34,25 @@ assert.equal(draft.status, "editing");
 }));
 assert.equal(draft.annotations.length, 2);
 
+let adjacentDraft = Core.createDraft({
+  url: "https://local.test/adjacent",
+  sourceText: "FirstSecond",
+  pageText: "FirstSecond"
+});
+({ draft: adjacentDraft } = Core.addAnnotation(adjacentDraft, { selectedText: "First", ranges: [{ start: 0, end: 5 }] }));
+({ draft: adjacentDraft } = Core.addAnnotation(adjacentDraft, { selectedText: "Second", ranges: [{ start: 5, end: 11 }] }));
+assert.equal(adjacentDraft.annotations.length, 2, "adjacent half-open ranges must remain independently mergeable annotations");
+
+let overlappingDraft = Core.createDraft({
+  url: "https://local.test/overlapping",
+  sourceText: "Alpha beta gamma",
+  pageText: "Alpha beta gamma"
+});
+({ draft: overlappingDraft } = Core.addAnnotation(overlappingDraft, { selectedText: "Alpha beta", ranges: [{ start: 0, end: 10 }] }));
+({ draft: overlappingDraft } = Core.addAnnotation(overlappingDraft, { selectedText: "beta gamma", ranges: [{ start: 6, end: 16 }] }));
+assert.equal(overlappingDraft.annotations.length, 1, "genuinely overlapping ranges must continue to merge automatically");
+assert.deepEqual(overlappingDraft.annotations[0].ranges, [{ start: 0, end: 16 }]);
+
 const ids = draft.annotations.map((item) => item.id);
 ({ draft } = Core.mergeAnnotations(draft, ids));
 assert.equal(draft.annotations.length, 1);
@@ -60,6 +79,67 @@ const completed = Core.markCompleted(draft, { status: "done" });
 assert.equal(completed.status, "completed_pending_archive");
 assert.equal(completed.locked, true);
 
+const documentState = Core.createDocumentState(draft, {
+  path: "04 Projects/渐进阅读工作流/阅读区/浏览器高亮/Draft test.md",
+  title: "Draft test",
+  sourceUrl: draft.url,
+  destination: "reading",
+  markdownSha256: "final-sha",
+  rawMarkdownSha256: "raw-sha",
+  conversionMethod: "readability"
+});
+assert.equal(documentState.schema, "local-ir.document-state");
+assert.equal(documentState.document.status, "inbox");
+assert.equal(documentState.annotations.length, 2);
+assert.equal(documentState.annotations[0].renderMode, "virtual_decoration");
+assert.equal(documentState.annotations[0].path, documentState.document.path);
+assert.equal(documentState.qaCards[0].path, documentState.document.path);
+
+const completedDocumentState = Core.createDocumentState(draft, {
+  path: "04 Projects/渐进阅读工作流/待归档原文/Draft test.md",
+  title: "Draft test",
+  sourceUrl: draft.url,
+  destination: "completed",
+  documentStatus: "done",
+  markdownSha256: "final",
+  rawMarkdownSha256: "raw",
+  conversionMethod: "readability_html",
+  committedAt: "2026-08-16T00:00:00.000Z"
+});
+assert.equal(completedDocumentState.document.status, "done");
+assert.equal(completedDocumentState.annotations.length, documentState.annotations.length);
+assert.equal(completedDocumentState.articleMusing.bodyMarkdown, documentState.articleMusing.bodyMarkdown);
+assert.equal(completedDocumentState.qaCards[0].questionMarkdown, documentState.qaCards[0].questionMarkdown);
+assert.equal(documentState.articleMusing.path, documentState.document.path);
+
+const localEdit = Core.replaceDocumentCollections(documentState, {
+  path: documentState.document.path,
+  annotations: documentState.annotations.map((annotation, index) => index === 0
+    ? { ...annotation, type: "comment", commentMarkdown: "本地续写评论" }
+    : annotation),
+  qaCards: documentState.qaCards,
+  articleMusing: { ...documentState.articleMusing, bodyMarkdown: "本地续写随想" }
+});
+assert.equal(localEdit.document.revision, documentState.document.revision + 1);
+assert.equal(localEdit.annotations[0].commentMarkdown, "本地续写评论");
+assert.equal(localEdit.articleMusing.bodyMarkdown, "本地续写随想");
+assert.notEqual(Core.comparableDocumentState(documentState), Core.comparableDocumentState(localEdit));
+
+const legacyState = Core.normalizeDocumentState({
+  schema_version: 1,
+  draft_id: "legacy-draft",
+  revision: 4,
+  source_type: "browser_page",
+  source_metadata: { source_url: "https://local.test/legacy", source_title: "Legacy" },
+  annotations: documentState.annotations,
+  article_musing: documentState.articleMusing,
+  qa_cards: documentState.qaCards,
+  destination: "reading"
+}, { path: "legacy.md" });
+assert.equal(legacyState.document.id, "legacy-draft");
+assert.equal(legacyState.document.revision, 4);
+assert.equal(legacyState.document.path, "legacy.md");
+
 const retryableCompletion = Core.markFailed(Core.markPending({
   ...draft,
   submitDestination: "completed"
@@ -69,5 +149,5 @@ assert.equal(retryableCompletion.status, "error");
 
 console.log(JSON.stringify({
   status: "passed",
-  checks: ["authoring_modes", "virtual_ranges", "merge", "undo", "musing", "qa_card", "save_lock", "complete_lock", "completion_retry_destination"]
+  checks: ["authoring_modes", "virtual_ranges", "overlapping_ranges_auto_merge", "adjacent_ranges_remain_separate", "merge", "undo", "musing", "qa_card", "save_lock", "complete_lock", "document_state", "completed_document_state", "local_roundtrip", "legacy_sidecar", "completion_retry_destination"]
 }, null, 2));

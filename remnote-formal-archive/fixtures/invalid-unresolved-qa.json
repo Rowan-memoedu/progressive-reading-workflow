@@ -1,0 +1,24 @@
+{
+  "schema": "progressive-reading.local-ir-export-package/v1",
+  "packageId": "fixture-invalid-qa",
+  "packageRevision": 1,
+  "status": "export_package_ready",
+  "title": "未解析问答卡样例",
+  "sourcePath": "staging/unresolved.md",
+  "localArchive": {
+    "state": "export_package_ready",
+    "sourcePath": "staging/unresolved.md",
+    "archivedSourcePath": "archive/unresolved.md"
+  },
+  "annotations": [],
+  "cards": [
+    {
+      "id": "qa-unresolved",
+      "questionMarkdown": "问题？",
+      "answerMarkdown": "",
+      "needsAnswerGeneration": true
+    }
+  ],
+  "clozeCards": [],
+  "articleMusings": []
+}

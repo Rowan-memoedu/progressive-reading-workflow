@@ -1,0 +1,19 @@
+{
+  "schema": "progressive-reading.import-destination-routes/v1",
+  "routes": {
+    "browser_extension": {
+      "mode": "fixed",
+      "folder": "浏览器高亮"
+    },
+    "obsidian": {
+      "mode": "domain"
+    },
+    "ai": {
+      "mode": "explicit"
+    },
+    "default": {
+      "mode": "fixed",
+      "folder": "浏览器高亮"
+    }
+  }
+}

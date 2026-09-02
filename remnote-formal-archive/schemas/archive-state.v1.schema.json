@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "progressive-reading.remnote-archive-state/v1",
+  "title": "Progressive Reading formal archive local state",
+  "type": "object",
+  "required": ["schema", "engineVersion", "packages"],
+  "properties": {
+    "schema": { "const": "progressive-reading.remnote-archive-state/v1" },
+    "engineVersion": { "type": "string" },
+    "packages": { "type": "object", "additionalProperties": { "$ref": "#/$defs/packageState" } }
+  },
+  "$defs": {
+    "packageState": {
+      "type": "object",
+      "required": ["payloadHash", "status", "itemMappings"],
+      "properties": {
+        "payloadHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "status": { "enum": ["export_package_ready", "writing", "partial_failure", "remnote_imported_and_verified", "archived", "local_rolled_back"] },
+        "itemMappings": { "type": "object" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

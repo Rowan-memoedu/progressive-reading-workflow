@@ -1,0 +1,52 @@
+{
+  "schema": "progressive-reading.local-ir-export-package/v1",
+  "packageId": "fixture-article-001",
+  "packageRevision": 1,
+  "status": "export_package_ready",
+  "title": "离线归档样例",
+  "sourcePath": "staging/article.md",
+  "localArchive": {
+    "state": "export_package_ready",
+    "sourcePath": "staging/article.md",
+    "archivedSourcePath": "archive/article.md"
+  },
+  "annotations": [
+    {
+      "id": "ann-001",
+      "index": 1,
+      "type": "comment",
+      "typeLabel": "普通评论",
+      "targetDocument": "普通评论",
+      "route": "remnote",
+      "importable": true,
+      "originalText": "原文片段",
+      "currentText": "原文片段",
+      "commentMarkdown": "这是评论。",
+      "rewriteMarkdown": ""
+    }
+  ],
+  "cards": [
+    {
+      "id": "qa-001",
+      "questionMarkdown": "样例问题？",
+      "answerMarkdown": "样例答案。",
+      "needsQuestionGeneration": false,
+      "needsAnswerGeneration": false,
+      "source": "article"
+    }
+  ],
+  "clozeCards": [
+    {
+      "id": "cloze-001",
+      "sourceAnnotationId": "ann-001",
+      "clozeMarkdown": "- 这是{{挖空}}样例。"
+    }
+  ],
+  "articleMusings": [
+    {
+      "id": "musing-001",
+      "bodyMarkdown": "仅本地保留的随想。",
+      "aiStatus": "pending"
+    }
+  ]
+}

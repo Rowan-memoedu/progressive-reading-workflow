@@ -11,10 +11,16 @@
   const MAX_HTML = 1000000;
   const MAX_CONTEXT = 8000;
   const TYPE_LABELS = {
+    highlight: "仅高亮",
     comment: "普通评论",
     myth_truth: "迷思 / 真相",
+    rebuttal: "反驳",
     sample_quote: "引用",
-    add_viewpoint: "联想 / 新观点",
+    later: "稍后处理",
+    rewrite: "改写",
+    refine: "精炼",
+    add_viewpoint: "联想",
+    rebuttal_rewrite: "反驳后改写",
     question: "提问",
     optimize: "优化",
     example_viewpoint: "例子与观点",
@@ -28,6 +34,7 @@
   let lastCaptureAt = 0;
   let toastTimer = null;
   let ui = null;
+  let standardImportBusy = false;
 
   function trimText(value, maxChars) {
     return String(value || "")
@@ -47,7 +54,7 @@
     });
   }
 
-  function showToast(text, kind = "ok") {
+  function showToast(text, kind = "ok", timeoutMs = 3200) {
     let node = document.getElementById("local-ir-browser-toast");
     if (!node) {
       node = document.createElement("div");
@@ -57,7 +64,7 @@
     node.className = `local-ir-browser-toast ${kind === "error" ? "is-error" : "is-ok"}`;
     node.textContent = text;
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => node.remove(), 3200);
+    toastTimer = timeoutMs > 0 ? setTimeout(() => node.remove(), timeoutMs) : null;
   }
 
   function sourceSnapshot() {
@@ -85,12 +92,30 @@
     return draft;
   }
 
-  async function initializeDraft() {
-    if (draft) return draft;
-    draft = Core.createDraft(sourceSnapshot());
-    await persistDraft();
-    renderStatus();
-    showToast("当前网页已初始化，可以选择加工模式");
+  function isAuthoringInitialized() {
+    if (!draft) return false;
+    const explicit = draft.sourceMetadata?.local_ir_authoring_initialized;
+    if (typeof explicit === "boolean") return explicit;
+    return draft.submitMode !== "standard_preprocess";
+  }
+
+  async function initializeDraft(options = {}) {
+    const authoring = options.authoring !== false;
+    let changed = false;
+    if (!draft) {
+      draft = Core.createDraft(sourceSnapshot());
+      changed = true;
+    }
+    if (draft.sourceMetadata?.local_ir_authoring_initialized !== authoring && (authoring || changed)) {
+      draft.sourceMetadata = {
+        ...draft.sourceMetadata,
+        local_ir_authoring_initialized: authoring
+      };
+      changed = true;
+    }
+    if (changed) await persistDraft();
+    else renderStatus();
+    if (authoring) showToast("当前网页已初始化，可以选择加工模式");
     return draft;
   }
 
@@ -218,17 +243,27 @@
   function renderStatus() {
     if (!ui) return;
     const summary = draft ? Core.summary(draft) : null;
-    const initialized = Boolean(summary);
-    ui.initializer.hidden = initialized;
-    ui.controls.hidden = !initialized;
-    ui.dock.classList.toggle("is-compact", !initialized);
+    const authoringInitialized = isAuthoringInitialized();
+    ui.initializer.hidden = authoringInitialized;
+    ui.importLocal.hidden = authoringInitialized;
+    ui.controls.hidden = !authoringInitialized;
+    ui.dock.classList.toggle("is-compact", !authoringInitialized);
     if (!summary) ui.status.textContent = "尚未初始化";
     else if (summary.status === "saved_locked") ui.status.textContent = `已保存并锁定 · ${summary.annotations} 条批注`;
     else if (summary.status === "completed_pending_archive") ui.status.textContent = `已完成阅读 · 待归档 · ${summary.annotations} 条批注`;
+    else if (summary.status === "submitting" && summary.submitMode === "standard_preprocess") ui.status.textContent = "正在标准化并导入本地…";
+    else if (summary.status === "submitting") ui.status.textContent = "正在保存…";
     else if (summary.status === "error") ui.status.textContent = `提交失败，已保留草稿 · ${summary.lastError || "unknown"}`;
     else ui.status.textContent = `未保存 v${summary.revision} · ${summary.annotations} 条批注 · ${summary.qaCards} 张卡`;
     const locked = Boolean(summary?.locked);
-    for (const button of [ui.undo, ui.musing, ui.qa, ui.save, ui.complete]) button.disabled = locked;
+    const canReimport = summary?.status === "saved_locked";
+    const submitting = summary?.status === "submitting";
+    const retryStandardImport = summary?.status === "error" && summary.submitMode === "standard_preprocess";
+    for (const button of [ui.processing, ui.cloze, ui.undo, ui.musing, ui.qa, ui.complete]) button.disabled = locked || submitting;
+    ui.abandon.disabled = submitting;
+    ui.save.disabled = submitting || (locked && !canReimport);
+    ui.save.textContent = canReimport ? "重新导入" : retryStandardImport ? "重试导入本地" : "保存";
+    ui.importLocal.textContent = canReimport || retryStandardImport ? "重新导入" : submitting ? "导入中…" : "导入本地";
     ui.processing.classList.toggle("is-active", authoringMode === "processing");
     ui.cloze.classList.toggle("is-active", authoringMode === "cloze");
   }
@@ -392,15 +427,68 @@
     showToast("已撤销最近一次加工");
   }
 
-  async function submit(destination) {
+  async function submit(destination, options = {}) {
     if (!draft) throw new Error("draft_not_initialized");
-    if (draft.locked) return;
-    await persistDraft();
-    const response = await sendMessage({ type: "draft-submit", url: location.href, destination });
-    if (!response.ok) return showToast(`提交失败，草稿已保留：${response.error || "unknown"}`, "error");
+    const force = Boolean(options.force);
+    if (draft.locked && !force) return { ok: true, draft, result: draft.receipt || null, skipped: true };
+    if (!draft.locked) await persistDraft();
+    const standardize = options.mode === "standard_preprocess";
+    const response = await sendMessage({
+      type: force ? "draft-resubmit" : standardize ? "draft-import-local" : "draft-submit",
+      url: location.href,
+      destination
+    });
+    if (!response.ok) {
+      const error = response.error || "unknown";
+      showToast(`提交失败，草稿已保留：${error}`, "error", 8000);
+      return { ok: false, error };
+    }
     draft = Core.normalizeDraft(response.draft);
     renderStatus();
-    showToast(destination === "completed" ? "已完成阅读并进入待归档区" : "已保存并锁定当前版本");
+    const resolvedDestination = draft.submitDestination === "completed" ? "completed" : "reading";
+    showToast(force
+      ? resolvedDestination === "completed" ? "已重新导入待归档区" : "已重新导入本地阅读区"
+      : standardize ? "已标准化并导入本地阅读区"
+        : destination === "completed" ? "已完成阅读并进入待归档区" : "已保存并锁定当前版本");
+    return { ok: true, draft, result: response.result || null };
+  }
+
+  async function discardCurrentDraft() {
+    if (!draft) return;
+    const response = await sendMessage({ type: "draft-discard", url: location.href });
+    if (!response.ok) throw new Error(response.error || "draft_discard_failed");
+    draft = null;
+    mergeSelection = [];
+    closeDialog();
+    renderHighlights();
+    renderStatus();
+    showToast("已放弃阅读并清除本页加工记录");
+  }
+
+  function setImportLaunchersDisabled(disabled) {
+    if (!ui) return;
+    ui.initializer.disabled = disabled;
+    ui.importLocal.disabled = disabled;
+  }
+
+  async function importCurrentPageStandard() {
+    if (standardImportBusy) throw new Error("standard_import_already_running");
+    standardImportBusy = true;
+    ensureUi();
+    setImportLaunchersDisabled(true);
+    try {
+      await initializeDraft({ authoring: false });
+      showToast("正在调用标准接口加工并导入本地…", "ok", 0);
+      const submitted = await submit("reading", { mode: "standard_preprocess" });
+      if (!submitted.ok) throw new Error(submitted.error || "standard_import_failed");
+      return submitted;
+    } catch (error) {
+      showToast(`导入失败，草稿已保留：${error.message}`, "error", 8000);
+      throw error;
+    } finally {
+      standardImportBusy = false;
+      setImportLaunchersDisabled(false);
+    }
   }
 
   function ensureUi() {
@@ -411,7 +499,7 @@
     const shadow = host.attachShadow({ mode: "open" });
     const style = document.createElement("style");
     style.textContent = `
-      :host{all:initial}[hidden]{display:none!important}.dock{position:fixed;right:18px;bottom:18px;z-index:2147483646;display:flex;align-items:center;gap:6px;padding:8px;background:#fff;border:1px solid #d0d5dd;border-radius:12px;box-shadow:0 8px 28px rgba(16,24,40,.18);font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#344054}.dock.is-compact{padding:6px}.controls{display:flex;align-items:center;gap:6px}.mode{font-weight:650}.mode.is-active{border-color:#1f5fbf;background:#eef4ff;color:#174a96}button{border:1px solid #c9d0dc;border-radius:7px;padding:6px 9px;background:#fff;color:#1d2939;cursor:pointer;font:inherit}button:hover,button.is-active{border-color:#1f5fbf;background:#eef4ff}button.initialize{background:#1f5fbf;color:#fff;border-color:#1f5fbf;font-weight:650}button.primary{background:#1f5fbf;color:#fff;border-color:#1f5fbf}button.complete{background:#067647;color:#fff;border-color:#067647}button:disabled{opacity:.45;cursor:not-allowed}.status{max-width:210px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.overlay{display:none;position:fixed;inset:0;z-index:2147483647;background:rgba(16,24,40,.38);align-items:center;justify-content:center}.overlay.is-open{display:flex}.dialog{width:min(900px,92vw);max-height:84vh;overflow:auto;background:#fff;border-radius:14px;padding:18px;box-shadow:0 24px 64px rgba(16,24,40,.28);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#1d2939}.dialog h2{margin:0 0 14px;font-size:18px}.field{display:grid;gap:5px;margin:12px 0}.field span{font-weight:650}.field textarea{box-sizing:border-box;width:100%;min-height:92px;border:1px solid #c9d0dc;border-radius:8px;padding:9px;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.type-buttons,.dialog-actions{display:flex;flex-wrap:wrap;gap:7px}.dialog-actions{justify-content:flex-end;margin-top:16px}.qa-list{display:grid;gap:7px}.qa-list>div{display:flex;justify-content:space-between;gap:10px;padding:8px;border:1px solid #eaecf0;border-radius:7px}`;
+      :host{all:initial}[hidden]{display:none!important}.dock{position:fixed;right:18px;bottom:18px;z-index:2147483646;display:flex;align-items:center;gap:6px;padding:8px;background:#fff;border:1px solid #d0d5dd;border-radius:12px;box-shadow:0 8px 28px rgba(16,24,40,.18);font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#344054}.dock.is-compact{padding:6px}.controls{display:flex;align-items:center;gap:6px}.mode{font-weight:650}.mode.is-active{border-color:#1f5fbf;background:#eef4ff;color:#174a96}button{border:1px solid #c9d0dc;border-radius:7px;padding:6px 9px;background:#fff;color:#1d2939;cursor:pointer;font:inherit}button:hover,button.is-active{border-color:#1f5fbf;background:#eef4ff}button.initialize{background:#1f5fbf;color:#fff;border-color:#1f5fbf;font-weight:650}button.primary{background:#1f5fbf;color:#fff;border-color:#1f5fbf}button.complete{background:#067647;color:#fff;border-color:#067647}button.abandon{background:#d92d20;color:#fff;border-color:#d92d20}button.abandon:hover{background:#b42318;border-color:#b42318}button:disabled{opacity:.45;cursor:not-allowed}.status{max-width:210px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.overlay{display:none;position:fixed;inset:0;z-index:2147483647;background:rgba(16,24,40,.38);align-items:center;justify-content:center}.overlay.is-open{display:flex}.dialog{width:min(900px,92vw);max-height:84vh;overflow:auto;background:#fff;border-radius:14px;padding:18px;box-shadow:0 24px 64px rgba(16,24,40,.28);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#1d2939}.dialog h2{margin:0 0 14px;font-size:18px}.field{display:grid;gap:5px;margin:12px 0}.field span{font-weight:650}.field textarea{box-sizing:border-box;width:100%;min-height:92px;border:1px solid #c9d0dc;border-radius:8px;padding:9px;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.type-buttons,.dialog-actions{display:flex;flex-wrap:wrap;gap:7px}.dialog-actions{justify-content:flex-end;margin-top:16px}.qa-list{display:grid;gap:7px}.qa-list>div{display:flex;justify-content:space-between;gap:10px;padding:8px;border:1px solid #eaecf0;border-radius:7px}`;
     const dock = document.createElement("div");
     dock.className = "dock";
     const initializer = document.createElement("button");
@@ -419,14 +507,20 @@
     initializer.textContent = "初始化加工";
     initializer.addEventListener("click", async () => {
       initializer.disabled = true;
+      importLocal.disabled = true;
       try {
         await initializeDraft();
       } catch (error) {
         showToast(`初始化失败：${error.message}`, "error");
       } finally {
         initializer.disabled = false;
+        importLocal.disabled = false;
       }
     });
+    const importLocal = document.createElement("button");
+    importLocal.className = "import-local";
+    importLocal.textContent = "导入本地";
+    importLocal.addEventListener("click", () => void importCurrentPageStandard().catch(() => {}));
     const controls = document.createElement("div");
     controls.className = "controls";
     const makeButton = (label, handler, className = "") => {
@@ -443,12 +537,16 @@
     const undoButton = makeButton("撤销", () => void undo());
     const musing = makeButton("随想", openMusing);
     const qa = makeButton("问答卡", openQaCards);
-    const save = makeButton("保存", () => void submit("reading"), "primary");
-    const complete = makeButton("完成阅读", () => void submit("completed"), "complete");
+    const save = makeButton("保存", () => void submit("reading", {
+      force: Boolean(draft?.locked),
+      mode: draft?.submitMode === "standard_preprocess" ? "standard_preprocess" : "local"
+    }).catch((error) => showToast(`保存失败：${error.message}`, "error", 8000)), "primary");
+    const complete = makeButton("完成阅读", () => void submit("completed").catch((error) => showToast(`完成阅读失败：${error.message}`, "error", 8000)), "complete");
+    const abandon = makeButton("放弃阅读", () => void discardCurrentDraft().catch((error) => showToast(`放弃阅读失败：${error.message}`, "error", 8000)), "abandon");
     const status = document.createElement("span");
     status.className = "status";
     controls.appendChild(status);
-    dock.append(initializer, controls);
+    dock.append(initializer, importLocal, controls);
     const overlay = document.createElement("div");
     overlay.className = "overlay";
     const dialog = document.createElement("div");
@@ -456,27 +554,23 @@
     overlay.appendChild(dialog);
     overlay.addEventListener("click", (event) => { if (event.target === overlay) closeDialog(); });
     shadow.append(style, dock, overlay);
-    ui = { dock, initializer, controls, processing, cloze, undo: undoButton, musing, qa, save, complete, status, overlay, dialog };
+    ui = { dock, initializer, importLocal, controls, processing, cloze, undo: undoButton, musing, qa, save, complete, abandon, status, overlay, dialog };
     renderStatus();
     return ui;
   }
 
-  async function captureSelection() {
+  async function captureRange(range, selection = null) {
     if (!draft || draft.locked || authoringMode === "off") return;
-    const selection = window.getSelection();
-    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
-    if (isEditableNode(selection.anchorNode) || isEditableNode(selection.focusNode)) return;
-    const selectedText = trimText(selection.toString(), 60000);
+    const selectedText = trimText(range.toString(), 60000);
     if (!selectedText) return;
     const now = Date.now();
     const captureKey = `${location.href}\n${selectedText}`;
     if (captureKey === lastCaptureKey && now - lastCaptureAt < 1000) return;
     lastCaptureKey = captureKey;
     lastCaptureAt = now;
-    const range = selection.getRangeAt(0).cloneRange();
     const offsets = rangeOffsets(range);
     const context = contextForRange(range, selectedText);
-    selection.removeAllRanges();
+    selection?.removeAllRanges();
     try {
       ({ draft } = Core.addAnnotation(requireDraft(), {
         selectedText,
@@ -494,13 +588,35 @@
     }
   }
 
-  document.addEventListener("click", (event) => {
-    const mark = event.target.closest?.("mark.local-ir-browser-highlight[data-local-ir-annotation-id]");
-    if (!mark || !draft) return;
+  async function captureSelection() {
+    if (!draft || draft.locked || authoringMode === "off") return;
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+    if (isEditableNode(selection.anchorNode) || isEditableNode(selection.focusNode)) return;
+    await captureRange(selection.getRangeAt(0).cloneRange(), selection);
+  }
+
+  async function captureClickedParagraph(event) {
+    if (!event.ctrlKey || event.altKey || event.metaKey || !draft || draft.locked || authoringMode === "off") return false;
+    const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+    if (!target || target.closest("#local-ir-browser-workbench") || isEditableNode(target)) return false;
+    const paragraph = target.closest("p, li, blockquote, pre, figcaption, dd, dt, h1, h2, h3, h4, h5, h6, td, th");
+    if (!paragraph || paragraph.closest("#local-ir-browser-workbench")) return false;
+    const range = document.createRange();
+    range.selectNodeContents(paragraph);
+    if (!trimText(range.toString(), 60000)) return false;
     event.preventDefault();
     event.stopPropagation();
-    const id = mark.dataset.localIrAnnotationId;
-    if (event.altKey || event.ctrlKey || event.metaKey) {
+    await captureRange(range);
+    return true;
+  }
+
+  document.addEventListener("click", (event) => {
+    const mark = event.target.closest?.("mark.local-ir-browser-highlight[data-local-ir-annotation-id]");
+    if (mark && draft && (event.altKey || event.metaKey)) {
+      event.preventDefault();
+      event.stopPropagation();
+      const id = mark.dataset.localIrAnnotationId;
       if (!mergeSelection.includes(id)) mergeSelection.push(id);
       mark.classList.add("is-merge-selected");
       if (mergeSelection.length >= 2) {
@@ -513,9 +629,17 @@
           mergeSelection = [];
           showToast(`合并失败：${error.message}`, "error");
         }
-      } else showToast("已选择 1 条高亮，再按 Alt/Ctrl 点击另一条合并");
+      } else showToast("已选择 1 条高亮，再按 Alt 点击另一条合并");
       return;
     }
+    if (event.ctrlKey && !event.altKey && !event.metaKey) {
+      void captureClickedParagraph(event);
+      return;
+    }
+    if (!mark || !draft) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const id = mark.dataset.localIrAnnotationId;
     openAnnotation(id);
   }, true);
 
@@ -551,12 +675,30 @@
         return;
       }
       if (message?.type === "save-draft") {
-        await submit(message.destination === "completed" ? "completed" : "reading");
+        const submitted = await submit(message.destination === "completed" ? "completed" : "reading");
+        if (!submitted.ok) throw new Error(submitted.error || "draft_submit_failed");
         sendResponse({ ok: true, draft: draft ? Core.summary(draft) : null });
         return;
       }
+      if (message?.type === "context-import-current-page") {
+        const submitted = await importCurrentPageStandard();
+        sendResponse({ ok: true, result: submitted.result || null, draft: draft ? Core.summary(draft) : null });
+        return;
+      }
+      if (message?.type === "context-import-progress") {
+        const phase = String(message.phase || "started");
+        const text = String(message.message || "正在导入到渐进阅读…");
+        showToast(text, phase === "failed" ? "error" : "ok", phase === "started" ? 0 : phase === "failed" ? 8000 : 4200);
+        sendResponse({ ok: true });
+        return;
+      }
       if (message?.type === "draft-state") {
-        draft = message.draft ? Core.normalizeDraft(message.draft) : draft;
+        draft = message.draft ? Core.normalizeDraft(message.draft) : null;
+        if (!draft) {
+          mergeSelection = [];
+          closeDialog();
+        }
+        renderHighlights();
         renderStatus();
         sendResponse({ ok: true });
         return;

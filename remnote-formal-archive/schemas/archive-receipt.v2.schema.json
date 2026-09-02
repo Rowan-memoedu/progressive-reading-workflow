@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "progressive-reading.remnote-archive-receipt/v2",
+  "title": "Progressive Reading formal archive receipt v2",
+  "type": "object",
+  "required": ["schema", "engineVersion", "status", "packageId", "packageRevision", "payloadHash", "packageFile", "source", "dispositionCoverage"],
+  "properties": {
+    "schema": { "const": "progressive-reading.remnote-archive-receipt/v2" },
+    "engineVersion": { "type": "string" },
+    "status": { "enum": ["archived", "partial_failure"] },
+    "packageId": { "type": "string", "minLength": 1 },
+    "packageRevision": { "type": "integer", "minimum": 1 },
+    "payloadHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "packageFile": { "type": "string", "minLength": 1 },
+    "source": {
+      "type": "object",
+      "required": ["materialType", "format"],
+      "properties": {
+        "materialType": { "type": "string" },
+        "format": { "type": "string" },
+        "origin": { "type": ["string", "null"] }
+      }
+    },
+    "dispositionCoverage": {
+      "type": "object",
+      "required": ["verified", "total", "summary", "dispositions"],
+      "properties": {
+        "verified": { "type": "boolean" },
+        "total": { "type": "integer", "minimum": 0 },
+        "summary": { "type": "object" },
+        "dispositions": { "type": "array" }
+      }
+    },
+    "target": { "type": "object" },
+    "remoteOutcome": {
+      "type": "object",
+      "required": ["mode", "remoteWritePerformed"],
+      "properties": {
+        "mode": { "enum": ["remnote_items", "no_remnote_content"] },
+        "remoteWritePerformed": { "type": "boolean" },
+        "confirmation": { "type": "object" }
+      }
+    },
+    "readback": { "type": "object" },
+    "localFinalization": { "type": "object" },
+    "completedAt": { "type": "string", "format": "date-time" },
+    "failedAt": { "type": "string", "format": "date-time" },
+    "error": { "type": "object" }
+  },
+  "additionalProperties": true
+}

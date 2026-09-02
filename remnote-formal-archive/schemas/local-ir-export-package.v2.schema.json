@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "progressive-reading.local-ir-export-package/v2",
+  "title": "Progressive Reading Local IR export package v2",
+  "type": "object",
+  "required": ["schema", "packageId", "packageRevision", "status", "title", "sourcePath", "source", "localArchive", "annotations", "cards", "clozeCards", "articleMusings"],
+  "properties": {
+    "schema": { "const": "progressive-reading.local-ir-export-package/v2" },
+    "packageId": { "type": "string", "minLength": 1 },
+    "packageRevision": { "type": "integer", "minimum": 1 },
+    "status": { "const": "export_package_ready" },
+    "title": { "type": "string", "minLength": 1 },
+    "sourcePath": { "type": "string", "minLength": 1 },
+    "source": {
+      "type": "object",
+      "required": ["materialType", "format"],
+      "properties": {
+        "materialType": { "type": "string", "minLength": 1 },
+        "format": { "type": "string", "minLength": 1 },
+        "origin": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "localArchive": {
+      "type": "object",
+      "required": ["state", "sourcePath", "archivedSourcePath"],
+      "properties": {
+        "state": { "const": "export_package_ready" },
+        "sourcePath": { "type": "string", "minLength": 1 },
+        "archivedSourcePath": { "type": "string", "minLength": 1 },
+        "noRemnoteContentConfirmation": {
+          "type": "object",
+          "required": ["schema", "confirmed", "confirmedAt", "missingElementKinds"],
+          "properties": {
+            "schema": { "const": "progressive-reading.no-remnote-content-confirmation/v1" },
+            "confirmed": { "const": true },
+            "confirmedAt": { "type": "string", "format": "date-time" },
+            "missingElementKinds": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "enum": ["annotations", "cards", "clozeCards", "articleMusings"] }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": { "type": "array", "items": { "$ref": "#/$defs/identifiedItem" } },
+    "cards": { "type": "array", "items": { "$ref": "#/$defs/identifiedItem" } },
+    "clozeCards": { "type": "array", "items": { "$ref": "#/$defs/identifiedItem" } },
+    "articleMusings": { "type": "array", "items": { "$ref": "#/$defs/identifiedItem" } }
+  },
+  "$defs": {
+    "identifiedItem": {
+      "type": "object",
+      "required": ["id"],
+      "properties": { "id": { "type": "string", "minLength": 1 } }
+    }
+  },
+  "additionalProperties": true
+}

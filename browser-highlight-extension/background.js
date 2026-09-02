@@ -1,15 +1,17 @@
 importScripts("draft-core.js");
 
 const Core = globalThis.LocalIrDraftCore;
-const VERSION = "0.4.0";
+const VERSION = "0.5.14";
 const DEFAULT_PORT = 37829;
 const PORT_SCAN_START = 37829;
 const PORT_SCAN_END = 37849;
 const HEALTH_TIMEOUT_MS = 900;
 const REQUEST_TIMEOUT_MS = 30000;
+const STANDARD_IMPORT_TIMEOUT_MS = 10 * 60 * 1000;
 const FAILED_LIMIT = 20;
 const DRAFTS_KEY = "localIrBrowserDrafts";
 const TAB_URLS_KEY = "localIrDraftTabUrls";
+const TRANSPORT_MAX_ATTEMPTS = 3;
 
 function chromeCallback(call) {
   return new Promise((resolve) => {
@@ -77,7 +79,11 @@ async function requestJsonAtPort(port, path, options = {}) {
     });
     const text = await response.text();
     const data = text ? JSON.parse(text) : {};
-    if (!response.ok) throw new Error(data.error || `http_${response.status}`);
+    if (!response.ok) {
+      const error = new Error(data.error || `http_${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
     return data;
   } catch (error) {
     if (error.name === "AbortError") throw new Error(`request_timeout_${timeoutMs}ms`);
@@ -104,6 +110,31 @@ async function findServicePort() {
 async function requestJson(path, options = {}) {
   const { port } = await findServicePort();
   return requestJsonAtPort(port, path, options);
+}
+
+function retryableTransportError(error) {
+  const status = Number(error?.status || 0);
+  if (status) return status === 408 || status === 425 || status === 429 || status >= 500;
+  const message = String(error?.message || error || "");
+  return !/^(invalid_|unsupported_|empty_|no_url_found|too_many_urls|draft_not_found|draft_locked|requires_browser_auth|requires_js_render|browser_auth_)/u.test(message);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function requestJsonReliable(path, options = {}, maxAttempts = TRANSPORT_MAX_ATTEMPTS) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await requestJson(path, options);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxAttempts || !retryableTransportError(error)) break;
+      await delay(300 * (2 ** (attempt - 1)));
+    }
+  }
+  throw lastError || new Error("local_service_request_failed");
 }
 
 async function saveDraftMap(drafts) {
@@ -138,21 +169,45 @@ async function notifyDraftState(url, draft) {
   }
 }
 
-async function submitDraft(url, destination = "reading") {
+async function submitDraft(url, destination = "reading", options = {}) {
   const settings = await getSettings();
   const current = settings.drafts[url];
   if (!current) throw new Error("draft_not_found");
   let draft = Core.normalizeDraft(current);
-  if (draft.locked) return { draft, result: draft.receipt };
-  draft.submitDestination = destination === "completed" ? "completed" : "reading";
+  if (draft.locked && !options.force) return { draft, result: draft.receipt };
+  if (draft.locked && options.force) {
+    draft = {
+      ...draft,
+      locked: false,
+      dirty: true,
+      status: "editing",
+      lastError: null
+    };
+  }
+  const submitMode = options.mode === "standard_preprocess"
+    ? "standard_preprocess"
+    : options.mode === "local"
+      ? "local"
+      : draft.submitMode;
+  draft.submitDestination = submitMode === "standard_preprocess"
+    ? "reading"
+    : destination === "completed" ? "completed" : "reading";
+  draft.submitMode = submitMode;
   draft = Core.markPending(draft);
   draft.status = "submitting";
   settings.drafts[url] = draft;
   await saveDraftMap(settings.drafts);
+  await notifyDraftState(url, draft);
   try {
-    const endpoint = destination === "completed" ? "/api/highlights/complete" : "/api/highlights/commit";
-    const result = await requestJson(endpoint, { method: "POST", body: JSON.stringify({ draft }) });
-    draft = destination === "completed" ? Core.markCompleted(draft, result) : Core.markSaved(draft, result);
+    const endpoint = submitMode === "standard_preprocess"
+      ? "/api/highlights/import-local"
+      : draft.submitDestination === "completed" ? "/api/highlights/complete" : "/api/highlights/commit";
+    const result = await requestJsonReliable(endpoint, {
+      method: "POST",
+      body: JSON.stringify({ draft }),
+      ...(submitMode === "standard_preprocess" ? { timeoutMs: STANDARD_IMPORT_TIMEOUT_MS } : {})
+    });
+    draft = draft.submitDestination === "completed" ? Core.markCompleted(draft, result) : Core.markSaved(draft, result);
     settings.drafts[url] = draft;
     await saveDraftMap(settings.drafts);
     await notifyDraftState(url, draft);
@@ -207,7 +262,7 @@ async function rememberFailedCapture(payload, reason) {
 
 async function captureHighlight(payload) {
   try {
-    return { ok: true, result: await requestJson("/api/highlights/capture", { method: "POST", body: JSON.stringify(payload) }) };
+    return { ok: true, result: await requestJsonReliable("/api/highlights/capture", { method: "POST", body: JSON.stringify(payload) }) };
   } catch (error) {
     return { ok: false, error: error.message, failedCount: await rememberFailedCapture(payload, error.message) };
   }
@@ -219,7 +274,7 @@ async function retryFailedCaptures() {
   const imported = [];
   for (const item of settings.failedCaptures) {
     try {
-      imported.push(await requestJson("/api/highlights/capture", { method: "POST", body: JSON.stringify(item.payload) }));
+      imported.push(await requestJsonReliable("/api/highlights/capture", { method: "POST", body: JSON.stringify(item.payload) }));
     } catch (error) {
       remaining.push({ ...item, reason: error.message, failedAt: new Date().toISOString() });
     }
@@ -229,18 +284,160 @@ async function retryFailedCaptures() {
   return { imported, remaining: remaining.length, drafts };
 }
 
-async function importUrl(text) {
-  return requestJson("/api/import", { method: "POST", body: JSON.stringify({ text }) });
+async function discardDraft(url, tabId = null) {
+  const normalizedUrl = String(url || "").trim();
+  if (!/^https?:\/\//.test(normalizedUrl)) throw new Error("invalid_draft_url");
+  const settings = await getSettings();
+  const discarded = Boolean(settings.drafts[normalizedUrl]);
+  delete settings.drafts[normalizedUrl];
+  for (const [key, mappedUrl] of Object.entries(settings.tabUrls)) {
+    if (mappedUrl === normalizedUrl || (Number.isInteger(tabId) && key === String(tabId))) delete settings.tabUrls[key];
+  }
+  await storageSet({ [DRAFTS_KEY]: settings.drafts, [TAB_URLS_KEY]: settings.tabUrls });
+  await notifyDraftState(normalizedUrl, null);
+  return { discarded };
+}
+
+function isSupportedPageUrl(value) {
+  return /^https?:\/\//u.test(String(value || ""));
+}
+
+async function sendTabMessage(tabId, message) {
+  if (!Number.isInteger(tabId)) return { ok: false, error: "tab_id_required" };
+  const response = await chromeCallback((done) => chrome.tabs.sendMessage(tabId, message, done));
+  if (!response.ok) return response;
+  return response.result || { ok: false, error: "empty_response" };
+}
+
+async function injectContentScript(tabId) {
+  const css = await chromeCallback((done) => chrome.scripting.insertCSS({ target: { tabId }, files: ["content.css"] }, done));
+  if (!css.ok) throw new Error(`content_css_injection_failed:${css.error}`);
+  for (const files of [["draft-core.js"], ["lib/web-highlighter.min.js"], ["content.js"]]) {
+    const injected = await chromeCallback((done) => chrome.scripting.executeScript({ target: { tabId }, files }, done));
+    if (!injected.ok) throw new Error(`content_script_injection_failed:${injected.error}`);
+  }
+}
+
+async function ensureContentScript(tab) {
+  if (!tab?.id || !isSupportedPageUrl(tab.url)) throw new Error("unsupported_context_page");
+  const existing = await sendTabMessage(tab.id, { type: "get-content-status" });
+  if (existing.ok) return existing;
+  await injectContentScript(tab.id);
+  const injected = await sendTabMessage(tab.id, { type: "get-content-status" });
+  if (!injected.ok) throw new Error(`content_script_unavailable:${injected.error || "unknown"}`);
+  return injected;
+}
+
+async function setContextBadge(tabId, text, color) {
+  if (!Number.isInteger(tabId) || !chrome.action) return;
+  await chromeCallback((done) => chrome.action.setBadgeBackgroundColor({ tabId, color }, done));
+  await chromeCallback((done) => chrome.action.setBadgeText({ tabId, text }, done));
+}
+
+function clearContextBadgeLater(tabId, delayMs = 6000) {
+  setTimeout(() => {
+    if (!Number.isInteger(tabId) || !chrome.action) return;
+    chrome.action.setBadgeText({ tabId, text: "" }, () => void chrome.runtime.lastError);
+  }, delayMs);
+}
+
+async function notifyContextProgress(tabId, phase, message, details = null) {
+  await sendTabMessage(tabId, { type: "context-import-progress", phase, message, details });
+}
+
+async function importUrlsStandard(text) {
+  return requestJsonReliable("/api/highlights/import-local-urls", {
+    method: "POST",
+    body: JSON.stringify({ text, source: "browser_extension", entry_route: "browser_extension" }),
+    timeoutMs: STANDARD_IMPORT_TIMEOUT_MS
+  });
+}
+
+async function createBrowserImportRequest(url, source = "browser_context_link") {
+  return requestJsonReliable("/api/browser-import/requests", {
+    method: "POST",
+    body: JSON.stringify({
+      urls: [url],
+      source,
+      entry_route: "browser_extension",
+      client_request_id: `${source}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+    }),
+    timeoutMs: REQUEST_TIMEOUT_MS
+  });
+}
+
+async function waitForBrowserImportRequest(requestId, timeoutMs = STANDARD_IMPORT_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const request = await requestJsonReliable(`/api/browser-import/requests/${encodeURIComponent(requestId)}`, {
+      timeoutMs: REQUEST_TIMEOUT_MS
+    });
+    if (request?.terminal) {
+      const result = Array.isArray(request.results) ? request.results[0] : null;
+      if (result?.status === "imported" || result?.status === "idempotent_replay") return result;
+      const degradedStatus = new Set(["requires_browser_auth", "requires_js_render"]);
+      const status = String(result?.status || request.status || "");
+      if (degradedStatus.has(status)) throw new Error(status);
+      throw new Error(String(result?.error || status || "browser_import_request_failed"));
+    }
+    await delay(350);
+  }
+  throw new Error("browser_import_request_timeout");
+}
+
+async function importCurrentPageFromContext(tab) {
+  await ensureContentScript(tab);
+  const response = await sendTabMessage(tab.id, { type: "context-import-current-page" });
+  if (!response.ok) throw new Error(response.error || "current_page_import_failed");
+  return response.result || response;
+}
+
+async function importLinkFromContext(url, tab) {
+  if (!isSupportedPageUrl(url)) throw new Error("invalid_context_link_url");
+  if (tab?.id && isSupportedPageUrl(tab.url)) {
+    await ensureContentScript(tab);
+    await notifyContextProgress(tab.id, "started", "正在后台静默导入链接…");
+  }
+  const request = await createBrowserImportRequest(url);
+  return waitForBrowserImportRequest(request.request_id);
+}
+
+async function handleContextMenuClick(info, tab) {
+  const tabId = tab?.id;
+  await setContextBadge(tabId, "…", "#1f5fbf");
+  try {
+    if (info.menuItemId === "local-ir-import-page") {
+      await importCurrentPageFromContext(tab);
+    } else if (info.menuItemId === "local-ir-import-link") {
+      await importLinkFromContext(info.linkUrl, tab);
+      if (tabId && isSupportedPageUrl(tab?.url)) {
+        await notifyContextProgress(tabId, "succeeded", "链接已标准化并导入本地阅读区");
+      }
+    } else {
+      return;
+    }
+    await setContextBadge(tabId, "✓", "#067647");
+  } catch (error) {
+    if (tabId && isSupportedPageUrl(tab?.url)) {
+      await notifyContextProgress(tabId, "failed", `导入失败：${error.message}`);
+    }
+    await setContextBadge(tabId, "!", "#b42318");
+  } finally {
+    clearContextBadgeLater(tabId);
+  }
 }
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({ id: "local-ir-import-link", title: "导入链接到渐进阅读", contexts: ["link"] });
-    chrome.contextMenus.create({ id: "local-ir-import-page", title: "导入当前页到渐进阅读", contexts: ["page"] });
+    const documentUrlPatterns = ["http://*/*", "https://*/*"];
+    chrome.contextMenus.create({ id: "local-ir-import-link", title: "导入链接到渐进阅读", contexts: ["link"], documentUrlPatterns });
+    chrome.contextMenus.create({ id: "local-ir-import-page", title: "导入当前页到渐进阅读", contexts: ["page"], documentUrlPatterns });
   });
 });
 
-chrome.runtime.onStartup.addListener(() => void retryPendingDrafts());
+chrome.runtime.onStartup.addListener(() => {
+  void retryPendingDrafts();
+});
 chrome.runtime.onSuspend.addListener(() => void markDirtyDraftsPending());
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -258,8 +455,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
-  const text = info.menuItemId === "local-ir-import-link" ? info.linkUrl : tab?.url;
-  if (text) void importUrl(text);
+  void handleContextMenuClick(info, tab);
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -268,11 +464,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === "capture-highlight") return sendResponse(await captureHighlight(message.payload || {}));
     if (message?.type === "health") return sendResponse({ ok: true, result: await findServicePort() });
     if (message?.type === "retry-failed") return sendResponse({ ok: true, result: await retryFailedCaptures() });
-    if (message?.type === "import-current-url") return sendResponse({ ok: true, result: await importUrl(message.url || "") });
+    if (message?.type === "import-current-url") return sendResponse({ ok: true, result: await importUrlsStandard(message.url || "") });
     if (message?.type === "draft-get") return sendResponse({ ok: true, draft: await getDraft(String(message.url || "")) });
     if (message?.type === "draft-upsert") return sendResponse({ ok: true, draft: await upsertDraft(message.draft || {}, sender.tab?.id) });
+    if (message?.type === "draft-discard") return sendResponse({ ok: true, result: await discardDraft(message.url, sender.tab?.id) });
     if (message?.type === "draft-submit") {
-      const submitted = await submitDraft(String(message.url || ""), message.destination === "completed" ? "completed" : "reading");
+      const submitted = await submitDraft(String(message.url || ""), message.destination === "completed" ? "completed" : "reading", { mode: "local" });
+      return sendResponse({ ok: true, ...submitted });
+    }
+    if (message?.type === "draft-import-local") {
+      const submitted = await submitDraft(String(message.url || ""), "reading", { mode: "standard_preprocess" });
+      return sendResponse({ ok: true, ...submitted });
+    }
+    if (message?.type === "draft-resubmit") {
+      const url = String(message.url || "");
+      const current = await getDraft(url);
+      const destination = current?.submitDestination === "completed" ? "completed" : "reading";
+      const submitted = await submitDraft(url, destination, { force: true });
       return sendResponse({ ok: true, ...submitted });
     }
     sendResponse({ ok: false, error: "unknown_message" });

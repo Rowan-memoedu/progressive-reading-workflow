@@ -19,28 +19,444 @@
   "properties": {
     "schema_version": { "const": "progressive-reading.preprocess.result/v1" },
     "contract_version": { "const": "1.0.0" },
-    "status": {
-      "enum": ["completed", "completed_with_warnings", "quarantined", "failed", "idempotent_replay"]
-    },
-    "material_id": { "type": ["string", "null"] },
-    "idempotency_key": { "type": ["string", "null"] },
-    "processing_state": {
-      "enum": ["rendered", "degraded", "quarantined", "failed"]
-    },
-    "translation_state": {
-      "enum": ["not_translation", "translation_original_missing", "alignment_pending", "aligned", "unknown"]
-    },
-    "artifacts": { "type": "object" },
-    "source_metadata": { "type": "object" },
-    "receipt": { "type": "object" },
-    "errors": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["code", "stage", "message", "retryable", "severity"]
+    "status": { "enum": ["completed", "completed_with_warnings", "quarantined", "failed", "idempotent_replay"] },
+    "material_id": { "type": ["string", "null"], "minLength": 1 },
+    "idempotency_key": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9._-]{1,128}$" },
+    "processing_state": { "enum": ["rendered", "degraded", "quarantined", "failed"] },
+    "translation_state": { "enum": ["not_translation", "translation_original_missing", "alignment_pending", "aligned", "generated_translation", "unknown"] },
+    "artifacts": { "$ref": "#/$defs/artifacts" },
+    "source_metadata": { "$ref": "#/$defs/sourceMetadata" },
+    "receipt": { "$ref": "#/$defs/receipt" },
+    "errors": { "type": "array", "items": { "$ref": "#/$defs/error" } }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "processing_state": { "const": "rendered" } } },
+      "then": {
+        "properties": {
+          "material_id": { "type": "string", "minLength": 1 },
+          "idempotency_key": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$" },
+          "source_metadata": { "required": ["source_url", "original_url", "translation", "embedded_frontmatter"] },
+          "artifacts": {
+            "required": ["reading_markdown", "quarantine_markdown", "target_zone", "semantic", "body_blocks", "cleaning_manifest", "bilingual", "artifact_hashes"],
+            "properties": {
+              "reading_markdown": { "type": "string", "minLength": 1 },
+              "quarantine_markdown": { "type": "null" },
+              "target_zone": { "const": "local-ir-reading" },
+              "semantic": { "$ref": "#/$defs/semantic" },
+              "cleaning_manifest": { "$ref": "#/$defs/cleaningManifest" }
+            }
+          },
+          "receipt": { "required": ["contract_version", "cleaning_policy", "material_id", "idempotency_key", "hashes", "deterministic", "model"] }
+        }
       }
+    },
+    {
+      "if": { "properties": { "processing_state": { "const": "degraded" } } },
+      "then": {
+        "properties": {
+          "material_id": { "type": "string", "minLength": 1 },
+          "idempotency_key": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$" },
+          "source_metadata": { "required": ["source_url", "original_url", "translation", "embedded_frontmatter"] },
+          "artifacts": {
+            "required": ["reading_markdown", "quarantine_markdown", "target_zone", "semantic", "body_blocks", "cleaning_manifest", "bilingual", "artifact_hashes"],
+            "properties": {
+              "reading_markdown": { "type": "string", "minLength": 1 },
+              "quarantine_markdown": { "type": "null" },
+              "target_zone": { "const": "preprocess-review" },
+              "semantic": { "$ref": "#/$defs/semantic" },
+              "cleaning_manifest": { "$ref": "#/$defs/cleaningManifest" }
+            }
+          },
+          "receipt": { "required": ["contract_version", "cleaning_policy", "material_id", "idempotency_key", "hashes", "deterministic", "model"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "processing_state": { "const": "quarantined" } } },
+      "then": {
+        "properties": {
+          "material_id": { "type": "string", "minLength": 1 },
+          "idempotency_key": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$" },
+          "translation_state": { "const": "translation_original_missing" },
+          "source_metadata": { "required": ["source_url", "original_url", "translation", "embedded_frontmatter"] },
+          "artifacts": {
+            "required": ["reading_markdown", "quarantine_markdown", "target_zone", "semantic", "body_blocks", "bilingual", "artifact_hashes"],
+            "properties": {
+              "reading_markdown": { "type": "null" },
+              "quarantine_markdown": { "type": "string", "minLength": 1 },
+              "target_zone": { "const": "translation-quarantine" },
+              "semantic": { "type": "null" }
+            }
+          },
+          "receipt": { "required": ["contract_version", "cleaning_policy", "material_id", "idempotency_key", "hashes", "deterministic", "model"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "failed" } } },
+      "then": { "properties": { "processing_state": { "const": "failed" } } }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "sourceMetadata": {
+      "type": "object",
+      "properties": {
+        "source_url": { "type": ["string", "null"] },
+        "canonical_url": { "type": ["string", "null"] },
+        "original_url": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] },
+        "source_title": { "type": ["string", "null"] },
+        "author": { "type": ["string", "null"] },
+        "published_at": { "type": ["string", "null"] },
+        "content_profile": { "type": ["string", "null"] },
+        "source_is_original": { "type": "boolean" },
+        "translation": {
+          "type": "object",
+          "required": ["is_translation", "original_url", "original_language", "translation_language"],
+          "properties": {
+            "is_translation": { "type": "boolean" },
+            "original_url": { "type": ["string", "null"] },
+            "original_language": { "type": "string", "minLength": 1 },
+            "translation_language": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": true
+        },
+        "embedded_frontmatter": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "judgment": {
+      "type": "object",
+      "required": ["level", "reason"],
+      "properties": { "level": {}, "reason": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "judgments": {
+      "type": "object",
+      "required": ["value", "density", "continue_reading"],
+      "properties": {
+        "value": { "allOf": [{ "$ref": "#/$defs/judgment" }, { "properties": { "level": { "enum": ["very_low", "low", "medium", "high", "very_high"] } } }] },
+        "density": { "allOf": [{ "$ref": "#/$defs/judgment" }, { "properties": { "level": { "enum": ["very_low", "low", "medium", "high", "very_high"] } } }] },
+        "continue_reading": { "allOf": [{ "$ref": "#/$defs/judgment" }, { "properties": { "level": { "type": "integer", "minimum": 0, "maximum": 4 } } }] }
+      },
+      "additionalProperties": false
+    },
+    "insight": {
+      "type": "object",
+      "required": ["title", "description", "target_block_key"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "description": {
+          "type": "string",
+          "minLength": 60,
+          "$comment": "Runtime validation counts non-whitespace characters; JSON Schema minLength is only the structural lower bound."
+        },
+        "target_block_key": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "semantic": {
+      "type": "object",
+      "required": ["judgments", "insights"],
+      "properties": {
+        "judgments": { "$ref": "#/$defs/judgments" },
+        "insights": { "type": "array", "maxItems": 24, "items": { "$ref": "#/$defs/insight" } }
+      },
+      "additionalProperties": false
+    },
+    "bodyBlock": {
+      "type": "object",
+      "required": ["source_block_key", "type", "role", "language", "markdown", "source_hash"],
+      "properties": {
+        "source_block_key": { "type": "string", "minLength": 1 },
+        "source_block_keys": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "source_index": { "type": "integer", "minimum": 0 },
+        "block_id": { "type": "string", "pattern": "^pr-[a-f0-9]{12}$" },
+        "markdown": { "type": "string", "minLength": 1 },
+        "source_hash": { "$ref": "#/$defs/sha256" },
+        "source_hashes": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/sha256" } },
+        "output_hash": { "$ref": "#/$defs/sha256" },
+        "type": { "enum": ["heading", "paragraph", "code", "list", "quote", "table"] },
+        "role": { "type": "string", "minLength": 1 },
+        "language": { "type": "string", "minLength": 1 },
+        "cleaning_reason": { "type": ["string", "null"] },
+        "local_fidelity_verified": { "type": "boolean" },
+        "fidelity_verification": { "type": ["object", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "cleaningDestination": {
+      "type": "object",
+      "required": ["section", "location"],
+      "properties": { "section": { "enum": ["body", "appendix"] }, "location": { "type": "string", "minLength": 1 } },
+      "additionalProperties": false
+    },
+    "cleaningMapping": {
+      "type": "object",
+      "required": ["source_id", "status", "destinations"],
+      "properties": {
+        "source_id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["body_preserved", "structured_with_original"] },
+        "reason": { "type": "string", "minLength": 1 },
+        "original_text": { "type": "string" },
+        "destinations": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/cleaningDestination" } }
+      },
+      "additionalProperties": false
+    },
+    "cleaningManifest": {
+      "type": "object",
+      "required": ["version", "profile", "source_nodes", "mappings", "protected_terms", "ai_additions", "body_text", "appendix_text", "requirement_text", "ai_candidate_text"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1 },
+        "profile": { "enum": ["semantic_only", "source_voice_structuring", "lossless_spoken_to_written", "source_translation"] },
+        "source_nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "text"],
+            "properties": { "id": { "type": "string", "minLength": 1 }, "text": { "type": "string" } },
+            "additionalProperties": false
+          }
+        },
+        "mappings": { "type": "array", "items": { "$ref": "#/$defs/cleaningMapping" } },
+        "protected_terms": { "type": "array" },
+        "ai_additions": { "type": "array" },
+        "semantic_normalizations": { "type": "array", "items": { "type": "object" } },
+        "semantic_normalization_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "body_text": { "type": "string" },
+        "appendix_text": { "type": "string" },
+        "requirement_text": { "type": "string" },
+        "ai_candidate_text": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "alignment": {
+      "type": "object",
+      "required": ["original_block_key", "translation_block_key", "confidence", "status"],
+      "properties": {
+        "original_block_key": { "type": "string", "minLength": 1 },
+        "translation_block_key": { "type": "string", "minLength": 1 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "status": { "enum": ["aligned", "uncertain", "pending"] }
+      },
+      "additionalProperties": false
+    },
+    "bilingual": {
+      "type": "object",
+      "required": ["detection", "alignments"],
+      "properties": {
+        "detection": {
+          "type": "object",
+          "required": ["explicit", "bilingual", "has_translation", "has_original", "requires_original_url", "original_url"],
+          "properties": {
+            "explicit": { "type": "boolean" },
+            "bilingual": { "type": "boolean" },
+            "routed_bilingual": { "type": "boolean" },
+            "has_translation": { "type": "boolean" },
+            "has_original": { "type": "boolean" },
+            "requires_original_url": { "type": "boolean" },
+            "original_url": { "type": ["string", "null"] }
+          },
+          "additionalProperties": false
+        },
+        "alignments": { "type": "array", "items": { "$ref": "#/$defs/alignment" } }
+      },
+      "additionalProperties": false
+    },
+    "artifactHashes": {
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+        "reading_markdown": { "$ref": "#/$defs/sha256" },
+        "quarantine_markdown": { "$ref": "#/$defs/sha256" },
+        "semantic": { "$ref": "#/$defs/sha256" },
+        "body_blocks": { "$ref": "#/$defs/sha256" },
+        "cleaning_manifest": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    },
+    "artifacts": {
+      "type": "object",
+      "properties": {
+        "reading_markdown": { "type": ["string", "null"] },
+        "quarantine_markdown": { "type": ["string", "null"] },
+        "target_zone": { "enum": ["local-ir-reading", "preprocess-review", "translation-quarantine"] },
+        "semantic": { "anyOf": [{ "$ref": "#/$defs/semantic" }, { "type": "null" }] },
+        "body_blocks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/bodyBlock" } },
+        "cleaning_manifest": { "$ref": "#/$defs/cleaningManifest" },
+        "bilingual": { "$ref": "#/$defs/bilingual" },
+        "artifact_hashes": { "$ref": "#/$defs/artifactHashes" }
+      },
+      "additionalProperties": false
+    },
+    "cleaningPolicy": {
+      "type": "object",
+      "required": ["mode", "preserve_source_voice", "forbid_visible_timestamps", "require_content_headings", "attribute_unverified_claims"],
+      "properties": {
+        "mode": { "enum": ["semantic_only", "source_voice_structuring", "lossless_spoken_to_written", "source_translation"] },
+        "preserve_source_voice": { "type": "boolean" },
+        "forbid_visible_timestamps": { "type": "boolean" },
+        "require_content_headings": { "type": "boolean" },
+        "attribute_unverified_claims": { "type": "boolean" },
+        "translation_target_language": { "type": ["string", "null"] },
+        "normalize_semantic_containers": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "modelAttempt": {
+      "type": "object",
+      "required": ["attempt", "status", "validation_errors", "usage"],
+      "properties": {
+        "attempt": { "type": "integer", "minimum": 1 },
+        "status": { "enum": ["accepted", "rejected", "failed"] },
+        "validation_errors": { "type": "array", "items": { "type": "string" } },
+        "usage": { "type": ["object", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "modelReceipt": {
+      "type": "object",
+      "required": ["provider", "model", "calls", "attempts", "metadata_policy"],
+      "properties": {
+        "provider": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "calls": { "type": "integer", "minimum": 0 },
+        "attempts": { "type": "array", "items": { "$ref": "#/$defs/modelAttempt" } },
+        "metadata_policy": { "type": "string", "minLength": 1 },
+        "call_ledger": { "type": "array", "items": { "type": "object" } }
+      },
+      "additionalProperties": false
+    },
+    "validation": {
+      "type": "object",
+      "required": ["name", "status"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["passed", "failed", "not_applicable", "not_needed"] },
+        "details": {}
+      },
+      "additionalProperties": false
+    },
+    "routingDecision": {
+      "type": "object",
+      "required": ["value", "method", "evidence"],
+      "properties": {
+        "value": { "type": "string", "minLength": 1 },
+        "method": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "workflowClassifier": {
+      "type": "object",
+      "required": ["version", "prompt_version", "skipped", "calls", "attempts", "call_ledger"],
+      "properties": {
+        "version": { "const": "workflow-router/v1" },
+        "prompt_version": { "enum": ["workflow-router-v1.0-concise", "workflow-router-v1.1-form-boundary", "workflow-router-v1.2-formal-content-boundary"] },
+        "skipped": { "type": "boolean" },
+        "reason": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "calls": { "type": "integer", "minimum": 0 },
+        "attempts": { "type": "array", "items": { "$ref": "#/$defs/modelAttempt" } },
+        "call_ledger": { "type": "array", "items": { "type": "object" } }
+      },
+      "additionalProperties": false
+    },
+    "receipt": {
+      "type": "object",
+      "required": ["processor_version", "prompt_version", "created_at", "validations"],
+      "properties": {
+        "contract_version": { "const": "1.0.0" },
+        "processor_version": { "type": "string", "minLength": 1 },
+        "prompt_version": { "type": "string", "minLength": 1 },
+        "cleaning_policy": { "$ref": "#/$defs/cleaningPolicy" },
+        "material_id": { "type": "string", "minLength": 1 },
+        "idempotency_key": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$" },
+        "created_at": { "type": "string", "minLength": 1 },
+        "hashes": {
+          "type": "object",
+          "required": ["input", "original_input", "user_instruction"],
+          "properties": {
+            "input": { "$ref": "#/$defs/sha256" },
+            "original_input": { "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+            "user_instruction": { "$ref": "#/$defs/sha256" }
+          },
+          "additionalProperties": false
+        },
+        "deterministic": {
+          "type": "object",
+          "required": ["material_id", "idempotency_key", "body_block_ids", "markdown_rendering"],
+          "properties": {
+            "material_id": { "type": "boolean" },
+            "idempotency_key": { "type": "boolean" },
+            "body_block_ids": { "type": "boolean" },
+            "markdown_rendering": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "model": { "$ref": "#/$defs/modelReceipt" },
+        "semantic_normalization": {
+          "type": "object",
+          "required": ["enabled", "counts"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } }
+          },
+          "additionalProperties": false
+        },
+        "processing_profile": {
+          "type": "object",
+          "required": ["id", "version", "prompt_version", "translated_prose_blocks", "preserved_formula_blocks", "preserved_formula_spans", "preserved_code_blocks", "preserved_algorithm_blocks", "preserved_terms"],
+          "properties": {
+            "id": { "const": "math_lecture" },
+            "version": { "type": "string", "pattern": "^math-lecture-(?:translation/v[12]|standardization/v1)$" },
+            "prompt_version": { "type": "string", "minLength": 1 },
+            "translated_prose_blocks": { "type": "integer", "minimum": 0 },
+            "preserved_formula_blocks": { "type": "integer", "minimum": 0 },
+            "preserved_formula_spans": { "type": "integer", "minimum": 0 },
+            "preserved_code_blocks": { "type": "integer", "minimum": 0 },
+            "preserved_algorithm_blocks": { "type": "integer", "minimum": 0 },
+            "preserved_terms": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "terminology_policy": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        "workflow_route": {
+          "type": "object",
+          "required": ["version", "input_form", "content_profile", "source_language", "translation_required", "original_placement", "classifier", "stages"],
+          "properties": {
+            "version": { "const": "progressive-reading.workflow-route/v1" },
+            "input_form": { "$ref": "#/$defs/routingDecision" },
+            "content_profile": { "$ref": "#/$defs/routingDecision" },
+            "source_language": { "$ref": "#/$defs/routingDecision" },
+            "translation_required": { "type": "boolean" },
+            "original_placement": { "const": "after_translation" },
+            "classifier": { "$ref": "#/$defs/workflowClassifier" },
+            "stages": { "type": "array", "minItems": 1, "items": { "type": "object" } }
+          },
+          "additionalProperties": false
+        },
+        "validations": { "type": "array", "items": { "$ref": "#/$defs/validation" } },
+        "replay_of_status": { "enum": ["completed", "completed_with_warnings", "quarantined", "failed"] },
+        "replayed_at": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "stage", "message", "retryable", "severity"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "stage": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "severity": { "enum": ["warning", "error"] }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false
 }
-

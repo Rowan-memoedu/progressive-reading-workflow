@@ -9,6 +9,54 @@ import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
+import "../browser-highlight-extension/draft-core.js";
+import { isReadyResult } from "../standard-preprocessing/index.mjs";
+import { preprocessBrowserCapture } from "../standard-preprocessing/integrations/browser-capture.mjs";
+import { PROCESSOR_VERSION as standardPreprocessProcessorVersion } from "../standard-preprocessing/lib/core.mjs";
+import {
+  BACKGROUND_FETCH_TRANSPORT,
+  BrowserImportBroker,
+  DEFAULT_LEASE_MS,
+  DEFAULT_MAX_ATTEMPTS,
+  URL_IMPORT_EXECUTION_CONTRACT
+} from "./browser-import-broker.mjs";
+import {
+  inferImportEntryRoute,
+  loadImportDestinationRoutes,
+  normalizeRelativeDestinationFolder,
+  resolveImportDestinationFolder,
+  resolveReadingDestinationRoot
+} from "./import-destination-routing.mjs";
+import {
+  URL_COOKIE_SYNC_ALLOWED_HOSTNAMES,
+  URL_COOKIE_SETUP_ORIGIN,
+  URL_COOKIE_SYNC_SCHEMA,
+  UrlImportDegradedError,
+  fetchUrlWithoutBrowser,
+  isLoopbackAddress,
+  mergeCookieSyncIntoProcessEnvironment,
+  validateCookieSyncContentType,
+  validateCookieSyncSetupOrigin,
+  validateCookieSyncPayload,
+  withoutUrlCookieEnvironment,
+  loadDomainCookieMap
+} from "./url-background-fetch.mjs";
+import {
+  CHROME_COOKIE_JAR_MAX_COOKIES,
+  CHROME_COOKIE_JAR_MAX_SYNC_BYTES,
+  CHROME_COOKIE_JAR_SYNC_SCHEMA,
+  CHROME_COOKIE_SNAPSHOT_PATH_ENV,
+  CHROME_COOKIE_SNAPSHOT_SCHEMA,
+  CHROME_COOKIE_SNAPSHOT_SCHEMA_VERSION,
+  ChromeCookieJar,
+  validateChromeCookieSyncOrigin
+} from "./chrome-cookie-jar.mjs";
+import {
+  discoverRecentZhihuLikes,
+  discoverZhihuLikesSince,
+  unlikeZhihuItems,
+  verifyZhihuLikesRemoved
+} from "./zhihu-social-archive.mjs";
 import {
   addMaterialCandidate,
   createLearningProject,
@@ -23,6 +71,11 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const codeWorkflowRoot = path.resolve(__dirname, "..");
+const LocalIrDocumentCore = globalThis.LocalIrDraftCore;
+
+if (!LocalIrDocumentCore?.createDocumentState) {
+  throw new Error("local_ir_document_core_unavailable");
+}
 
 function resolveWorkflowRoot() {
   const configuredRoot = String(process.env.PROGRESSIVE_READING_WORKFLOW_ROOT || "").trim();
@@ -46,7 +99,7 @@ function resolveWorkflowRoot() {
 
 const workflowRoot = resolveWorkflowRoot();
 const importScript = path.join(__dirname, "import-web-md.mjs");
-const rssScript = path.join(__dirname, "rss-workflow.mjs");
+const rssReadingScript = path.join(workflowRoot, "rss-reading", "cli.mjs");
 const localTranscribeScript = path.join(__dirname, "local-whispercpp-transcribe.py");
 const readingRoot = path.join(workflowRoot, "阅读区");
 const importsRoot = path.join(workflowRoot, "imports");
@@ -54,10 +107,23 @@ const appRunsRoot = path.join(importsRoot, "app-runs");
 const learningRoot = path.resolve(process.env.LEARNING_PROJECT_ROOT || defaultLearningRoot);
 const browserHighlightRoot = path.join(readingRoot, "浏览器高亮");
 const browserCompletedRoot = path.join(workflowRoot, "待归档原文");
+const browserCompletedHighlightRoot = path.join(browserCompletedRoot, "浏览器高亮");
+const browserStateRoot = path.join(workflowRoot, ".local-ir", "browser-document-state");
+const browserPreprocessRoot = path.join(workflowRoot, ".local-ir", "browser-standard-preprocess");
+const importDestinationRoutesPath = path.join(workflowRoot, "config", "import-destination-routes.json");
+const importDestinationRoutes = await loadImportDestinationRoutes(importDestinationRoutesPath);
+const browserImportBroker = new BrowserImportBroker({ stateRoot: path.join(workflowRoot, ".local-ir", "browser-import-broker") });
+let urlCookieConfig = loadDomainCookieMap(process.env);
+const chromeCookieJar = new ChromeCookieJar();
+const configuredCookieSnapshotPath = String(process.env[CHROME_COOKIE_SNAPSHOT_PATH_ENV] || "").trim();
+const legacyRuntimeCookieReplacementEnabled = process.env.PROGRESSIVE_READING_ENABLE_LEGACY_COOKIE_SYNC === "true";
 const defaultPort = Number(process.env.PROGRESSIVE_READING_APP_PORT || 37829);
 const producerConfigDir = path.join(process.env.USERPROFILE || process.env.HOME || "", "Documents", "New project");
 const producerConfigKeys = ["AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL"];
 const jobs = new Map();
+const browserCommitLocks = new Map();
+const backgroundImportRuns = new Map();
+const cookieSyncEndpoint = "/api/browser-import/cookies/sync";
 
 const browserTurndown = new TurndownService({
   headingStyle: "atx",
@@ -96,6 +162,70 @@ function corsHeaders() {
 
 function shortHash(value, length = 10) {
   return createHash("sha256").update(String(value || "")).digest("hex").slice(0, length);
+}
+
+function importDestinationFolder({ source, entryRoute, destinationFolder, sourceUrl }) {
+  return resolveImportDestinationFolder(importDestinationRoutes, { source, entryRoute, destinationFolder, sourceUrl });
+}
+
+function readingDestinationRoot(folder) {
+  return resolveReadingDestinationRoot(readingRoot, folder);
+}
+
+function cookieSyncCorsHeaders(origin) {
+  return {
+    ...(origin ? { "Access-Control-Allow-Origin": origin } : {}),
+    "Access-Control-Allow-Methods": "POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Cache-Control": "no-store, max-age=0",
+    "Vary": "Origin"
+  };
+}
+
+function cookieSyncOrigin(req) {
+  if (!isLoopbackAddress(req.socket?.remoteAddress)) throw new Error("cookie_sync_loopback_only");
+  const origin = String(req.headers.origin || "").trim();
+  if (origin === URL_COOKIE_SETUP_ORIGIN) return validateCookieSyncSetupOrigin(origin);
+  return validateChromeCookieSyncOrigin(origin);
+}
+
+function cookieSyncErrorStatus(error) {
+  const code = String(error?.message || error || "");
+  if (/^(?:cookie_sync_loopback_only|cookie_sync_origin_)/u.test(code)) return 403;
+  if (code === "cookie_sync_content_type_must_be_application_json") return 415;
+  if (code === "request_too_large") return 413;
+  if (code === "cookie_sync_invalid_json") return 400;
+  return /^(?:cookie_sync_|chrome_cookie_)/u.test(code) ? 422 : 400;
+}
+
+function importFailureHttpStatus(error) {
+  const message = String(error?.message || error || "");
+  return /^(invalid_|unsupported_|empty_|no_url_found|too_many_urls|standard_preprocess_not_ready_after_)/u.test(message)
+    ? 422
+    : 503;
+}
+
+async function writeFileAtomic(target, contents) {
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporary, contents, "utf8");
+    await fs.rename(temporary, target);
+  } catch (error) {
+    await fs.rm(temporary, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function withBrowserCommitLock(key, operation) {
+  const normalizedKey = String(key || "unknown");
+  const previous = browserCommitLocks.get(normalizedKey) || Promise.resolve();
+  const current = previous.catch(() => undefined).then(operation);
+  browserCommitLocks.set(normalizedKey, current);
+  try {
+    return await current;
+  } finally {
+    if (browserCommitLocks.get(normalizedKey) === current) browserCommitLocks.delete(normalizedKey);
+  }
 }
 
 function normalizeMarkdownText(value, maxChars = 200000) {
@@ -191,16 +321,56 @@ function stripModelFences(text) {
     .trim();
 }
 
+function trimTrailingUrlPunctuation(value) {
+  let candidate = String(value || "").trim().replace(/[.,;:!?，。；：！？、]+$/g, "");
+  for (const [opening, closing] of [["(", ")"], ["[", "]"], ["{", "}"], ["（", "）"], ["【", "】"], ["「", "」"], ["《", "》"]]) {
+    while (candidate.endsWith(closing)) {
+      const openings = candidate.split(opening).length - 1;
+      const closings = candidate.split(closing).length - 1;
+      if (closings <= openings) break;
+      candidate = candidate.slice(0, -1);
+    }
+  }
+  return candidate;
+}
+
+function normalizeHttpUrl(value) {
+  try {
+    const parsed = new URL(trimTrailingUrlPunctuation(value));
+    if (!new Set(["http:", "https:"]).has(parsed.protocol)) return null;
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function urlImportDedupeKey(value) {
+  try {
+    const parsed = new URL(value);
+    const trackingKeys = [];
+    parsed.searchParams.forEach((_item, key) => {
+      if (/^utm_/i.test(key) || /^(fbclid|gclid|mc_cid|mc_eid)$/i.test(key)) trackingKeys.push(key);
+    });
+    for (const key of trackingKeys) parsed.searchParams.delete(key);
+    parsed.searchParams.sort();
+    if (parsed.pathname.length > 1) parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    return parsed.toString();
+  } catch {
+    return value;
+  }
+}
+
 function extractUrls(text) {
-  const matches = String(text || "").match(/https?:\/\/[^\s<>"'，。；、）)]+/g) || [];
+  const matches = String(text || "").match(/https?:\/\/[^\s<>"']+/gi) || [];
   const seen = new Set();
   const urls = [];
   for (const raw of matches) {
-    const url = raw.replace(/[，。；;、)）]+$/g, "");
-    if (!seen.has(url)) {
-      seen.add(url);
-      urls.push(url);
-    }
+    const url = normalizeHttpUrl(raw);
+    const dedupeKey = url ? urlImportDedupeKey(url) : "";
+    if (!url || seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    urls.push(url);
   }
   return urls;
 }
@@ -428,7 +598,8 @@ async function log(job, message) {
 
 function runProcess(command, args, { cwd = workflowRoot, timeoutMs = 600000 } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { cwd, windowsHide: true });
+    const childEnv = withoutUrlCookieEnvironment(process.env);
+    const child = spawn(command, args, { cwd, windowsHide: true, env: childEnv });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
@@ -463,7 +634,7 @@ function parseSummary(stdout) {
 }
 
 function isSuccessfulImportItem(item) {
-  return item?.status === "imported" || item?.status === "partial";
+  return item?.status === "imported" || item?.status === "partial" || item?.status === "idempotent_replay";
 }
 
 function outputDetails(item) {
@@ -494,14 +665,14 @@ function parseJsonOutput(stdout) {
   }
 }
 
-async function runRssCli(args, { timeoutMs = 900000 } = {}) {
-  const result = await runProcess(process.execPath, [rssScript, ...args, "--json"], { timeoutMs });
+async function runRssReadingCli(args, { timeoutMs = 900000 } = {}) {
+  const result = await runProcess(process.execPath, [rssReadingScript, ...args], { timeoutMs });
   const parsed = parseJsonOutput(result.stdout);
   if (result.code !== 0) {
-    const detail = parsed || { error: result.stderr || result.stdout || `rss_cli_exit_${result.code}` };
+    const detail = parsed || { error: result.stderr || result.stdout || `rss_reading_cli_exit_${result.code}` };
     throw new Error(JSON.stringify(detail));
   }
-  return parsed || { stdout: result.stdout, stderr: result.stderr };
+  return parsed?.result || parsed || { stdout: result.stdout, stderr: result.stderr };
 }
 
 async function writeFailureReport({ dir, url, stage, reason, detail = "" }) {
@@ -862,17 +1033,16 @@ async function writeBrowserHighlightCapture(rawPayload) {
   };
 }
 
-async function browserDraftTarget(root, sourceUrl, title, destination) {
+async function browserDraftTarget(root, sourceUrl, title) {
   const parsed = new URL(sourceUrl);
-  const label = destination === "completed" ? "浏览器完成阅读" : "浏览器加工";
-  const suffix = `--${label}--${shortHash(parsed.href)}.md`;
+  const suffix = `--浏览器加工--${shortHash(parsed.href)}.md`;
   const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
   const existing = entries.find((entry) => entry.isFile() && entry.name.endsWith(suffix));
   if (existing) return path.join(root, existing.name);
   return path.join(root, `${safeName(title || parsed.hostname || "browser-reading")}${suffix}`);
 }
 
-function browserDraftDocument({ draft, converted, destination, metadataFileName }) {
+function browserDraftDocument({ draft, converted, documentStatus }) {
   const title = converted.title || draft.title || new URL(draft.url).hostname;
   const now = nowIso();
   return [
@@ -881,13 +1051,13 @@ function browserDraftDocument({ draft, converted, destination, metadataFileName 
     `source_title: ${yamlString(title)}`,
     `imported_at: ${yamlString(now)}`,
     `updated_at: ${yamlString(now)}`,
-    `import_method: ${destination === "completed" ? "browser_complete_reading" : "browser_draft_commit"}`,
+    "import_method: browser_draft_commit",
     "highlight_mode: virtual_metadata",
     `conversion_method: ${yamlString(converted.method)}`,
     `browser_draft_id: ${yamlString(draft.id)}`,
     `browser_draft_revision: ${Number(draft.revision || 0)}`,
-    `browser_metadata_file: ${yamlString(metadataFileName)}`,
-    `status: ${destination === "completed" ? "done" : "imported"}`,
+    "browser_state_schema: local-ir.document-state/v1",
+    `status: ${documentStatus === "done" ? "done" : "imported"}`,
     "---",
     "",
     `# ${title}`,
@@ -899,7 +1069,148 @@ function browserDraftDocument({ draft, converted, destination, metadataFileName 
   ].join("\n");
 }
 
-async function writeBrowserDraftCommit(rawBody, destination = "reading") {
+async function browserPreprocessProducer() {
+  const mode = String(process.env.PROGRESSIVE_READING_BROWSER_PREPROCESS_TEST_PRODUCER || "").trim();
+  if (!mode) return undefined;
+  if (process.env.NODE_ENV !== "test") throw new Error("browser_preprocess_test_producer_requires_test_environment");
+  const { SyntheticProducer } = await import("../standard-preprocessing/test-support/synthetic-producer.mjs");
+  if (mode === "synthetic") return new SyntheticProducer();
+  if (mode === "synthetic-invalid") return new SyntheticProducer({ invalid: true });
+  throw new Error(`unsupported_browser_preprocess_test_producer:${mode}`);
+}
+
+async function standardizeBrowserDraft(draft, parsedUrl, converted) {
+  const outputDir = path.join(browserPreprocessRoot, shortHash(parsedUrl.href));
+  const cacheDir = path.join(browserPreprocessRoot, ".cache");
+  const run = await preprocessBrowserCapture({
+    markdown: converted.markdown,
+    sourceMetadata: {
+      ...draft.sourceMetadata,
+      source_url: String(draft.sourceMetadata?.source_url || parsedUrl.href),
+      canonical_url: String(draft.sourceMetadata?.canonical_url || parsedUrl.href),
+      title: converted.title || draft.title,
+      source_is_original: true,
+      capture_agent: String(draft.sourceMetadata?.capture_agent || "local_ir_browser_extension")
+    },
+    userInstruction: draft.userInstruction,
+    outputDir,
+    cacheDir,
+    producer: await browserPreprocessProducer()
+  });
+  if (!isReadyResult(run.result)) {
+    const status = run.result?.status || "unknown";
+    const state = run.result?.processing_state || "unknown";
+    const zone = run.result?.artifacts?.target_zone || "unknown";
+    const attempts = Math.max(1, Number(run.workflow_attempts?.length || 1));
+    throw new Error(`standard_preprocess_not_ready_after_${attempts}_workflows:${status}:${state}:${zone}`);
+  }
+  const rendered = String(run.result.artifacts.reading_markdown || "");
+  if (!rendered.startsWith("---\n")) throw new Error("standard_preprocess_missing_frontmatter");
+  const processorVersion = String(run.result.receipt?.processor_version || "unknown");
+  const promptVersion = String(run.result.receipt?.prompt_version || "unknown");
+  const conversionMethod = `progressive_reading_preprocess/${processorVersion}`;
+  const markdown = updateFrontmatterFields(rendered, {
+    source_url: String(draft.sourceMetadata?.source_url || parsedUrl.href),
+    source_title: converted.title || draft.title,
+    import_method: "browser_standard_preprocess",
+    highlight_mode: "virtual_metadata",
+    conversion_method: conversionMethod,
+    browser_draft_id: draft.id,
+    browser_draft_revision: Number(draft.revision || 0),
+    browser_state_schema: "local-ir.document-state/v1",
+    status: "imported"
+  });
+  return {
+    markdown,
+    conversionMethod,
+    outputDir: run.output_dir || outputDir,
+    materialId: run.result.material_id,
+    idempotencyKey: run.result.idempotency_key,
+    processorVersion,
+    promptVersion,
+    status: run.result.status,
+    processingState: run.result.processing_state,
+    targetZone: run.result.artifacts.target_zone,
+    workflowAttempts: run.workflow_attempts || []
+  };
+}
+
+function assertUrlImportBodyIntegrity(draft, converted) {
+  if (draft.sourceType !== "url_import") return;
+  const sourceIntegrity = draft.sourceMetadata?.content_integrity || {};
+  const markdownChars = String(converted.markdown || "").replace(/\s+/gu, "").length;
+  const visibleChars = Math.max(0, Number(sourceIntegrity.visible_text_chars || 0));
+  if (markdownChars < 80) throw new Error("url_content_integrity_failed:extracted_markdown_too_short");
+  if (visibleChars >= 500 && markdownChars / visibleChars < 0.15) {
+    throw new Error("url_content_integrity_failed:extracted_body_ratio_too_low");
+  }
+}
+
+async function pathExists(target) {
+  return fs.access(target).then(() => true, () => false);
+}
+
+async function migrateLegacyBrowserCompletedArtifacts() {
+  const entries = await fs.readdir(browserCompletedRoot, { withFileTypes: true }).catch(() => []);
+  const migrations = [];
+  await fs.mkdir(browserCompletedHighlightRoot, { recursive: true });
+  await fs.mkdir(browserStateRoot, { recursive: true });
+
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".md") || !entry.name.includes("--浏览器完成阅读--")) continue;
+    const legacyMarkdown = path.join(browserCompletedRoot, entry.name);
+    const legacySidecar = path.join(browserStateRoot, `${entry.name}.browser-ir.json`);
+    const canonicalName = entry.name.replace("--浏览器完成阅读--", "--浏览器加工--");
+    const canonicalMarkdown = path.join(browserCompletedHighlightRoot, canonicalName);
+    const canonicalSidecar = path.join(browserStateRoot, `${canonicalName}.browser-ir.json`);
+    if (await pathExists(canonicalMarkdown) || await pathExists(canonicalSidecar) || !(await pathExists(legacySidecar))) continue;
+
+    let state;
+    try {
+      state = JSON.parse(await fs.readFile(legacySidecar, "utf8"));
+    } catch {
+      continue;
+    }
+    if (state?.schema !== LocalIrDocumentCore.DOCUMENT_STATE_SCHEMA || state?.document?.status !== "done") continue;
+
+    const migratedAt = nowIso();
+    const documentPath = path.relative(path.resolve(workflowRoot, "..", ".."), canonicalMarkdown).replaceAll("\\", "/");
+    const migratedState = LocalIrDocumentCore.normalizeDocumentState({
+      ...state,
+      document: {
+        ...state.document,
+        path: documentPath,
+        revision: Number(state.document.revision || 0) + 1,
+        updatedAt: migratedAt,
+        handoff: {
+          ...state.document.handoff,
+          state: "ready",
+          owner: "obsidian",
+          committedAt: migratedAt
+        }
+      },
+      browser: {
+        ...state.browser,
+        destination: "completed",
+        completionIntent: "pending_archive"
+      }
+    }, { path: documentPath });
+
+    await fs.rename(legacyMarkdown, canonicalMarkdown);
+    try {
+      await writeFileAtomic(canonicalSidecar, `${JSON.stringify(migratedState, null, 2)}\n`);
+      await fs.rm(legacySidecar, { force: true });
+      migrations.push({ from: legacyMarkdown, to: canonicalMarkdown, annotations: migratedState.annotations.length });
+    } catch (error) {
+      await fs.rename(canonicalMarkdown, legacyMarkdown).catch(() => undefined);
+      await fs.rm(canonicalSidecar, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+  return migrations;
+}
+
+async function writeBrowserDraftCommitUnlocked(rawBody, destination = "reading", options = {}) {
   const rawDraft = rawBody?.draft || {};
   const draft = {
     ...rawDraft,
@@ -912,7 +1223,8 @@ async function writeBrowserDraftCommit(rawBody, destination = "reading") {
     articleMusing: rawDraft.articleMusing || null,
     sourceType: String(rawDraft.sourceType || "browser_page"),
     sourceMetadata: rawDraft.sourceMetadata && typeof rawDraft.sourceMetadata === "object" ? rawDraft.sourceMetadata : {},
-    userInstruction: String(rawDraft.userInstruction || "")
+    userInstruction: String(rawDraft.userInstruction || ""),
+    destinationFolder: normalizeRelativeDestinationFolder(rawDraft.destinationFolder || "")
   };
   let parsed;
   try {
@@ -929,71 +1241,405 @@ async function writeBrowserDraftCommit(rawBody, destination = "reading") {
     sourceUrl: parsed.href,
     title: draft.title
   });
-  const root = destination === "completed" ? browserCompletedRoot : browserHighlightRoot;
+  assertUrlImportBodyIntegrity(draft, converted);
+  const standardize = Boolean(options.standardize);
+  const resolvedDestination = standardize ? "reading" : destination;
+  const completed = resolvedDestination === "completed";
+  const root = completed
+    ? browserCompletedHighlightRoot
+    : standardize && draft.destinationFolder
+      ? readingDestinationRoot(draft.destinationFolder)
+      : browserHighlightRoot;
+  const documentStatus = completed ? "done" : "inbox";
   await fs.mkdir(root, { recursive: true });
-  const target = await browserDraftTarget(root, parsed.href, converted.title || draft.title, destination);
-  const metadataTarget = `${target}.browser-ir.json`;
-  const markdown = browserDraftDocument({
+  await fs.mkdir(browserStateRoot, { recursive: true });
+  const target = await browserDraftTarget(root, parsed.href, converted.title || draft.title);
+  const metadataTarget = path.join(browserStateRoot, `${path.basename(target)}.browser-ir.json`);
+  const preprocessing = standardize
+    ? await standardizeBrowserDraft(draft, parsed, converted)
+    : null;
+  const markdown = preprocessing?.markdown || browserDraftDocument({
     draft: { ...draft, url: parsed.href },
     converted,
-    destination,
-    metadataFileName: path.basename(metadataTarget)
+    documentStatus
   });
   const rawMarkdownSha256 = createHash("sha256").update(converted.markdown).digest("hex");
   const finalMarkdownSha256 = createHash("sha256").update(markdown).digest("hex");
-  const metadata = {
-    schema_version: 1,
-    status: destination === "completed" ? "completed_pending_archive" : "saved_locked",
-    destination,
-    draft_id: draft.id,
-    revision: Number(draft.revision || 0),
-    source_type: draft.sourceType,
-    source_metadata: {
+  const documentPath = path.relative(path.resolve(workflowRoot, "..", ".."), target).replaceAll("\\", "/");
+  const stateDraft = preprocessing ? {
+    ...draft,
+    sourceMetadata: {
       ...draft.sourceMetadata,
-      source_url: parsed.href,
-      source_title: converted.title || draft.title,
-      conversion_method: converted.method,
-      raw_markdown_sha256: rawMarkdownSha256
-    },
-    user_instruction: draft.userInstruction,
-    annotations: draft.annotations,
-    article_musing: draft.articleMusing,
-    qa_cards: draft.qaCards,
-    completion_intent: destination === "completed" ? "pending_archive" : null,
-    created_at: nowIso()
-  };
-  await fs.writeFile(target, markdown, "utf8");
-  await fs.writeFile(metadataTarget, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+      destination_folder: draft.destinationFolder || "浏览器高亮",
+      standard_preprocess: {
+        material_id: preprocessing.materialId,
+        idempotency_key: preprocessing.idempotencyKey,
+        processor_version: preprocessing.processorVersion,
+        prompt_version: preprocessing.promptVersion,
+        output_dir: preprocessing.outputDir,
+        workflow_attempts: preprocessing.workflowAttempts
+      }
+    }
+  } : draft;
+  const metadata = LocalIrDocumentCore.createDocumentState(stateDraft, {
+    path: documentPath,
+    title: converted.title || draft.title,
+    sourceUrl: String(draft.sourceMetadata?.source_url || parsed.href),
+    destination: resolvedDestination,
+    documentStatus,
+    markdownSha256: finalMarkdownSha256,
+    rawMarkdownSha256,
+    conversionMethod: preprocessing?.conversionMethod || converted.method,
+    committedAt: nowIso()
+  });
+  metadata.annotations = LocalIrDocumentCore.anchorAnnotationsToMarkdown(metadata.annotations, markdown, documentPath);
+  await writeFileAtomic(target, markdown);
+  await writeFileAtomic(metadataTarget, `${JSON.stringify(metadata, null, 2)}\n`);
   return {
-    status: destination === "completed" ? "completed_pending_archive" : "saved_locked",
+    status: completed ? "completed_pending_archive" : "saved_locked",
     artifacts: [
       { kind: "markdown", path: target, sha256: finalMarkdownSha256 },
-      { kind: "browser_ir_metadata", path: metadataTarget }
+      { kind: "browser_ir_metadata", path: metadataTarget },
+      ...(preprocessing ? [{ kind: "standard_preprocess_audit", path: preprocessing.outputDir }] : [])
     ],
-    source_metadata: metadata.source_metadata,
+    source_metadata: metadata.browser.sourceMetadata,
     receipt: {
       draft_id: draft.id,
       revision: Number(draft.revision || 0),
-      destination,
-      committed_at: nowIso()
+      destination: resolvedDestination,
+      committed_at: nowIso(),
+      ...(preprocessing ? {
+        processing_mode: "standard_preprocess",
+        preprocess_status: preprocessing.status,
+        material_id: preprocessing.materialId,
+        idempotency_key: preprocessing.idempotencyKey,
+        processor_version: preprocessing.processorVersion,
+        prompt_version: preprocessing.promptVersion,
+        workflow_attempts: preprocessing.workflowAttempts
+      } : {}),
+      raw_markdown_sha256: rawMarkdownSha256,
+      final_markdown_sha256: finalMarkdownSha256
     },
     errors: []
   };
 }
 
-async function moveWebFailures(results, failureDir) {
-  await fs.mkdir(failureDir, { recursive: true });
-  for (const result of results) {
-    if (result.status !== "failed" || !result.target) continue;
+function runtimeCookieHeaderForUrl(value) {
+  return chromeCookieJar.headerForUrl(value);
+}
+
+function authenticatedCookieHealth() {
+  return {
+    schema: CHROME_COOKIE_SNAPSHOT_SCHEMA,
+    schema_version: CHROME_COOKIE_SNAPSHOT_SCHEMA_VERSION,
+    configured: chromeCookieJar.health.configured,
+    source: chromeCookieJar.health.source,
+    cookie_count: chromeCookieJar.health.cookie_count,
+    domain_count: chromeCookieJar.health.domain_count,
+    skipped_count: chromeCookieJar.health.skipped_count,
+    skipped_partitioned_count: chromeCookieJar.health.skipped_partitioned_count,
+    skipped_expired_count: chromeCookieJar.health.skipped_expired_count,
+    snapshot_generated_at: chromeCookieJar.health.snapshot_generated_at || null,
+    snapshot_cookie_count: chromeCookieJar.health.snapshot_cookie_count || 0,
+    fingerprint: chromeCookieJar.health.fingerprint,
+    values_exposed: false
+  };
+}
+
+async function fetchUrlImportDraft(requestedUrl) {
+  const fetched = await fetchUrlWithoutBrowser(requestedUrl, { cookieHeaderForUrl: runtimeCookieHeaderForUrl });
+  const capturedAt = nowIso();
+  return {
+    requestedUrl: fetched.requestedUrl,
+    finalUrl: fetched.finalUrl,
+    redirectChain: fetched.redirectChain,
+    fetchReceipt: fetched.fetchReceipt,
+    draft: {
+      id: `local-ir-url-${shortHash(fetched.finalUrl, 16)}`,
+      url: fetched.finalUrl,
+      title: fetched.title,
+      pageText: fetched.isPlainText ? fetched.body : fetched.visibleText,
+      html: fetched.isHtml ? fetched.body : "",
+      annotations: [],
+      qaCards: [],
+      articleMusing: null,
+      sourceType: "url_import",
+      sourceMetadata: fetched.sourceMetadata,
+      userInstruction: "",
+      revision: 0,
+      createdAt: capturedAt,
+      updatedAt: capturedAt
+    }
+  };
+}
+
+async function writeBrowserDraftCommit(rawBody, destination = "reading", options = {}) {
+  const rawUrl = String(rawBody?.draft?.url || "").trim();
+  let lockKey = rawUrl;
+  try {
+    lockKey = new URL(rawUrl).href;
+  } catch {
+    // Invalid input is still serialized under its raw value and rejected by the core validator.
+  }
+  return withBrowserCommitLock(lockKey, () => writeBrowserDraftCommitUnlocked(rawBody, destination, options));
+}
+
+async function importUrlThroughStandardWorkflow(url, { userInstruction = "", destinationFolder = "" } = {}) {
+  const fetched = await fetchUrlImportDraft(url);
+  fetched.draft.userInstruction = String(userInstruction || "");
+  fetched.draft.destinationFolder = normalizeRelativeDestinationFolder(destinationFolder);
+  const result = await writeBrowserDraftCommit({ draft: fetched.draft }, "reading", { standardize: true });
+  return {
+    requested_url: fetched.requestedUrl,
+    final_url: fetched.finalUrl,
+    redirect_chain: fetched.redirectChain,
+    status: result.receipt?.preprocess_status === "idempotent_replay" ? "idempotent_replay" : "imported",
+    artifacts: result.artifacts,
+    source_metadata: result.source_metadata,
+    receipt: {
+      ...result.receipt,
+      destination_folder: fetched.draft.destinationFolder || "浏览器高亮",
+      ...fetched.fetchReceipt
+    }
+  };
+}
+
+async function replayExistingUrlImport(existing, requestedUrl) {
+  if (!existing || !Array.isArray(existing.artifacts)) return null;
+  const markdownArtifact = existing.artifacts.find((item) => item?.kind === "markdown" && item?.path);
+  if (!markdownArtifact) return null;
+  const markdown = await fs.readFile(markdownArtifact.path, "utf8").catch(() => null);
+  if (markdown === null || !markdown.trim()) return null;
+  const currentSha256 = createHash("sha256").update(markdown).digest("hex");
+  const recordedSha256 = String(markdownArtifact.sha256 || existing.receipt?.final_markdown_sha256 || "");
+  if (recordedSha256 && recordedSha256 !== currentSha256) return null;
+  return {
+    ...existing,
+    requested_url: requestedUrl,
+    status: "idempotent_replay",
+    artifacts: existing.artifacts.map((item) => item?.kind === "markdown"
+      ? { ...item, sha256: currentSha256 }
+      : item),
+    receipt: {
+      ...existing.receipt,
+      preprocess_status: "idempotent_replay",
+      final_markdown_sha256: currentSha256,
+      browser_tab_created: false,
+      cookie_policy: "versioned_snapshot_cookie_matching_no_store",
+      idempotent_replay_basis: "normalized_requested_url"
+    },
+    errors: []
+  };
+}
+
+async function findReadyDocumentStateImportForUrl(requestedUrl) {
+  const requestedKey = urlImportDedupeKey(requestedUrl);
+  const entries = await fs.readdir(browserStateRoot, { withFileTypes: true }).catch(() => []);
+  const workspaceRoot = path.resolve(workflowRoot, "..", "..");
+  const readingPrefix = `${path.resolve(readingRoot)}${path.sep}`;
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".browser-ir.json")) continue;
+    const metadataPath = path.join(browserStateRoot, entry.name);
+    let state;
     try {
-      const target = path.resolve(result.target);
-      const moved = path.join(failureDir, path.basename(target));
-      await fs.rename(target, moved);
-      result.target = moved;
+      state = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+    } catch {
+      continue;
+    }
+    const sourceMetadata = state?.browser?.sourceMetadata || {};
+    const preprocess = sourceMetadata.standard_preprocess || {};
+    const matchingUrl = [state?.document?.sourceUrl, sourceMetadata.source_url, sourceMetadata.canonical_url]
+      .find((value) => value && urlImportDedupeKey(value) === requestedKey);
+    const finalAttempt = Array.isArray(preprocess.workflow_attempts) ? preprocess.workflow_attempts.at(-1) : null;
+    if (!matchingUrl
+      || state?.document?.handoff?.state !== "ready"
+      || !preprocess.material_id
+      || !preprocess.idempotency_key
+      || !new Set(["completed", "idempotent_replay"]).has(finalAttempt?.status)
+      || finalAttempt?.processing_state !== "rendered"
+      || finalAttempt?.target_zone !== "local-ir-reading") continue;
+
+    const markdownPath = path.resolve(workspaceRoot, String(state.document.path || ""));
+    if (!markdownPath.startsWith(readingPrefix)) continue;
+    const markdown = await fs.readFile(markdownPath, "utf8").catch(() => null);
+    if (!markdown?.trim()) continue;
+    const markdownSha256 = createHash("sha256").update(markdown).digest("hex");
+    if (state.content?.markdownSha256 && state.content.markdownSha256 !== markdownSha256) continue;
+    return {
+      requested_url: requestedUrl,
+      final_url: String(sourceMetadata.canonical_url || matchingUrl),
+      redirect_chain: [],
+      status: "imported",
+      artifacts: [
+        { kind: "markdown", path: markdownPath, sha256: markdownSha256 },
+        { kind: "browser_ir_metadata", path: metadataPath },
+        ...(preprocess.output_dir ? [{ kind: "standard_preprocess_audit", path: preprocess.output_dir }] : [])
+      ],
+      source_metadata: sourceMetadata,
+      receipt: {
+        processing_mode: "standard_preprocess",
+        preprocess_status: "completed",
+        material_id: preprocess.material_id,
+        idempotency_key: preprocess.idempotency_key,
+        processor_version: preprocess.processor_version,
+        prompt_version: preprocess.prompt_version,
+        workflow_attempts: preprocess.workflow_attempts,
+        destination_folder: sourceMetadata.destination_folder || "浏览器高亮",
+        final_markdown_sha256: markdownSha256,
+        browser_tab_created: false,
+        global_content_identity: "normalized_source_url"
+      },
+      errors: []
+    };
+  }
+  return null;
+}
+
+async function processBackgroundImportRequestUnlocked(requestId) {
+  while (true) {
+    const task = await browserImportBroker.claimTask(
+      "local-background-url-fetcher",
+      `background-${requestId}-${randomUUID()}`,
+      { transport: BACKGROUND_FETCH_TRANSPORT, requestId }
+    );
+    if (!task) {
+      const request = await browserImportBroker.getRequest(requestId);
+      if (!request || request.terminal) break;
+      await browserImportBroker.waitForTask(25000, { transport: BACKGROUND_FETCH_TRANSPORT });
+      continue;
+    }
+    try {
+      await withBrowserCommitLock(`url-import:${urlImportDedupeKey(task.requested_url)}`, async () => {
+        const existing = await browserImportBroker.findSuccessfulResultForUrl(task.requested_url, {
+          excludeTaskId: task.id
+        }) || await findReadyDocumentStateImportForUrl(task.requested_url);
+        const destinationFolder = importDestinationFolder({
+          source: task.source,
+          entryRoute: task.entry_route,
+          destinationFolder: task.destination_folder,
+          sourceUrl: task.requested_url
+        });
+        const existingDestination = String(existing?.receipt?.destination_folder || "浏览器高亮");
+        const existingSourceUrl = String(existing?.source_metadata?.source_url || "");
+        const sourceIdentityMatches = existingSourceUrl
+          && urlImportDedupeKey(existingSourceUrl) === urlImportDedupeKey(task.requested_url);
+        const globallyCommitted = existing?.receipt?.global_content_identity === "normalized_source_url";
+        const replay = (globallyCommitted || existingDestination === destinationFolder) && sourceIdentityMatches
+          ? await replayExistingUrlImport(existing, task.requested_url)
+          : null;
+        const result = replay || await importUrlThroughStandardWorkflow(task.requested_url, {
+            userInstruction: task.user_instruction,
+            destinationFolder
+          });
+        await browserImportBroker.completeTask(task.id, {
+          ok: true,
+          result,
+          leaseToken: task.lease_token
+        });
+      });
     } catch (error) {
-      result.moveFailureReportError = error.message;
+      if (error instanceof UrlImportDegradedError) {
+        await browserImportBroker.completeTask(task.id, {
+          ok: false,
+          degradedStatus: error.status,
+          error: error.message,
+          result: {
+            status: error.status,
+            requested_url: task.requested_url,
+            final_url: error.details?.final_url || task.requested_url,
+            redirect_chain: error.details?.redirect_chain || [],
+            source_metadata: {
+              source_url: task.requested_url,
+              canonical_url: error.details?.final_url || task.requested_url,
+              redirect_chain: error.details?.redirect_chain || [],
+              response_status: error.details?.response_status || null,
+              content_type: error.details?.content_type || null,
+              content_integrity: error.details?.content_integrity || null,
+              capture_agent: "local_background_url_fetch",
+              fetch_transport: BACKGROUND_FETCH_TRANSPORT
+            },
+            receipt: {
+              browser_tab_created: false,
+              cookie_policy: "versioned_snapshot_cookie_matching_no_store"
+            },
+            errors: [{ code: error.status, message: error.message }]
+          },
+          leaseToken: task.lease_token
+        });
+      } else {
+        await browserImportBroker.completeTask(task.id, {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+          result: {
+            status: "failed",
+            requested_url: task.requested_url,
+            receipt: {
+              browser_tab_created: false,
+              cookie_policy: "versioned_snapshot_cookie_matching_no_store"
+            },
+            errors: [{ code: "background_url_import_failed", message: error instanceof Error ? error.message : String(error) }]
+          },
+          leaseToken: task.lease_token
+        });
+      }
     }
   }
+  return browserImportBroker.getRequest(requestId);
+}
+
+async function processBackgroundImportRequest(requestId) {
+  const key = String(requestId);
+  const existing = backgroundImportRuns.get(key);
+  if (existing) return existing;
+  const run = processBackgroundImportRequestUnlocked(key).finally(() => {
+    if (backgroundImportRuns.get(key) === run) backgroundImportRuns.delete(key);
+  });
+  backgroundImportRuns.set(key, run);
+  return run;
+}
+
+async function submitSharedUrlImport(urls, {
+  source = "unknown",
+  clientRequestId = null,
+  userInstruction = "",
+  entryRoute = "",
+  destinationFolder = "",
+  wait = false
+} = {}) {
+  const request = await browserImportBroker.createRequest(urls, {
+    source,
+    clientRequestId,
+    transport: BACKGROUND_FETCH_TRANSPORT,
+    userInstruction,
+    entryRoute: inferImportEntryRoute(source, entryRoute),
+    destinationFolder: normalizeRelativeDestinationFolder(destinationFolder)
+  });
+  const run = processBackgroundImportRequest(request.request_id);
+  return wait ? run : request;
+}
+
+async function resumePendingBackgroundImports() {
+  const requestIds = await browserImportBroker.listPendingRequestIds({ transport: BACKGROUND_FETCH_TRANSPORT });
+  for (const requestId of requestIds) {
+    processBackgroundImportRequest(requestId).catch((error) => console.error(error));
+  }
+  return requestIds.length;
+}
+
+async function importUrlsThroughStandardWorkflow(rawBody) {
+  const urls = Array.isArray(rawBody?.urls)
+    ? extractUrls(rawBody.urls.join("\n"))
+    : extractUrls(rawBody?.text || "");
+  if (!urls.length) throw new Error("no_url_found");
+  if (urls.length > 50) throw new Error("too_many_urls_max_50");
+  return submitSharedUrlImport(urls, {
+    source: String(rawBody?.source || "obsidian_local_ir"),
+    clientRequestId: rawBody?.client_request_id || null,
+    userInstruction: String(rawBody?.user_instruction || rawBody?.userInstruction || ""),
+    entryRoute: String(rawBody?.entry_route || rawBody?.entryRoute || "obsidian"),
+    destinationFolder: String(rawBody?.destination_folder || rawBody?.destinationFolder || ""),
+    wait: true
+  });
 }
 
 async function importWechat(job, urls, runName) {
@@ -1026,32 +1672,20 @@ async function importWechat(job, urls, runName) {
 }
 
 async function importWeb(job, urls, runName) {
-  const outDir = path.join(readingRoot, "网页", runName);
-  const failureDir = path.join(job.runDir, "web-failures");
-  await log(job, `普通网页导入开始：${urls.length} 个链接`);
-  const args = [importScript, ...urls, "--out", outDir];
-  const instruction = importerInstruction(job);
-  if (instruction) args.push("--instruction", instruction);
-  const result = await runProcess(process.execPath, args);
+  await log(job, `普通网页后台静默导入开始：${urls.length} 个链接`);
+  const summary = await submitSharedUrlImport(urls, {
+    source: "production_interaction",
+    clientRequestId: `app-job-${job.id}`,
+    userInstruction: importerInstruction(job),
+    wait: true
+  });
   await fs.mkdir(path.join(job.runDir, "web"), { recursive: true });
-  await fs.writeFile(path.join(job.runDir, "web", "command.stdout.txt"), result.stdout, "utf8");
-  await fs.writeFile(path.join(job.runDir, "web", "command.stderr.txt"), result.stderr, "utf8");
-  const summary = parseSummary(result.stdout) || [];
-  await moveWebFailures(summary, failureDir);
-  for (const item of summary) {
+  await fs.writeFile(path.join(job.runDir, "web", "broker-receipt.json"), `${JSON.stringify(summary, null, 2)}\n`, "utf8");
+  for (const item of summary.results || []) {
     if (isSuccessfulImportItem(item)) job.outputs.push(item);
     else job.failures.push(item);
   }
-  if (result.code !== 0 && summary.length === 0) {
-    const target = await writeFailureReport({
-      dir: failureDir,
-      url: urls[0],
-      stage: "command",
-      reason: result.stderr || `exit_${result.code}`
-    });
-    job.failures.push({ url: urls[0], status: "failed", stage: "command", reason: result.stderr || `exit_${result.code}`, target });
-  }
-  await log(job, `普通网页导入完成：成功 ${summary.filter(isSuccessfulImportItem).length}，失败 ${summary.filter((item) => !isSuccessfulImportItem(item)).length}`);
+  await log(job, `普通网页后台静默导入完成：成功 ${summary.imported || 0}，降级 ${summary.degraded || 0}，失败 ${summary.failed || 0}`);
 }
 
 async function readAgentReachDoctor(job) {
@@ -1616,6 +2250,84 @@ function sendJson(res, status, data) {
   res.end(JSON.stringify(data, null, 2));
 }
 
+function readCookieSyncRequest(req, maxBytes = 48 * 1024) {
+  return new Promise((resolve, reject) => {
+    const declaredLength = Number(req.headers["content-length"] || 0);
+    if (declaredLength > maxBytes) {
+      reject(new Error("request_too_large"));
+      req.resume();
+      return;
+    }
+    const chunks = [];
+    let totalBytes = 0;
+    let rejected = false;
+    req.on("data", (chunk) => {
+      if (rejected) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += bytes.byteLength;
+      if (totalBytes > maxBytes) {
+        rejected = true;
+        reject(new Error("request_too_large"));
+        return;
+      }
+      chunks.push(bytes);
+    });
+    req.on("end", () => {
+      if (!rejected) resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    req.on("error", reject);
+  });
+}
+
+function sendCookieSyncJson(res, status, data, origin = null) {
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    ...cookieSyncCorsHeaders(origin)
+  });
+  res.end(JSON.stringify(data));
+}
+
+function synchronizeUrlCookies(payload, origin) {
+  if (payload?.schema === CHROME_COOKIE_JAR_SYNC_SCHEMA) {
+    if (!legacyRuntimeCookieReplacementEnabled) throw new Error("cookie_sync_runtime_replacement_retired_use_snapshot");
+    if (!String(origin || "").startsWith("chrome-extension://")) throw new Error("chrome_cookie_sync_extension_origin_required");
+    const health = chromeCookieJar.replace(payload);
+    return {
+      status: "synchronized",
+      schema: CHROME_COOKIE_JAR_SYNC_SCHEMA,
+      cookie_count: health.cookie_count,
+      domain_count: health.domain_count,
+      skipped_count: health.skipped_count,
+      skipped_partitioned_count: health.skipped_partitioned_count,
+      skipped_expired_count: health.skipped_expired_count,
+      fingerprint: health.fingerprint,
+      persistence: {
+        scope: "current_service_process",
+        resync_required_after_restart: true
+      },
+      cookie_values_exposed: false
+    };
+  }
+  if (origin !== URL_COOKIE_SETUP_ORIGIN) throw new Error("cookie_sync_legacy_setup_origin_required");
+  const validated = validateCookieSyncPayload(payload);
+  urlCookieConfig = mergeCookieSyncIntoProcessEnvironment(urlCookieConfig.cookies, validated.cookies, process.env);
+  const cookieCount = validated.domains.reduce((sum, domain) => sum + domain.cookie_count, 0);
+  const fingerprint = `sha256:${createHash("sha256").update(validated.domains.map((domain) => domain.fingerprint).sort().join("\n")).digest("hex")}`;
+  return {
+    status: "synchronized",
+    schema: URL_COOKIE_SYNC_SCHEMA,
+    cookie_count: cookieCount,
+    domain_count: validated.domains.length,
+    skipped_count: 0,
+    fingerprint,
+    persistence: {
+      scope: "current_service_process",
+      resync_required_after_restart: true
+    },
+    cookie_values_exposed: false
+  };
+}
+
 function browserHighlightTestHtml() {
   return `<!doctype html>
 <html lang="zh-CN">
@@ -1639,11 +2351,11 @@ function browserHighlightTestHtml() {
     <p>这是一个普通的本地 HTTP 页面，用来验证浏览器扩展是否能注入、选区是否能高亮、摘录是否能写入本地 Markdown。</p>
     <section>
       <h2>测试文本</h2>
-      <p>请开启 Local IR Browser Highlight 的高亮模式，然后选中这一整句话。成功时，页面会出现视觉高亮，并且阅读区的浏览器高亮文件夹会出现一条 Obsidian 旧高亮格式摘录。</p>
+      <p>请开启 Local IR Browser Highlight 的加工模式，然后选中这一整句话。成功时，页面会出现虚拟高亮，并且阅读区的浏览器高亮文件夹只会出现可直接阅读的 Markdown。</p>
       <p>你也可以从右往左选择这句话，检查反向选择是否能正常保存。</p>
       <ul>
         <li>目标目录：<code>阅读区/浏览器高亮</code></li>
-        <li>保存格式：<code>==选中文本==</code></li>
+        <li>保存格式：阅读区只保留 <code>文章.md</code>；Local IR 状态保存在项目内部目录。</li>
         <li>后续加工：回到 Obsidian Local IR 里处理。</li>
       </ul>
     </section>
@@ -1754,41 +2466,16 @@ https://example.com/article
         <pre id="learningOutput"></pre>
       </section>
       <section class="rss-panel">
-        <label>RSS</label>
-        <p class="hint">RSS 这边处理订阅源、日报、周报和三状态归档；普通链接直接用左侧导入区。</p>
+        <label>RSS 运行状态</label>
+        <p class="hint">本页只查看运行状态和生成摘要，不提供审批。长文唯一审批入口是摘要区中的最新 RSS 长文周报；短文周报直接进入阅读区。</p>
         <div class="actions">
-          <button class="secondary" id="rssHealth">健康检查</button>
-          <button class="secondary" id="rssSources">刷新源</button>
-          <button class="secondary" id="rssSourceSetup">源层设置</button>
-          <button class="secondary" id="rssSourceSync">同步源层</button>
-          <button id="rssSync">生成日报</button>
-          <button id="rssPromote">处理选择</button>
+          <button class="secondary" id="rssStatus">状态</button>
+          <button class="secondary" id="rssQueue">刷新候选</button>
+          <button id="rssDaily">生成今日增量</button>
+          <button id="rssWeekly">生成本周周报</button>
+          <button class="secondary" id="rssCanary">运行 Canary</button>
         </div>
-        <div class="row">
-          <div>
-            <label for="rssType">类型</label>
-            <select id="rssType">
-              <option value="x-user">X 账号</option>
-              <option value="rss">RSS URL</option>
-            </select>
-          </div>
-          <div>
-            <label for="rssName">名称</label>
-            <input id="rssName" placeholder="Dan Koe">
-          </div>
-        </div>
-        <div class="row">
-          <div>
-            <label for="rssHandle">账号</label>
-            <input id="rssHandle" placeholder="thedankoe">
-          </div>
-          <div>
-            <label for="rssFeedUrl">Feed URL</label>
-            <input id="rssFeedUrl" placeholder="https://example.com/feed.xml">
-          </div>
-        </div>
-        <button class="secondary" id="rssAdd">添加源</button>
-        <div class="paths" id="rssSourceList"></div>
+        <div class="paths" id="rssQueueList"></div>
         <pre id="rssOutput"></pre>
       </section>
     </div>
@@ -1805,11 +2492,11 @@ https://example.com/article
     const urlPreview = document.getElementById('urlPreview');
     const urlCount = document.getElementById('urlCount');
     const rssOutput = document.getElementById('rssOutput');
-    const rssSourceList = document.getElementById('rssSourceList');
+    const rssQueueList = document.getElementById('rssQueueList');
     const learningOutput = document.getElementById('learningOutput');
     const learningProjects = document.getElementById('learningProjects');
     const learningButtons = ['learningCreate', 'learningRefresh'].map(id => document.getElementById(id));
-    const rssButtons = ['rssHealth', 'rssSources', 'rssSourceSetup', 'rssSourceSync', 'rssSync', 'rssPromote', 'rssAdd'].map(id => document.getElementById(id));
+    const rssButtons = ['rssStatus', 'rssQueue', 'rssDaily', 'rssWeekly', 'rssCanary'].map(id => document.getElementById(id));
     let timer = null;
 
     function extractClientUrls(text) {
@@ -1878,12 +2565,30 @@ https://example.com/article
     }
 
     function renderRss(data) {
-      rssOutput.textContent = JSON.stringify(data, null, 2);
-      if (data && Array.isArray(data.sources)) {
-        rssSourceList.innerHTML = data.sources.map(source => (
-          '<div class="item">' + escapeHtml(source.displayName || source.id) +
-          '<div class="muted">' + escapeHtml(source.type + ' / ' + (source.handle || source.feedUrl || '')) + '</div></div>'
+      if (data && Array.isArray(data.items)) {
+        const ready = data.items.filter(item => item.review_preview && item.review_preview.status === 'ready').length;
+        const blocked = data.items.filter(item => item.route === 'blocked').length;
+        rssOutput.textContent = '长文候选 ' + data.items.length + ' 篇｜摘要卡就绪 ' + ready + ' 篇｜正文未就绪 ' + blocked + ' 篇。审批请前往摘要区最新 RSS 长文周报。';
+        rssQueueList.innerHTML = data.items.map(item => (
+          '<div class="item"><strong>' + escapeHtml(item.title || item.material_id) + '</strong>' +
+          '<div class="muted">' + escapeHtml(item.route === 'blocked' ? '正文尚未就绪' : '长文候选') + '｜' + escapeHtml(item.decision === 'selected' ? (item.publication && item.publication.status === 'published' ? '已正式入库' : (item.publication_authorized ? '正在自动发布' : '历史已选，等待本次确认')) : item.decision === 'deferred' ? ('已入库，Later 至 ' + ((item.later && item.later.defer_until || '').slice(0, 10))) : item.decision === 'dismissed' ? '不保留' : '未决') + '</div>' +
+          (item.review_preview && item.review_preview.core ? '<div><strong>一句话核心：</strong>' + escapeHtml(item.review_preview.core) + '</div>' : '') +
+          (item.review_preview && item.review_preview.value_reason ? '<div><strong>为什么值得读：</strong>' + escapeHtml(({ high: '高', medium: '中', low: '低' }[item.review_preview.value_level] || '待判断') + '；' + item.review_preview.value_reason) + '</div>' : '') +
+          (item.review_preview && item.review_preview.novelty ? '<div><strong>可能新增量：</strong>' + escapeHtml(item.review_preview.novelty) + '</div>' : '') +
+          (item.review_preview && item.review_preview.reading_cost ? '<div><strong>预计阅读成本：</strong>' + escapeHtml(item.review_preview.reading_cost) + '｜<strong>建议读法：</strong>' + escapeHtml(item.review_preview.suggested_route || '待判断') + '</div>' : '') +
+          (item.publication_failure ? '<div class="fail">自动发布失败：' + escapeHtml(item.publication_failure.message || item.publication_failure.error || '请在最新长文周报重新处理') + '</div>' : '') +
+          (item.item_url ? '<div><a href="' + escapeHtml(item.item_url) + '" target="_blank" rel="noreferrer">查看原文</a></div>' : '') +
+          '</div>'
         )).join('');
+      } else if (data && data.outputs) {
+        const daily = data.outputs.daily && (data.outputs.daily.path || data.outputs.daily);
+        const longWeekly = data.outputs.long_weekly && (data.outputs.long_weekly.path || data.outputs.long_weekly);
+        const shortWeekly = data.outputs.short_weekly && (data.outputs.short_weekly.path || data.outputs.short_weekly);
+        rssOutput.textContent = 'RSS 产物已更新。\n长文日报：' + (daily || '本次无新增，不生成空文件') + '\n长文周报：' + (longWeekly || '本次未生成') + '\n短文周报：' + (shortWeekly || '本次无新增，不生成空文件');
+      } else if (data && data.status) {
+        rssOutput.textContent = data.status === 'passed' ? 'Canary 已通过。' : 'RSS 状态：' + data.status;
+      } else {
+        rssOutput.textContent = '操作已完成。';
       }
     }
 
@@ -2006,21 +2711,11 @@ https://example.com/article
       logsEl.textContent = '';
     });
 
-    document.getElementById('rssHealth').addEventListener('click', () => rssCall('/api/rss/health'));
-    document.getElementById('rssSources').addEventListener('click', () => rssCall('/api/rss/sources'));
-    document.getElementById('rssSourceSetup').addEventListener('click', () => rssCall('/api/rss/source/setup', {}));
-    document.getElementById('rssSourceSync').addEventListener('click', () => rssCall('/api/rss/source/sync', {}));
-    document.getElementById('rssSync').addEventListener('click', () => rssCall('/api/rss/sync', {}));
-    document.getElementById('rssPromote').addEventListener('click', () => rssCall('/api/rss/resolve', {}));
-    document.getElementById('rssAdd').addEventListener('click', () => {
-      const type = document.getElementById('rssType').value;
-      rssCall('/api/rss/sources', {
-        type,
-        displayName: document.getElementById('rssName').value,
-        handle: document.getElementById('rssHandle').value,
-        feedUrl: document.getElementById('rssFeedUrl').value
-      }).then(() => rssCall('/api/rss/sources'));
-    });
+    document.getElementById('rssStatus').addEventListener('click', () => rssCall('/api/rss-reading/status'));
+    document.getElementById('rssQueue').addEventListener('click', () => rssCall('/api/rss-reading/queue'));
+    document.getElementById('rssDaily').addEventListener('click', () => rssCall('/api/rss-reading/generate', { mode: 'daily' }).then(() => rssCall('/api/rss-reading/queue')));
+    document.getElementById('rssWeekly').addEventListener('click', () => rssCall('/api/rss-reading/generate', { mode: 'weekly' }).then(() => rssCall('/api/rss-reading/queue')));
+    document.getElementById('rssCanary').addEventListener('click', () => rssCall('/api/rss-reading/canary', {}));
     document.getElementById('learningRefresh').addEventListener('click', () => learningCall('/api/learning/projects'));
     document.getElementById('learningCreate').addEventListener('click', () => learningCall('/api/learning/projects', {
       repoUrl: document.getElementById('learningRepo').value,
@@ -2029,7 +2724,7 @@ https://example.com/article
       fetchReading: document.getElementById('learningReading').checked
     }).then(() => learningCall('/api/learning/projects')));
     renderInputPreview();
-    rssCall('/api/rss/sources');
+    rssCall('/api/rss-reading/queue');
     learningCall('/api/learning/projects');
   </script>
 </body>
@@ -2038,6 +2733,27 @@ https://example.com/article
 
 async function handle(req, res) {
   const url = new URL(req.url || "/", "http://127.0.0.1");
+  if (url.pathname === cookieSyncEndpoint && req.method === "OPTIONS") {
+    let origin = null;
+    try {
+      origin = cookieSyncOrigin(req);
+      if (String(req.headers["access-control-request-method"] || "").toUpperCase() !== "POST") {
+        throw new Error("cookie_sync_preflight_method_not_allowed");
+      }
+      const requestedHeaders = String(req.headers["access-control-request-headers"] || "")
+        .split(",")
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean);
+      if (requestedHeaders.length !== 1 || requestedHeaders[0] !== "content-type") {
+        throw new Error("cookie_sync_preflight_headers_not_allowed");
+      }
+      res.writeHead(204, cookieSyncCorsHeaders(origin));
+      res.end();
+      return;
+    } catch (error) {
+      return sendCookieSyncJson(res, cookieSyncErrorStatus(error), { error: error.message }, origin);
+    }
+  }
   if (req.method === "OPTIONS") {
     res.writeHead(204, corsHeaders());
     res.end();
@@ -2080,15 +2796,96 @@ async function handle(req, res) {
       readingRoot,
       browserHighlightRoot,
       browserCompletedRoot,
+      browserCompletedHighlightRoot,
+      browserStateRoot,
+      browserPreprocessRoot,
+      importDestinationRouting: {
+        configPath: importDestinationRoutesPath,
+        schema: importDestinationRoutes.schema,
+        routes: importDestinationRoutes.routes
+      },
+      standardImport: {
+        draftEndpoint: "/api/highlights/import-local",
+        urlBatchEndpoint: "/api/highlights/import-local-urls",
+        sharedRequestEndpoint: "/api/browser-import/requests",
+        defaultTransport: BACKGROUND_FETCH_TRANSPORT,
+        browserTabCreatedOnNormalPath: false,
+        cookiePolicy: "versioned_local_snapshot_domain_hostonly_path_secure_expiry_matching",
+        authenticatedFetch: authenticatedCookieHealth(),
+        maxWorkflowAttempts: 3,
+        processorVersion: standardPreprocessProcessorVersion,
+        transportMaxAttempts: 3,
+        serializedBySourceUrl: true
+      },
+      cookieSync: {
+        endpoint: cookieSyncEndpoint,
+        schema: CHROME_COOKIE_JAR_SYNC_SCHEMA,
+        legacySchema: URL_COOKIE_SYNC_SCHEMA,
+        loopbackOnly: true,
+        origin: "chrome-extension://<32-char-extension-id>",
+        legacySetupOrigin: URL_COOKIE_SETUP_ORIGIN,
+        maxCookies: CHROME_COOKIE_JAR_MAX_COOKIES,
+        maxBodyBytes: CHROME_COOKIE_JAR_MAX_SYNC_BYTES,
+        atomicReplace: true,
+        partitionedCookies: "skipped_and_counted",
+        state: { ...chromeCookieJar.health },
+        persistence: "current_service_process",
+        resyncRequiredAfterRestart: true,
+        childProcessInheritance: false,
+        cookieValuesExposed: false,
+        runtimeReplacementEnabled: legacyRuntimeCookieReplacementEnabled,
+        status: legacyRuntimeCookieReplacementEnabled ? "legacy_compatibility_enabled" : "retired_use_versioned_snapshot"
+      },
+      cookieSnapshot: {
+        pathEnvironmentVariable: CHROME_COOKIE_SNAPSHOT_PATH_ENV,
+        schema: CHROME_COOKIE_SNAPSHOT_SCHEMA,
+        schemaVersion: CHROME_COOKIE_SNAPSHOT_SCHEMA_VERSION,
+        configured: Boolean(configuredCookieSnapshotPath),
+        loaded: chromeCookieJar.health.source === "versioned_local_snapshot",
+        state: authenticatedCookieHealth(),
+        snapshotPathExposed: false,
+        cookieValuesExposed: false
+      },
+      browserImportBroker: {
+        createRequestEndpoint: "/api/browser-import/requests",
+        claimTaskEndpoint: "/api/browser-import/tasks/claim",
+        requestStatusEndpoint: "/api/browser-import/requests/:requestId",
+        completeTaskEndpoint: "/api/browser-import/tasks/:taskId/complete",
+        backgroundTransport: BACKGROUND_FETCH_TRANSPORT,
+        extensionWorker: "retired",
+        extensionClaimEnabled: false,
+        maxTaskAttempts: DEFAULT_MAX_ATTEMPTS,
+        claimLeaseMs: DEFAULT_LEASE_MS,
+        idempotentRequestCreation: true,
+        idempotentTaskClaim: true,
+        executionContract: URL_IMPORT_EXECUTION_CONTRACT
+      },
       now: nowIso()
     });
+  }
+  if (req.method === "POST" && url.pathname === cookieSyncEndpoint) {
+    let origin = null;
+    try {
+      origin = cookieSyncOrigin(req);
+      validateCookieSyncContentType(req.headers["content-type"]);
+      const rawBody = await readCookieSyncRequest(req, CHROME_COOKIE_JAR_MAX_SYNC_BYTES);
+      let payload;
+      try {
+        payload = JSON.parse(rawBody || "{}");
+      } catch {
+        throw new Error("cookie_sync_invalid_json");
+      }
+      return sendCookieSyncJson(res, 200, synchronizeUrlCookies(payload, origin), origin);
+    } catch (error) {
+      return sendCookieSyncJson(res, cookieSyncErrorStatus(error), { error: error.message }, origin);
+    }
   }
   if (req.method === "POST" && url.pathname === "/api/highlights/capture") {
     try {
       const body = JSON.parse(await readRequest(req, { maxBytes: 8 * 1024 * 1024 }) || "{}");
       return sendJson(res, 200, await writeBrowserHighlightCapture(body));
     } catch (error) {
-      return sendJson(res, 400, { error: error.message });
+      return sendJson(res, importFailureHttpStatus(error), { error: error.message });
     }
   }
   if (req.method === "POST" && url.pathname === "/api/highlights/commit") {
@@ -2096,7 +2893,7 @@ async function handle(req, res) {
       const body = JSON.parse(await readRequest(req, { maxBytes: 8 * 1024 * 1024 }) || "{}");
       return sendJson(res, 200, await writeBrowserDraftCommit(body, "reading"));
     } catch (error) {
-      return sendJson(res, 400, { error: error.message });
+      return sendJson(res, importFailureHttpStatus(error), { error: error.message });
     }
   }
   if (req.method === "POST" && url.pathname === "/api/highlights/complete") {
@@ -2104,7 +2901,139 @@ async function handle(req, res) {
       const body = JSON.parse(await readRequest(req, { maxBytes: 8 * 1024 * 1024 }) || "{}");
       return sendJson(res, 200, await writeBrowserDraftCommit(body, "completed"));
     } catch (error) {
+      return sendJson(res, importFailureHttpStatus(error), { error: error.message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/browser-import/requests") {
+    try {
+      const body = JSON.parse(await readRequest(req, { maxBytes: 1024 * 1024 }) || "{}");
+      const urls = Array.isArray(body.urls) ? extractUrls(body.urls.join("\n")) : extractUrls(body.text || "");
+      if (!urls.length) throw new Error("no_url_found");
+      if (urls.length > 50) throw new Error("too_many_urls_max_50");
+      const request = await browserImportBroker.createRequest(urls, {
+        source: String(body.source || "unknown"),
+        clientRequestId: body.client_request_id || null,
+        transport: BACKGROUND_FETCH_TRANSPORT,
+        userInstruction: String(body.user_instruction || body.userInstruction || ""),
+        entryRoute: inferImportEntryRoute(body.source, body.entry_route || body.entryRoute),
+        destinationFolder: normalizeRelativeDestinationFolder(body.destination_folder || body.destinationFolder || "")
+      });
+      if (request.transport === BACKGROUND_FETCH_TRANSPORT) processBackgroundImportRequest(request.request_id).catch((error) => console.error(error));
+      return sendJson(res, 202, request);
+    } catch (error) {
       return sendJson(res, 400, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/social-archive/zhihu/recent-likes") {
+    try {
+      const body = JSON.parse(await readRequest(req, { maxBytes: 64 * 1024 }) || "{}");
+      if (body.action === "preview" || !body.action) {
+        const inventory = body.since_epoch
+          ? await discoverZhihuLikesSince({
+              profileToken: body.profile_token,
+              sinceEpoch: Number(body.since_epoch),
+              maxPages: Number(body.max_pages || 200),
+              cookieHeaderForUrl: runtimeCookieHeaderForUrl
+            })
+          : await discoverRecentZhihuLikes({
+              profileToken: body.profile_token,
+              limit: Number(body.limit || 10),
+              cookieHeaderForUrl: runtimeCookieHeaderForUrl
+            });
+        return sendJson(res, 200, { status: "previewed", ...inventory });
+      }
+      const items = Array.isArray(body.items) ? body.items : [];
+      if (!items.length || items.length > 50) throw new Error("frozen_zhihu_items_required");
+      if (body.action === "verify") {
+        const verification = await verifyZhihuLikesRemoved({
+          profileToken: body.profile_token,
+          removedItems: items,
+          cookieHeaderForUrl: runtimeCookieHeaderForUrl
+        });
+        return sendJson(res, 200, { status: verification.status === "verified" ? "cleanup_verified" : "cleanup_unverified", verification });
+      }
+      if (body.action !== "unlike") throw new Error("zhihu_social_archive_action_invalid");
+      const operations = await unlikeZhihuItems(items, {
+        cookieHeaderForUrl: runtimeCookieHeaderForUrl,
+        allowAccountMutation: body.allow_account_mutation === true
+      });
+      let verification;
+      try {
+        verification = await verifyZhihuLikesRemoved({
+          profileToken: body.profile_token,
+          removedItems: items,
+          cookieHeaderForUrl: runtimeCookieHeaderForUrl
+        });
+      } catch (error) {
+        return sendJson(res, 200, {
+          status: "cleanup_applied_verification_failed",
+          operations,
+          verification_error: error.message
+        });
+      }
+      if (verification.status !== "verified") {
+        return sendJson(res, 200, {
+          status: "cleanup_applied_verification_failed",
+          operations,
+          verification
+        });
+      }
+      return sendJson(res, 200, {
+        status: "cleanup_verified",
+        operations,
+        verification
+      });
+    } catch (error) {
+      return sendJson(res, 400, { error: error.message });
+    }
+  }
+  const browserImportRequestMatch = url.pathname.match(/^\/api\/browser-import\/requests\/([^/]+)$/u);
+  if (req.method === "GET" && browserImportRequestMatch) {
+    const request = await browserImportBroker.getRequest(decodeURIComponent(browserImportRequestMatch[1]));
+    return request ? sendJson(res, 200, request) : sendJson(res, 404, { error: "browser_import_request_not_found" });
+  }
+  if (req.method === "GET" && url.pathname === "/api/browser-import/tasks/claim") {
+    return sendJson(res, 200, {
+      task: null,
+      status: "extension_worker_retired",
+      claim_enabled: false,
+      claimable_statuses: []
+    });
+  }
+  const browserImportCompleteMatch = url.pathname.match(/^\/api\/browser-import\/tasks\/([^/]+)\/complete$/u);
+  if (req.method === "POST" && browserImportCompleteMatch) {
+    try {
+      const body = JSON.parse(await readRequest(req, { maxBytes: 1024 * 1024 }) || "{}");
+      const request = await browserImportBroker.completeTask(decodeURIComponent(browserImportCompleteMatch[1]), {
+        ok: body.ok === true,
+        result: body.result || null,
+        error: body.error || null,
+        retryable: body.retryable === true,
+        leaseToken: body.lease_token || null,
+        degradedStatus: body.degraded_status || null
+      });
+      return sendJson(res, 200, request);
+    } catch (error) {
+      const status = error.message === "browser_import_task_not_found"
+        ? 404
+        : error.message === "browser_import_task_stale_lease" ? 409 : 400;
+      return sendJson(res, status, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/highlights/import-local") {
+    try {
+      const body = JSON.parse(await readRequest(req, { maxBytes: 8 * 1024 * 1024 }) || "{}");
+      return sendJson(res, 200, await writeBrowserDraftCommit(body, "reading", { standardize: true }));
+    } catch (error) {
+      return sendJson(res, importFailureHttpStatus(error), { error: error.message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/highlights/import-local-urls") {
+    try {
+      const body = JSON.parse(await readRequest(req, { maxBytes: 1024 * 1024 }) || "{}");
+      return sendJson(res, 200, await importUrlsThroughStandardWorkflow(body));
+    } catch (error) {
+      return sendJson(res, importFailureHttpStatus(error), { error: error.message });
     }
   }
   if (req.method === "POST" && url.pathname === "/api/intent") {
@@ -2159,63 +3088,53 @@ async function handle(req, res) {
       return sendJson(res, 400, { error: error.message });
     }
   }
-  if (req.method === "GET" && url.pathname === "/api/rss/health") {
+  if (req.method === "GET" && url.pathname === "/api/rss-reading/status") {
     try {
-      return sendJson(res, 200, await runRssCli(["health"], { timeoutMs: 180000 }));
+      return sendJson(res, 200, await runRssReadingCli(["status"], { timeoutMs: 180000 }));
     } catch (error) {
       return sendJson(res, 500, { error: error.message });
     }
   }
-  if (req.method === "GET" && url.pathname === "/api/rss/sources") {
+  if (req.method === "GET" && url.pathname === "/api/rss-reading/queue") {
     try {
-      return sendJson(res, 200, await runRssCli(["sources"], { timeoutMs: 60000 }));
+      return sendJson(res, 200, await runRssReadingCli(["queue"], { timeoutMs: 180000 }));
     } catch (error) {
       return sendJson(res, 500, { error: error.message });
     }
   }
-  if (req.method === "POST" && url.pathname === "/api/rss/sources") {
+  if (req.method === "POST" && url.pathname === "/api/rss-reading/generate") {
     try {
       const body = JSON.parse(await readRequest(req) || "{}");
-      const args = ["add-source", "--type", String(body.type || "x-user")];
-      if (body.displayName) args.push("--display-name", String(body.displayName));
-      if (body.handle) args.push("--handle", String(body.handle));
-      if (body.feedUrl) args.push("--feed-url", String(body.feedUrl));
-      return sendJson(res, 200, await runRssCli(args, { timeoutMs: 60000 }));
+      const args = ["generate"];
+      if (body.mode) args.push("--mode", String(body.mode));
+      if (body.skipSummaryIngest) args.push("--skip-summary-ingest");
+      return sendJson(res, 200, await runRssReadingCli(args, { timeoutMs: 300000 }));
+    } catch (error) {
+      return sendJson(res, 500, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/rss-reading/canary") {
+    try {
+      return sendJson(res, 200, await runRssReadingCli(["canary"], { timeoutMs: 300000 }));
+    } catch (error) {
+      return sendJson(res, 500, { error: error.message });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/rss-reading/decision") {
+    try {
+      const body = JSON.parse(await readRequest(req) || "{}");
+      if (!body.materialId || !body.decision) return sendJson(res, 400, { error: "decision_requires_material_id_and_decision" });
+      const args = ["decision", "--material-id", String(body.materialId), "--decision", String(body.decision)];
+      return sendJson(res, 200, await runRssReadingCli(args, { timeoutMs: 1200000 }));
     } catch (error) {
       return sendJson(res, 400, { error: error.message });
     }
   }
-  if (req.method === "POST" && url.pathname === "/api/rss/sync") {
+  if (req.method === "POST" && url.pathname === "/api/rss-reading/publish") {
     try {
-      return sendJson(res, 200, await runRssCli(["sync"], { timeoutMs: 1200000 }));
-    } catch (error) {
-      return sendJson(res, 500, { error: error.message });
-    }
-  }
-  if (req.method === "POST" && url.pathname === "/api/rss/source/setup") {
-    try {
-      return sendJson(res, 200, await runRssCli(["source-setup"], { timeoutMs: 600000 }));
-    } catch (error) {
-      return sendJson(res, 500, { error: error.message });
-    }
-  }
-  if (req.method === "POST" && url.pathname === "/api/rss/source/sync") {
-    try {
-      return sendJson(res, 200, await runRssCli(["source-sync"], { timeoutMs: 1200000 }));
-    } catch (error) {
-      return sendJson(res, 500, { error: error.message });
-    }
-  }
-  if (req.method === "POST" && url.pathname === "/api/rss/resolve") {
-    try {
-      return sendJson(res, 200, await runRssCli(["resolve"], { timeoutMs: 1200000 }));
-    } catch (error) {
-      return sendJson(res, 500, { error: error.message });
-    }
-  }
-  if (req.method === "POST" && url.pathname === "/api/rss/promote") {
-    try {
-      return sendJson(res, 200, await runRssCli(["resolve"], { timeoutMs: 1200000 }));
+      const body = JSON.parse(await readRequest(req) || "{}");
+      if (!body.materialId) return sendJson(res, 400, { error: "publish_requires_material_id" });
+      return sendJson(res, 200, await runRssReadingCli(["publish", "--material-id", String(body.materialId)], { timeoutMs: 1200000 }));
     } catch (error) {
       return sendJson(res, 500, { error: error.message });
     }
@@ -2275,7 +3194,14 @@ async function listen(port) {
   });
 }
 
-listen(defaultPort).catch((error) => {
+async function start() {
+  if (configuredCookieSnapshotPath) await chromeCookieJar.loadSnapshotFile(configuredCookieSnapshotPath);
+  await migrateLegacyBrowserCompletedArtifacts();
+  await listen(defaultPort);
+  await resumePendingBackgroundImports();
+}
+
+start().catch((error) => {
   console.error(error);
   process.exit(1);
 });

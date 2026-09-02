@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "progressive-reading.rss-source-package/v1",
+  "title": "Progressive reading RSS source package v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "package_version",
+    "material_id",
+    "status",
+    "content_status",
+    "sync_status",
+    "identity",
+    "source_metadata",
+    "artifacts",
+    "hashes",
+    "receipt",
+    "errors"
+  ],
+  "properties": {
+    "schema_version": { "const": "progressive-reading.rss-source-package/v1" },
+    "package_version": { "const": "1.0.0" },
+    "material_id": { "type": "string", "pattern": "^rss-[a-f0-9]{24}$" },
+    "status": {
+      "enum": ["fulltext_ready", "summary_only", "fetch_required", "fetch_failed", "duplicate"]
+    },
+    "content_status": {
+      "enum": ["fulltext_ready", "summary_only", "fetch_required", "fetch_failed"]
+    },
+    "sync_status": { "enum": ["new", "duplicate"] },
+    "identity": {
+      "type": "object",
+      "required": ["normalized_feed_url", "normalized_item_url", "guid", "content_hash"],
+      "properties": {
+        "normalized_feed_url": { "type": "string", "format": "uri" },
+        "normalized_item_url": { "type": ["string", "null"], "format": "uri" },
+        "guid": { "type": ["string", "null"] },
+        "content_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      },
+      "additionalProperties": false
+    },
+    "source_metadata": {
+      "type": "object",
+      "required": [
+        "source_type",
+        "feed_url",
+        "item_url",
+        "guid",
+        "title",
+        "author",
+        "published_at",
+        "fetched_at",
+        "content_completeness",
+        "original_source_ref",
+        "user_instruction"
+      ],
+      "properties": {
+        "source_type": { "const": "rss" },
+        "feed_url": { "type": "string", "format": "uri" },
+        "item_url": { "type": ["string", "null"], "format": "uri" },
+        "guid": { "type": ["string", "null"] },
+        "title": { "type": "string" },
+        "author": { "type": ["string", "null"] },
+        "published_at": { "type": ["string", "null"] },
+        "fetched_at": { "type": "string" },
+        "content_completeness": {
+          "enum": ["fulltext_ready", "summary_only", "fetch_required", "fetch_failed"]
+        },
+        "original_source_ref": { "type": "string" },
+        "user_instruction": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "artifacts": {
+      "type": "object",
+      "required": [
+        "source_markdown",
+        "source_metadata",
+        "raw_item",
+        "raw_feed_content",
+        "raw_item_page",
+        "raw_item_page_response",
+        "raw_feed_snapshot",
+        "preprocess_request"
+      ],
+      "properties": {
+        "source_markdown": { "type": "string" },
+        "source_metadata": { "type": "string" },
+        "raw_item": { "type": "string" },
+        "raw_feed_content": { "type": "string" },
+        "raw_item_page": { "type": ["string", "null"] },
+        "raw_item_page_response": { "type": ["string", "null"] },
+        "raw_feed_snapshot": { "type": "string" },
+        "preprocess_request": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "hashes": {
+      "type": "object",
+      "required": ["raw_feed_sha256", "raw_content_sha256", "source_markdown_sha256"],
+      "properties": {
+        "raw_feed_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "raw_content_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "source_markdown_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      },
+      "additionalProperties": false
+    },
+    "receipt": {
+      "type": "object",
+      "required": ["run_id", "source_id", "status_history", "previous_material_id", "preprocessing_handoff"],
+      "properties": {
+        "run_id": { "type": "string" },
+        "source_id": { "type": "string" },
+        "status_history": {
+          "type": "array",
+          "items": {
+            "enum": ["fulltext_ready", "summary_only", "fetch_required", "fetch_failed", "duplicate"]
+          }
+        },
+        "previous_material_id": { "type": ["string", "null"] },
+        "preprocessing_handoff": { "enum": ["request_ready", "blocked_in_source_layer"] }
+      },
+      "additionalProperties": true
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "stage", "message"],
+        "properties": {
+          "code": { "type": "string" },
+          "stage": { "type": "string" },
+          "message": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": false
+}

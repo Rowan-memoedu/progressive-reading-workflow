@@ -1,0 +1,38 @@
+{
+  "schema_version": "progressive-reading.rss-source-release/v1",
+  "version": "1.2.0",
+  "release_status": "released",
+  "released_at": "2026-08-22",
+  "runtime_entry": "npm run rss:source:sync:all",
+  "forced_rescan_entry": "npm run rss:source:sync:all -- --force",
+  "single_feed_entry": "npm run rss:source:sync:v1 -- --feed-url <feed-url> --limit <1-100>",
+  "subscriptions_entry": "npm run rss:source:subscriptions",
+  "subscriptions_config": "config/rss-subscriptions.v1.json",
+  "subscriptions_contract": "progressive-reading.rss-subscriptions/v1",
+  "subscriptions_schema": "rss-source/contracts/subscriptions.v1.schema.json",
+  "legacy_audit_status": "retired_immutable_snapshot",
+  "discovery_entry": "npm run rss:source:discover -- --url <website-url>",
+  "validation_entry": "npm run rss:source:validate -- --feed-url <feed-url>",
+  "test_entry": "npm run rss:source:check",
+  "contract": "progressive-reading.rss-source-package/v1",
+  "contract_schema": "rss-source/contracts/source-package.v1.schema.json",
+  "release_location": "rss-source/",
+  "runtime_data_location": "imports/rss/source-v1/",
+  "live_canary": "imports/rss/source-v1/batches/20260823130032-452db876/run.json",
+  "incremental_canary": "imports/rss/source-v1/batches/20260822083310-6fc70276/run.json",
+  "fulltext_policy": {
+    "dan-koe-letters": "Fetch each public item page when the Feed provides only a summary; access-restricted pages fail closed and never generate preprocess requests."
+  },
+  "live_inventory": {
+    "packages": 30,
+    "fulltext_ready": 28,
+    "fetch_failed": 2,
+    "validated_preprocess_requests": 28
+  },
+  "legacy_audit_manifest": "imports/rss/legacy-v0/manifest.json",
+  "legacy_retirement_receipt": "imports/rss/legacy-v0/retirement-receipt.json",
+  "rollback": {
+    "method": "Stop invoking rss:source:sync:all and leave imports/rss/source-v1 plus imports/rss/legacy-v0 intact for audit. The legacy script is not required for source-v1 rollback.",
+    "destructive_cleanup_required": false
+  }
+}

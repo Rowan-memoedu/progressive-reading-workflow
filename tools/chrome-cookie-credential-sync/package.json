@@ -1,0 +1,9 @@
+{
+  "name": "local-ir-chrome-cookie-credential-sync",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test-security.mjs && node test-local-contract.mjs"
+  }
+}

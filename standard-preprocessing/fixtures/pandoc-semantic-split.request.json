@@ -1,0 +1,22 @@
+{
+  "schema_version": "progressive-reading.preprocess.request/v1",
+  "contract_version": "1.0.0",
+  "material": {
+    "markdown": "# Synthetic algorithms chapter {#chap-synthetic .margin}\n\nThis introduction establishes the chapter goal.\n\n## Integer multiplication: an example of an algorithm\n\nFor integers $x$ and $y$, repeated addition gives a baseline algorithm.\n\n``` {.algorithm #alg-repeat title=\"Multiplication via repeated addition\" data-ref=\"repeat\"}\nINPUT: integers $x,y$\nOUTPUT: the product $x\\cdot y$\nprocedure{Multiply}{$x,y$}\n    $z \\leftarrow 0$\n    For{$i=1,\\ldots,y$}\n        $z \\leftarrow z+x$\n    endfor\n    return $z$\nendprocedure\n```\n\n``` {.algorithm #alg-school title=\"Grade-school multiplication\"}\nINPUT: $n$-digit integers $x,y$\nOUTPUT: $x\\cdot y$\nprocedure{GradeSchool}{$x,y$}\n    Compute all digit products $x_i y_j$\n    Add the shifted partial products\n    return the sum\nendprocedure\n```\n\nThe algorithms preserve the identity $x\\cdot y=\\sum_{i=1}^{y}x$; see [alg-repeat](){.ref}.\n\n::: {.remark #specification title=\"Specification, implementation, and analysis of algorithms.\"}\nA specification states the task, an implementation gives the steps, and an analysis measures resources.\n:::\n\n![A multiplication diagram](https://example.invalid/multiply.svg){#fig-multiply .margin title=\"layout only\"}\n\n## Other semantic containers\n\n::: {.objectives #goals}\n- Distinguish a specification from an implementation.\n- Keep $T(n)$ mathematically renderable.\n:::\n\n::: {.exercise #ex-one title=\"Trace the algorithm\"}\nCompute the result for $x=12$ and $y=3$.\n\n1. List the partial products.\n2. Explain why the output is correct.\n\nHint: use $12+12+12$.\n:::\n\n::: {.proof #proof-one}\nThe loop invariant is $z=ix$ after iteration $i$, so at termination $z=xy$.\n:::\n\n``` {#real-code .python}\ndef multiply(x, y):\n    return x * y\n```\n\nThe reference key [@synthetic2026] and URL https://example.invalid/source must remain unchanged."
+  },
+  "source_type": "synthetic_pandoc_markdown",
+  "source_metadata": {
+    "title": "Synthetic algorithms chapter",
+    "source_url": "https://example.invalid/source",
+    "source_is_original": true,
+    "content_profile": "math_lecture"
+  },
+  "user_instruction": "Normalize semantic containers into readable Markdown while preserving mathematics, source code, citations, and URLs.",
+  "processing_options": {
+    "cleaning_mode": "semantic_only",
+    "normalize_semantic_containers": true,
+    "insight_soft_min": 1,
+    "insight_soft_max": 4,
+    "insight_safety_cap": 8
+  }
+}

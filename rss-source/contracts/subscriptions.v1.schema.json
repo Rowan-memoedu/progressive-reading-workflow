@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/progressive-reading/rss-subscriptions.v1.schema.json",
+  "title": "Progressive Reading RSS subscriptions v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "registry_version", "subscriptions"],
+  "properties": {
+    "schema_version": {
+      "const": "progressive-reading.rss-subscriptions/v1"
+    },
+    "registry_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "subscriptions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "display_name", "enabled", "feed_url", "site_url", "fetch_fulltext", "user_instruction"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{1,79}$"
+          },
+          "display_name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "feed_url": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https?://"
+          },
+          "site_url": {
+            "type": ["string", "null"],
+            "format": "uri"
+          },
+          "fetch_fulltext": {
+            "type": "boolean"
+          },
+          "user_instruction": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

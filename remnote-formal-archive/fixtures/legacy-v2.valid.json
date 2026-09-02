@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 2,
+  "sourcePath": "04 Projects/渐进阅读工作流/阅读区/legacy.md",
+  "currentSourcePath": "04 Projects/渐进阅读工作流/已归档原文/legacy.md",
+  "archivedSourcePath": "04 Projects/渐进阅读工作流/已归档原文/legacy.md",
+  "title": "Legacy v2 样例",
+  "status": "archived",
+  "importStatus": "pending",
+  "annotations": [
+    {
+      "id": "legacy-ann-001",
+      "index": 1,
+      "type": "sample_quote",
+      "targetDocument": "引用",
+      "route": "remnote",
+      "importable": true,
+      "originalText": "legacy quote",
+      "currentText": "legacy quote"
+    }
+  ],
+  "cards": [],
+  "clozeCards": [],
+  "articleMusings": []
+}
