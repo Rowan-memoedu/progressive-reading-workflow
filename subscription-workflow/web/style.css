@@ -6,3 +6,6 @@
 .run-status{padding:10px 12px;border-inline-start:3px solid var(--line);background:var(--surface);overflow-wrap:anywhere}
 .run-status.error{border-color:var(--error);background:var(--error-bg)}
 .run-status.success{border-color:var(--success)}
+.source-group{margin-top:12px}.source-group>summary{font-weight:600;padding:10px 8px}.group-count{font-weight:400;margin-inline-start:12px}.source-group-items{margin-inline-start:14px;padding-inline-start:14px;border-inline-start:1px solid var(--line)}.disabled-subscriptions>summary h2{display:inline}.disabled-subscriptions>summary{margin-bottom:14px}#disabled-sources{margin-inline-start:14px;padding-inline-start:14px}button.danger{color:var(--error);border-color:var(--error)}button.danger:hover:not(:disabled){background:var(--error-bg);color:var(--error)}.source-group>summary:active,.disabled-subscriptions>summary:active{color:var(--accent)}
+@media(hover:hover){.source-group>summary:hover,.disabled-subscriptions>summary:hover{background:var(--tint)}}
+@media(max-width:414px){.source-group-items,#disabled-sources{margin-inline-start:8px;padding-inline-start:8px}}

@@ -7,6 +7,7 @@ const jobNames={rss:'RSS 检查',bilibili:'B 站检查',zhihu:'知乎检查',dai
 const stepNames={scan:'检查来源',previews:'处理材料',decisions:'处理勾选',report:'生成报告',activity:'写入入库动态',
   'apply-source-scopes':'应用接收范围','retry-rss':'重试 RSS','retry-bilibili':'重试 B 站','retry-zhihu':'重试知乎','retry-selections':'重试勾选项'};
 const trackedRuns=new Map();
+const sourceGroupOpen=new Map();
 function element(tag,text,cls){const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(cls)node.className=cls;return node;}
 function readableError(value){const text=String(value||'');if(/paid_subscribers/u.test(text))return '来源正文需要付费订阅，现有访问条件只能取得摘要。';if(/platform_subtitles_not_yet_available/u.test(text))return '平台尚未提供字幕，下个周期会再次检查。';if(/target_login_snapshot_unavailable/u.test(text))return '当前来源的登录快照不可用，等待浏览器登录状态同步后重试。';if(/zhihu_http_403/u.test(text))return '知乎接口拒绝访问（403），当前未取得可用正文。';return text;}
 async function api(url,body){
@@ -18,7 +19,7 @@ async function api(url,body){
     if(!response.ok)throw new Error(data.error||'本地服务请求失败');
     return data;
   } catch(error) {
-    if(error.name==='AbortError')throw new Error('本地服务响应超时，请刷新队列查看任务是否已入队。');
+    if(error.name==='AbortError')throw new Error('本地服务响应超时，请刷新状态确认处理结果。');
     throw error;
   } finally {clearTimeout(timeout);}
 }
@@ -68,12 +69,34 @@ function render(data){current=data;if(!data.initialized){$('health').textContent
   const columnReady=data.zhihu_validation?.checks?.some(check=>check.name==='column'&&check.status==='passed');
   $('zhihu-validation').textContent=columnReady?'知乎专栏采集已通过登录态验证；作者列表接口仍受限。单篇正文继续复用浏览器登录态。':'知乎部分采集接口仍受限；单篇正文继续复用浏览器登录态，并按实际获取结果判断。';
   $('health').className='notice'+(late||heartbeat?.status==='error'?' error':'');$('health').textContent=!data.enabled?'订阅流程已暂停。':late?'后台心跳已超过 90 秒，保存的配置仍然保留。':heartbeat?.status==='error'?'后台检查遇到问题：'+heartbeat.error:'订阅流程已启用。保存后的勾选会自动入队；正文与批注保留在原位置。';
-  const sources=$('sources');sources.replaceChildren();if(!data.subscriptions.length)sources.append(element('p','尚无订阅，添加一个来源开始。','empty'));
-  for(const source of data.subscriptions){const row=element('article',undefined,'source');const info=element('div');info.append(element('h3',source.name));const meta=element('p');meta.append(element('span',kinds[source.kind],'badge'),element('span',source.enabled?'已启用':'已停用',source.enabled?'success':'paused'));info.append(meta);const link=element('a',source.url);link.href=source.url;link.target='_blank';link.rel='noopener noreferrer';info.append(link);const mode=element('div',undefined,'source-mode');mode.append(element('p',modes[source.mode]),element('p','阅读区 / '+source.destination,'hint'));const actions=element('div',undefined,'source-actions');actions.append(button('编辑',async()=>edit(source)),button(source.enabled?'停用':'启用',async()=>{await api('/api/subscriptions/source',{revision:current.revision,source:{id:source.id,enabled:!source.enabled}});message(source.enabled?'订阅已停用，历史记录已保留。':'订阅已启用。');await refresh();}));row.append(info,mode,actions);sources.append(row);}
+  document.querySelectorAll('[data-source-group]').forEach(group=>sourceGroupOpen.set(group.dataset.sourceGroup,group.open));
+  const sources=$('sources'),disabledSources=$('disabled-sources'),groups=new Map();
+  sources.replaceChildren();disabledSources.replaceChildren();
+  const disabledCount=data.subscriptions.filter(source=>!source.enabled).length;
+  $('disabled-count').textContent=`${disabledCount} 项`;
+  if(!data.subscriptions.some(source=>source.enabled))sources.append(element('p','暂无启用的订阅。','empty'));
+  if(!disabledCount)disabledSources.append(element('p','暂无已停用的订阅。','empty'));
+  for(const enabled of [true,false])for(const [kind,label] of Object.entries(kinds)){
+    const members=data.subscriptions.filter(source=>source.enabled===enabled&&source.kind===kind);
+    if(!members.length)continue;
+    const key=`${enabled?'enabled':'disabled'}:${kind}`,group=element('details',undefined,'source-group'),summary=element('summary');
+    group.dataset.sourceGroup=key;group.open=sourceGroupOpen.get(key)??true;
+    summary.append(element('span',label),element('span',`${members.length} 项`,'hint group-count'));
+    const list=element('div',undefined,'source-group-items');group.append(summary,list);
+    (enabled?sources:disabledSources).append(group);groups.set(key,list);
+  }
+  for(const source of data.subscriptions){const row=element('article',undefined,'source');row.dataset.sourceId=source.id;const info=element('div');info.append(element('h3',source.name));const meta=element('p');meta.append(element('span',source.enabled?'已启用':'已停用',source.enabled?'success':'paused'));info.append(meta);const link=element('a',source.url);link.href=source.url;link.target='_blank';link.rel='noopener noreferrer';info.append(link);const mode=element('div',undefined,'source-mode');mode.append(element('p',modes[source.mode]),element('p','阅读区 / '+source.destination,'hint'));const actions=element('div',undefined,'source-actions');actions.append(button('编辑',async()=>edit(source)),button(source.enabled?'停用':'启用',async()=>{await api('/api/subscriptions/source',{revision:current.revision,source:{id:source.id,enabled:!source.enabled}});if(editing?.id===source.id){$('editor').hidden=true;editing=null;}
+      message(source.enabled?'订阅已移至“已停用的订阅”。':'订阅已启用。');await refresh();
+      if(source.enabled)$('disabled-subscriptions').querySelector('summary').focus();}));if(!source.enabled)actions.append(button('删除',async()=>{
+      await api('/api/subscriptions/source/delete',{revision:current.revision,id:source.id});
+      if(editing?.id===source.id){$('editor').hidden=true;editing=null;}
+      message('订阅已删除。');await refresh();$('disabled-subscriptions').querySelector('summary').focus();
+    },'secondary danger'));
+    row.append(info,mode,actions);groups.get(`${source.enabled?'enabled':'disabled'}:${source.kind}`).append(row);}
   $('schedule').replaceChildren();for(const [label,time] of [['RSS',data.schedule.rss],['知乎',data.schedule.zhihu],['B 站',data.schedule.bilibili],['日报',data.schedule.daily],['短文周报','逐篇追加'],['长文周报','周日 '+data.schedule.weekly]])$('schedule').append(element('dt',label),element('dd',time));
   $('conflict-section').hidden=!data.conflicts.length;$('conflicts').replaceChildren();for(const item of data.conflicts){const row=element('div',undefined,'queue-row');row.append(element('h3',item.title));const actions=element('div',undefined,'actions');for(const [mode,label] of [['standard_preprocess','用标准流程'],['original_text','只提取原文']])actions.append(button(label,async()=>{await api('/api/subscriptions/resolve',{id:item.id,mode});message('处理方式已确定，材料重新入队。');await refresh();}));row.append(actions);$('conflicts').append(row);}
   $('report-list').replaceChildren();for(const file of data.reports){const row=element('li',undefined,'report-row');row.append(element('span',file.split(/[\\/]/).at(-1)),button('编辑',async()=>{await api('/api/subscriptions/open-report',{path:file});message('已打开报告原文件。勾选后请保存。');}));$('report-list').append(row);}if(!data.reports.length)$('report-list').append(element('li','尚未生成报告。','empty'));
-  const items=[...data.pending,...data.failures,...Object.entries(data.zhihu_sources).filter(([,s])=>s.error).map(([id,s])=>({title:data.subscriptions.find(x=>x.id===id)?.name||'知乎来源',status:'blocked',error:s.error}))];
+  const items=[...data.pending,...data.failures,...Object.entries(data.zhihu_sources).filter(([id,s])=>s.error&&data.subscriptions.some(source=>source.id===id&&source.enabled)).map(([id,s])=>({title:data.subscriptions.find(x=>x.id===id).name,status:'blocked',error:s.error}))];
   $('queue-summary').textContent=`${items.length} 项待处理或需要关注；${data.pending_job_count??data.jobs.filter(j=>['running','queued'].includes(j.status)).length} 个任务正在运行或排队。`;$('queue').replaceChildren();for(const item of items){const row=element('div',undefined,'queue-row');row.append(element('h3',item.title||'订阅任务'),element('p',states[item.status]||item.status,'hint'));if(item.error)row.append(element('p',readableError(item.error),'error'));$('queue').append(row);}if(!items.length)$('queue').append(element('p','当前没有堵塞项。','empty'));
   $('jobs').replaceChildren();for(const job of data.jobs){
     const row=element('li',`${jobNames[job.kind]} · ${states[job.status]||job.status} · ${new Date(job.created_at).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}`);

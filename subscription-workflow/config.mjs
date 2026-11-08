@@ -142,6 +142,22 @@ export async function saveSource(workflowRoot, value, { home, expectedRevision }
   });
 }
 
+export async function deleteSource(workflowRoot, id, { home, expectedRevision } = {}) {
+  const p = paths(workflowRoot, home);
+  return withLock(p.config + '.lock', async () => {
+    const config = await loadConfig(workflowRoot, home);
+    if (!config) throw new Error('订阅配置尚未初始化');
+    if (!Number.isSafeInteger(expectedRevision) || config.revision !== expectedRevision) throw new Error('配置已在另一处更新，请刷新后重试');
+    const source = config.subscriptions.find(source => source.id === id);
+    if (!source) throw new Error('订阅不存在');
+    if (source.enabled) throw new Error('请先停用此订阅，再删除');
+    config.subscriptions = config.subscriptions.filter(source => source.id !== id);
+    config.revision++; config.updated_at = new Date().toISOString();
+    validateConfig(config); await writeJson(p.config, config);
+    return config;
+  });
+}
+
 export function platform(source) { return source.kind.split('_')[0]; }
 
 export async function initialize(workflowRoot = codeRoot, { home, rssHome = process.env.RSS_IMPORT_HOME || dataPath('RSSImport'), videoHome = process.env.PROGRESSIVE_READING_VIDEO_HOME || dataPath('ProgressiveReading', 'VideoWatch') } = {}) {

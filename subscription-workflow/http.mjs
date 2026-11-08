@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { codeRoot, loadConfig, saveSource } from './config.mjs';
+import { codeRoot, loadConfig, saveSource, deleteSource } from './config.mjs';
 import { status, enqueue, launchWorker, resolveMode, JOB_KINDS } from './service.mjs';
 
 const assets = new Map([['/subscriptions',['index.html','text/html']],['/subscriptions/',['index.html','text/html']],
@@ -36,6 +36,8 @@ export async function handleSubscriptions(req,res,root=codeRoot) {
     if(url.pathname==='/api/subscriptions/source') {
       const result=await saveSource(root,input.source,{expectedRevision:input.revision});
       json(res,200,result);
+    } else if(url.pathname==='/api/subscriptions/source/delete') {
+      json(res,200,await deleteSource(root,input.id,{expectedRevision:input.revision}));
     } else if(url.pathname==='/api/subscriptions/run') {
       if(!JOB_KINDS.includes(input.kind))throw new Error('任务类型无效');
       if (!(await loadConfig(root))?.enabled) throw new Error('订阅流程已暂停');
