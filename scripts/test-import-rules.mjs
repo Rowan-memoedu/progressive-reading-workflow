@@ -51,7 +51,7 @@ test("column enumeration requires synchronized site Cookies before any network r
 });
 test("redirect credentials are never followed and auth failure remains explicit", async () => {
   let called = false;
-  await assert.rejects(discoverZhihuColumn(column, { cookieHeaderForUrl: url => { assert.equal(new URL(url).hostname, "www.zhihu.com"); return "synthetic=test_only"; }, fetchImpl: async (_url, options) => {
+  await assert.rejects(discoverZhihuColumn(column, { cookieHeaderForUrl: url => { assert.equal(new URL(url).hostname, "zhuanlan.zhihu.com"); return "synthetic=test_only"; }, fetchImpl: async (_url, options) => {
     called = true; assert.equal(options.redirect, "error"); assert.equal(options.headers.Cookie, "synthetic=test_only"); return new Response("forbidden", { status: 403 });
   } }), /zhihu_http_403/u);
   assert.equal(called, true);

@@ -3,10 +3,15 @@ import { requestZhihuJson } from "./zhihu-social-archive.mjs";
 import { publicationDateFromSeconds } from "../subscription-workflow/publication-time.mjs";
 
 function nextPage(value, id) {
-  const url = new URL(value, "https://www.zhihu.com");
-  if (url.origin !== "https://www.zhihu.com" || url.username || url.password || url.pathname !== `/api/v4/columns/${id}/items`) {
+  const url = new URL(value, 'https://zhuanlan.zhihu.com');
+  const legacy = ['www.zhihu.com','zhuanlan.zhihu.com'].includes(url.hostname) && url.pathname === `/api/v4/columns/${id}/items`;
+  const column = url.hostname === 'zhuanlan.zhihu.com' && url.pathname === `/api/columns/${id}/items`;
+  if (!['http:','https:'].includes(url.protocol) || url.port || url.username || url.password || (!legacy && !column)) {
     throw new Error("zhihu_column_pagination_origin_invalid");
   }
+  // Reuse the maintained RSSHub column endpoint. Server-provided HTTP cursors
+  // are upgraded before any request, and authentication is matched again here.
+  url.protocol = 'https:'; url.hostname = 'zhuanlan.zhihu.com'; url.pathname = `/api/columns/${id}/items`;
   url.hash = "";
   url.searchParams.sort();
   return url.href;
@@ -47,13 +52,14 @@ export async function discoverZhihuColumn(value, { cookieHeaderForUrl, fetchImpl
         ...(publishedAt ? { published_at: publishedAt } : {}) });
     } else excluded.set(identity, String(item.type));
   };
-  let next = nextPage(`/api/v4/columns/${column.id}/items?limit=20&offset=0`, column.id);
+  let next = nextPage(`/api/columns/${column.id}/items?limit=20&offset=0`, column.id);
   while (next) {
     if (pages >= maxPages) throw new Error("zhihu_column_incomplete_page_limit");
     if (seenPages.has(next)) throw new Error("zhihu_column_incomplete_repeated_page");
     seenPages.add(next);
     const payload = await requestZhihuJson(next, options);
     if (!Array.isArray(payload.data) || typeof payload.paging?.is_end !== "boolean") throw new Error("zhihu_column_paging_invalid");
+    if (payload.data.length && payload.data.every(item => listingItems.has(itemIdentity(item)))) throw new Error('zhihu_column_incomplete_repeated_items');
     if (payload.paging.totals != null) {
       const total = Number(payload.paging.totals);
       if (!Number.isSafeInteger(total) || total < 0) throw new Error("zhihu_column_total_invalid");
@@ -70,7 +76,7 @@ export async function discoverZhihuColumn(value, { cookieHeaderForUrl, fetchImpl
     }
   }
   if (expectedTotal != null && listingItems.size !== expectedTotal) throw new Error("zhihu_column_incomplete_total_mismatch");
-  const pinned = await requestZhihuJson(`https://www.zhihu.com/api/v4/columns/${column.id}/pinned-items/v2`, options);
+  const pinned = await requestZhihuJson(`https://zhuanlan.zhihu.com/api/columns/${column.id}/pinned-items/v2`, options);
   if (!Array.isArray(pinned.data)) throw new Error("zhihu_column_pinned_items_invalid");
   for (const item of pinned.data) { add(item, false); pinnedCount += 1; }
   return {

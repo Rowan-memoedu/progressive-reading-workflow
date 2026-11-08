@@ -394,16 +394,20 @@ export async function requestZhihuJson(url, {
   allowAnonymous = false
 }) {
   const parsed = new URL(url);
-  if (parsed.protocol !== "https:" || parsed.hostname !== "www.zhihu.com") {
+  const columnRead = parsed.origin === 'https://zhuanlan.zhihu.com' && method === 'GET'
+    && /^\/api\/columns\/[0-9A-Za-z_-]+\/(?:items|pinned-items\/v2)$/u.test(parsed.pathname);
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password
+    || (parsed.origin !== 'https://www.zhihu.com' && !columnRead)) {
     throw new Error("zhihu_request_origin_invalid");
   }
   const cookie = typeof cookieHeaderForUrl === "function"
     ? await cookieHeaderForUrl(parsed.href)
-    : cookieByHostname?.get?.("www.zhihu.com") || cookieByHostname?.get?.("zhihu.com") || "";
+    : cookieByHostname?.get?.(parsed.hostname) || cookieByHostname?.get?.("zhihu.com") || "";
   if (!cookie && !allowAnonymous) throw new Error("zhihu_cookie_not_synced");
   if (allowAnonymous && method !== "GET") throw new Error("zhihu_anonymous_read_only");
   const headers = {
     Accept: "application/json, text/plain, */*",
+    ...(columnRead ? { 'User-Agent': 'Mozilla/5.0' } : {}),
     ...(cookie ? { Cookie: cookie } : {})
   };
   if (/^\/api\/v3\/moments\//u.test(parsed.pathname)) headers["X-API-VERSION"] = "3.0.40";

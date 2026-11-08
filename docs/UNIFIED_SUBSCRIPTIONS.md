@@ -12,7 +12,7 @@
 
 B 站订阅支持指定视频分 P 和合集。视频筛选卡使用完整字幕，选中后再运行现有截图、图文正文和标准导读。无字幕时保留等待，不把简介当作全文。
 
-知乎适配层支持指定作者的新回答、文章与指定专栏。RSS 和 B 站先启用；知乎专栏、作者回答和作者文章接口的本机实测均返回 403，目前仍待真实接通，尚未添加知乎订阅。作者端点参考维护中的 [RSSHub 回答路由](https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/answers.ts)与[文章路由](https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/posts.ts)，专栏复用项目现有采集器。
+知乎适配层支持指定作者的新回答、文章与指定专栏。列表和正文均按实际请求地址复用现有 Chrome 登录快照，不隐式退回匿名访问。专栏采集复用 [RSSHub 专栏路由](https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/zhuanlan.ts)使用的专栏域名 API，并保留置顶文章、分页完整性和日期校验。作者端点参考维护中的 [RSSHub 回答路由](https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/answers.ts)与[文章路由](https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/posts.ts)。作者列表仍可能受到接口限制；列表发现与单篇正文获取分别核验，不能用列表请求失败推断正文无法获取。
 
 ## 更新与历史
 

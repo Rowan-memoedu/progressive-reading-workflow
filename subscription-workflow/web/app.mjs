@@ -64,8 +64,9 @@ async function submitRun(kind,id){
 }
 function render(data){current=data;if(!data.initialized){$('health').textContent='订阅尚未初始化。';return;}
   const heartbeat=data.heartbeat,late=heartbeat&&Date.now()-Date.parse(heartbeat.at)>90000;
-  $('zhihu-validation').hidden=data.zhihu_validation?.status!=='blocked';
-  $('zhihu-validation').textContent='知乎接入待验证：最近一次实测的作者与专栏接口返回访问限制。RSS 和 B 站照常运行。';
+  $('zhihu-validation').hidden=!['blocked','partial'].includes(data.zhihu_validation?.status);
+  const columnReady=data.zhihu_validation?.checks?.some(check=>check.name==='column'&&check.status==='passed');
+  $('zhihu-validation').textContent=columnReady?'知乎专栏采集已通过登录态验证；作者列表接口仍受限。单篇正文继续复用浏览器登录态。':'知乎部分采集接口仍受限；单篇正文继续复用浏览器登录态，并按实际获取结果判断。';
   $('health').className='notice'+(late||heartbeat?.status==='error'?' error':'');$('health').textContent=!data.enabled?'订阅流程已暂停。':late?'后台心跳已超过 90 秒，保存的配置仍然保留。':heartbeat?.status==='error'?'后台检查遇到问题：'+heartbeat.error:'订阅流程已启用。保存后的勾选会自动入队；正文与批注保留在原位置。';
   const sources=$('sources');sources.replaceChildren();if(!data.subscriptions.length)sources.append(element('p','尚无订阅，添加一个来源开始。','empty'));
   for(const source of data.subscriptions){const row=element('article',undefined,'source');const info=element('div');info.append(element('h3',source.name));const meta=element('p');meta.append(element('span',kinds[source.kind],'badge'),element('span',source.enabled?'已启用':'已停用',source.enabled?'success':'paused'));info.append(meta);const link=element('a',source.url);link.href=source.url;link.target='_blank';link.rel='noopener noreferrer';info.append(link);const mode=element('div',undefined,'source-mode');mode.append(element('p',modes[source.mode]),element('p','阅读区 / '+source.destination,'hint'));const actions=element('div',undefined,'source-actions');actions.append(button('编辑',async()=>edit(source)),button(source.enabled?'停用':'启用',async()=>{await api('/api/subscriptions/source',{revision:current.revision,source:{id:source.id,enabled:!source.enabled}});message(source.enabled?'订阅已停用，历史记录已保留。':'订阅已启用。');await refresh();}));row.append(info,mode,actions);sources.append(row);}
