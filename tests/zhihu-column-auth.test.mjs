@@ -35,3 +35,14 @@ test('repeated page contents and cross-column cursors remain incomplete rather t
   await assert.rejects(discoverZhihuColumn(source,{cookieHeaderForUrl:()=> 'z_c0=synthetic',fetchImpl:async(url)=>json(page([article(1)],false,2,url.includes('offset=20')?'https://zhuanlan.zhihu.com/api/columns/c_auth_fixture/items?offset=40':'https://zhuanlan.zhihu.com/api/columns/c_auth_fixture/items?offset=20'))}),/incomplete_repeated_items/);
   await assert.rejects(discoverZhihuColumn(source,{cookieHeaderForUrl:()=> 'z_c0=synthetic',fetchImpl:async()=>json(page([article(1)],false,2,'https://zhuanlan.zhihu.com/api/columns/another/items?offset=20'))}),/pagination_origin_invalid/);
 });
+
+test('subscriptions retain available articles and answers while count gaps remain warnings',async()=>{
+  const warnings=[];
+  const result=await discoverZhihuColumn(source,{strictCounts:false,includeAnswers:true,onWarning:w=>warnings.push(w),cookieHeaderForUrl:()=> 'z_c0=synthetic',fetchImpl:async url=>{
+    if(url.includes('/pinned-items/'))return json({data:[]});
+    return json(page([article(1),{type:'answer',id:'2047309971508008683',question:{id:'2074148440918040656',title:'Synthetic question'},created_time:1735689600,content:'<p>Synthetic answer.</p>'}],true,3));
+  }});
+  assert.equal(result.complete,false);assert.equal(warnings.length,1);assert.equal(warnings[0].platform_total,3);assert.equal(warnings[0].actual_count,2);
+  assert.equal(result.articles.length,1);assert.equal(result.materials.length,2);assert.equal(result.materials[1].url,'https://www.zhihu.com/question/2074148440918040656/answer/2047309971508008683');assert.match(result.materials[1].html,/Synthetic answer/);
+  await assert.rejects(discoverZhihuColumn(source,{cookieHeaderForUrl:()=> 'z_c0=synthetic',fetchImpl:async()=>json(page([article(1)],true,2))}),/incomplete_total_mismatch/);
+});

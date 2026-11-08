@@ -6,6 +6,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {paths,SCHEMA,normalizeSource,writeJson,readJson} from '../subscription-workflow/config.mjs';
 import {externalCatalog} from '../subscription-workflow/catalog.mjs';
+import {discoverZhihuColumn} from '../scripts/zhihu-column-import.mjs';
 
 const source={url:'https://www.zhihu.com/people/synthetic-author',name:'Synthetic author'};
 const item=(id='1')=>({id,question:{id:'2',title:'Synthetic question'},title:'Synthetic article',created_time:1735689600,content:'<p>Synthetic body.</p>'});
@@ -57,14 +58,15 @@ test('an overlapping final page is accepted and deduplicated',async()=>{
 
 test('count warnings preserve report materials and progressive-reading queue entries',async()=>{
   const artifact='D:/Artifacts/ProgressiveReading/zhihu-count-warning-tests';await fs.mkdir(artifact,{recursive:true});
-  for(const mode of ['reports','original_text']){
+  for(const kind of ['zhihu_author','zhihu_column'])for(const mode of ['reports','original_text']){
     const root=await fs.mkdtemp(path.join(artifact,'case-')),home=path.join(root,'home'),rssHome=path.join(root,'rss-home');
-    const configured=normalizeSource({kind:'zhihu_author',name:source.name,url:source.url,mode,history_mode:'all'});
+    const configured=normalizeSource({kind,name:source.name,url:kind==='zhihu_author'?source.url:'https://www.zhihu.com/column/c_synthetic',mode,history_mode:'all'});
     await writeJson(paths(root).marker,{home});
     await writeJson(paths(root).config,{schema:SCHEMA,enabled:true,rss_home:rssHome,rss_defaults:{},subscriptions:[configured]});
-    const result=await scanZhihu(root,'count-warning',{access:()=>({}),discoverMember:(s,options)=>discoverAuthor(s,options,async url=>page([item()],true,new URL(url).pathname.endsWith('/answers')?2:1))});
+    const result=await scanZhihu(root,'count-warning',{access:()=>({}),discoverMember:(s,options)=>discoverAuthor(s,options,async url=>page([item()],true,new URL(url).pathname.endsWith('/answers')?2:1)),
+      discoverColumn:(url,options)=>discoverZhihuColumn(url,{...options,cookieHeaderForUrl:()=> 'z_c0=synthetic',fetchImpl:async target=>new Response(JSON.stringify(target.includes('/pinned-items/')?{data:[]}:page([{...item(),type:'answer'},{...item('3'),type:'article'}],true,3)))})});
     assert.deepEqual(result.errors,[]);assert.equal(result.warnings.length,1);
-    const state=await readJson(path.join(home,'zhihu-state.json'));assert.equal(state.sources[configured.id].error,null);assert.equal(state.sources[configured.id].inventory_complete,false);assert.equal(state.sources[configured.id].warnings[0].actual_count,1);
+    const state=await readJson(path.join(home,'zhihu-state.json'));assert.equal(state.sources[configured.id].error,null);assert.equal(state.sources[configured.id].inventory_complete,false);assert.equal(state.sources[configured.id].warnings[0].actual_count,kind==='zhihu_author'?1:2);
     assert.equal(Object.values(state.entries).length,2);assert.ok(Object.values(state.entries).every(i=>i.status==='ready'));
     if(mode==='reports'){const catalog=await externalCatalog(root);assert.equal(catalog.length,2);assert.ok(catalog.every(i=>i.eligible));}
     else {const queued=await readJson(path.join(rssHome,'state.json'));assert.equal(Object.keys(queued.items).length,2);assert.ok(Object.values(queued.items).every(i=>i.status==='pending'));}

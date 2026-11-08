@@ -294,8 +294,10 @@ export async function scanZhihu(root, cycle, { access = zhihuAccess, discoverCol
     if (retryOnly && !previous?.error) continue;
     try {
       const sourceWarnings = [];
-      const listed = source.kind === 'zhihu_column' ? (await discoverColumn(source.url, options)).articles : await discoverMember(source, { ...options,
-        onWarning: warning => { const entry = { ...warning, subscription_id: source.id, url: source.url, title: source.name }; sourceWarnings.push(entry); warnings.push(entry); } });
+      const discoveryOptions = { ...options, strictCounts:false, includeAnswers:true,
+        onWarning: warning => { const entry = { ...warning, subscription_id: source.id, url: source.url, title: source.name }; sourceWarnings.push(entry); warnings.push(entry); } };
+      const column = source.kind === 'zhihu_column' ? await discoverColumn(source.url, discoveryOptions) : null;
+      const listed = column ? column.materials || column.articles : await discoverMember(source, discoveryOptions);
       const seen = new Set(previous?.seen || []);
       const backfill = ['since','all'].includes(source.history_mode);
       for (const item of listed) {

@@ -30,12 +30,15 @@ function itemIdentity(item) {
   return `${item.type}:${id}`;
 }
 
-export async function discoverZhihuColumn(value, { cookieHeaderForUrl, fetchImpl = fetch, onProgress = async () => {}, maxPages = 1000 } = {}) {
+export async function discoverZhihuColumn(value, { cookieHeaderForUrl, fetchImpl = fetch, onProgress = async () => {}, maxPages = 1000,
+  strictCounts = true, includeAnswers = false, onWarning = async () => {} } = {}) {
   const column = zhihuColumnIdentity(value);
   if (!column) throw new Error("zhihu_column_url_invalid");
   const options = { cookieHeaderForUrl, retryDelaysMs: [],
     fetchImpl: (url, init) => fetchImpl(url, { ...init, signal: AbortSignal.timeout(30000) }) };
   const articles = new Map();
+  const materials = new Map(), observedTotals = new Set();
+  const warnings = [];
   const listingItems = new Set();
   const excluded = new Map();
   const seenPages = new Set();
@@ -51,6 +54,17 @@ export async function discoverZhihuColumn(value, { cookieHeaderForUrl, fetchImpl
       articles.set(id, { url: `https://zhuanlan.zhihu.com/p/${id}`, title: String(item.title || ""), id,
         ...(publishedAt ? { published_at: publishedAt } : {}) });
     } else excluded.set(identity, String(item.type));
+    if (includeAnswers && ['article','answer'].includes(item.type)) {
+      const id = identity.split(':')[1], previous = materials.get(identity);
+      const questionId = item.question?.id;
+      if (item.type === 'answer' && (!/^\d+$/u.test(String(questionId)) || (typeof questionId !== 'string' && !Number.isSafeInteger(questionId)))) throw new Error('zhihu_column_answer_identity_invalid');
+      const publishedAt = publicationDateFromSeconds(item.created ?? item.created_time) ?? previous?.published_at;
+      materials.set(identity, { key: `zhihu:${item.type === 'answer' ? 'answers' : 'articles'}:${id}`,
+        url: item.type === 'article' ? `https://zhuanlan.zhihu.com/p/${id}` : `https://www.zhihu.com/question/${questionId}/answer/${id}`,
+        title: String(item.type === 'article' ? item.title || '' : item.question.title || ''), author: item.author?.name || previous?.author,
+        published_at: publishedAt || null, revision: String(item.updated ?? item.updated_time ?? ''),
+        html: item.content_need_truncated ? null : item.content || previous?.html || null });
+    }
   };
   let next = nextPage(`/api/columns/${column.id}/items?limit=20&offset=0`, column.id);
   while (next) {
@@ -63,7 +77,8 @@ export async function discoverZhihuColumn(value, { cookieHeaderForUrl, fetchImpl
     if (payload.paging.totals != null) {
       const total = Number(payload.paging.totals);
       if (!Number.isSafeInteger(total) || total < 0) throw new Error("zhihu_column_total_invalid");
-      if (expectedTotal != null && expectedTotal !== total) throw new Error("zhihu_column_changed_during_listing");
+      if (strictCounts && expectedTotal != null && expectedTotal !== total) throw new Error("zhihu_column_changed_during_listing");
+      observedTotals.add(total);
       expectedTotal = total;
     }
     for (const item of payload.data) add(item, true);
@@ -75,14 +90,21 @@ export async function discoverZhihuColumn(value, { cookieHeaderForUrl, fetchImpl
       next = nextPage(payload.paging.next, column.id);
     }
   }
-  if (expectedTotal != null && listingItems.size !== expectedTotal) throw new Error("zhihu_column_incomplete_total_mismatch");
+  if (expectedTotal != null && (listingItems.size !== expectedTotal || observedTotals.size > 1)) {
+    if (strictCounts) throw new Error("zhihu_column_incomplete_total_mismatch");
+    const warning = { code:'zhihu_column_count_discrepancy', severity:'warning', platform_total:expectedTotal,
+      actual_count:listingItems.size, observed_totals:[...observedTotals], inventory_complete:false,
+      error:`知乎专栏数量异常：平台 ${expectedTotal}，实际 ${listingItems.size}。已获取内容继续处理。` };
+    warnings.push(warning); await onWarning(warning);
+  }
   const pinned = await requestZhihuJson(`https://zhuanlan.zhihu.com/api/columns/${column.id}/pinned-items/v2`, options);
   if (!Array.isArray(pinned.data)) throw new Error("zhihu_column_pinned_items_invalid");
   for (const item of pinned.data) { add(item, false); pinnedCount += 1; }
   return {
     source_url: value, column_url: column.url, column_id: column.id, rule_id: column.rule_id,
-    complete: true, pages, listed_items: listingItems.size, expected_total: expectedTotal,
+    complete: warnings.length === 0, pages, listed_items: listingItems.size, expected_total: expectedTotal,
     pinned_items: pinnedCount, excluded_count: excluded.size,
-    excluded_types: [...new Set(excluded.values())], articles: [...articles.values()], discovered_at: new Date().toISOString()
+    excluded_types: [...new Set(excluded.values())], articles: [...articles.values()], discovered_at: new Date().toISOString(),
+    ...(includeAnswers ? { materials:[...materials.values()] } : {}), ...(warnings.length ? { warnings } : {})
   };
 }
