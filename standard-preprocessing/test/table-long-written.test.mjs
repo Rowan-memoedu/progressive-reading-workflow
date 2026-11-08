@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { processMaterial } from "../lib/core.mjs";
+import { processMaterial, PROCESSOR_VERSION } from "../lib/core.mjs";
 import { generateChunkedSourceVoice, rejectLowFidelityWrittenPatches, shouldChunkSourceVoice, validateWrittenCleaningChunk } from "../lib/producer.mjs";
 import { validateResultContract } from "../index.mjs";
 import { SyntheticProducer } from "../test-support/synthetic-producer.mjs";
@@ -184,10 +184,10 @@ test("a stale invalid cache entry is not replayed", async () => {
   const second = await processMaterial(request, { producer, cacheDir });
   assert.equal(second.status, "completed");
   assert.equal(producer.calls, 1);
-  assert.equal(second.receipt.processor_version, "1.10.7");
+  assert.equal(second.receipt.processor_version, PROCESSOR_VERSION);
 });
 
-test("a degraded review result is neither cached nor replayed as an idempotent success", async () => {
+test("a legacy degraded cache entry is a cache miss and only a publishable completion can replay", async () => {
   const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "pr-degraded-result-cache-"));
   const request = requestFor(tableMarkdown, "degraded-cache");
   const degraded = await processMaterial(request, {
@@ -205,6 +205,8 @@ test("a degraded review result is neither cached nor replayed as an idempotent s
   const repaired = await processMaterial(request, { producer: repairedProducer, cacheDir });
   assert.equal(repaired.status, "completed");
   assert.equal(repaired.processing_state, "rendered");
+  assert.equal(repaired.artifacts.target_zone, "local-ir-reading");
+  assert.equal(repaired.receipt.replay_of_status, undefined);
   assert.equal(repairedProducer.calls, 1);
 
   const replayed = await processMaterial(request, {
@@ -320,8 +322,8 @@ test("written source_voice_structuring over 300 blocks uses bounded cleaning chu
   assert.equal(result.artifacts.body_blocks[4].markdown, "第 1 个合成段落保留唯一编号、原始顺序和来源信息。");
   assert.match(result.artifacts.body_blocks[5].markdown, /断句已核对/u);
   assert.ok(cleaningCalls > 1);
-  assert.equal(semanticCalls, 3);
-  assert.equal(repairCalls, 1);
+  assert.equal(semanticCalls, 1);
+  assert.equal(repairCalls, 0);
   assert.equal(result.receipt.model.attempts[0].status, "accepted");
   assert.equal(result.receipt.model.attempts[0].usage.stages.rejected_patch_count, 1);
   assert.deepEqual(result.receipt.model.attempts[0].usage.stages.rejected_patches, [{

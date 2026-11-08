@@ -20,7 +20,7 @@
         "author": { "type": ["string", "null"] },
         "published_at": { "type": ["string", "null"] },
         "input_form": { "enum": ["spoken_transcript", "written"] },
-        "content_profile": { "enum": ["natural_language", "math_lecture"] },
+        "content_profile": { "enum": ["natural_language", "math_lecture", "literature"] },
         "language": { "type": "string", "minLength": 2, "maxLength": 32 },
         "source_is_original": { "type": "boolean" },
         "translation": {
@@ -43,8 +43,12 @@
       "$comment": "Runtime MUST enforce insight_soft_min <= insight_soft_max <= insight_safety_cap when the related fields are present; portable JSON Schema cannot compare sibling numeric values.",
       "properties": {
         "workflow_mode": { "enum": ["standard", "single_stage"] },
+        "include_reading_guide": { "type": "boolean" },
+        "spoken_to_written": { "type": "boolean" },
+        "structure_body": { "type": "boolean" },
+        "translate": { "type": "boolean" },
         "input_form": { "enum": ["auto", "spoken_transcript", "written"] },
-        "content_profile": { "enum": ["auto", "natural_language", "math_lecture"] },
+        "content_profile": { "enum": ["auto", "natural_language", "math_lecture", "literature"] },
         "source_language": { "type": "string", "minLength": 2, "maxLength": 32 },
         "original_placement": { "const": "after_translation" },
         "cleaning_mode": { "enum": ["semantic_only", "source_voice_structuring", "lossless_spoken_to_written", "source_translation"] },

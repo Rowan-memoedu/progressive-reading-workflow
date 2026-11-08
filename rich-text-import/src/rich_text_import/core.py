@@ -13,9 +13,10 @@ from typing import Any
 PACKAGE_SCHEMA_VERSION = "progressive-reading.rich-text-package/v1"
 REQUEST_SCHEMA_VERSION = "progressive-reading.preprocess.request/v1"
 REQUEST_CONTRACT_VERSION = "1.0.0"
-EXTRACTOR_VERSION = "rich-text-import/0.2.0"
+EXTRACTOR_VERSION = "rich-text-import/0.5.0"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SUPPORTED_FORMATS = {
+    ".txt": ("txt", "text/plain"),
     ".pdf": ("pdf", "application/pdf"),
     ".epub": ("epub", "application/epub+zip"),
     ".docx": (
@@ -78,12 +79,30 @@ def extract_document(
     *,
     epub_chapter_selection: str = "all",
     epub_spine_index: int | None = None,
+    literature_chapter_count: int | None = None,
+    mineru_result_dir: Path | None = None,
 ) -> dict[str, Any]:
+    if source_type == "txt":
+        from .txt import extract_txt
+
+        return extract_txt(source_path, assets_dir)
     if source_type == "pdf":
+        if mineru_result_dir is not None:
+            from .mineru_pdf import extract_mineru_pdf
+
+            return extract_mineru_pdf(source_path, assets_dir, mineru_result_dir)
         from .pdf import extract_pdf
 
         return extract_pdf(source_path, assets_dir)
     if source_type == "epub":
+        if literature_chapter_count is not None:
+            from .literature import extract_literature_epub
+
+            return extract_literature_epub(
+                source_path,
+                assets_dir,
+                literature_chapter_count,
+            )
         from .epub import extract_epub
 
         return extract_epub(
@@ -150,6 +169,7 @@ def _downstream_request(
     user_instruction: str,
     language: str | None,
     content_profile: str | None,
+    include_reading_guide: bool | None = None,
 ) -> dict[str, Any]:
     metadata = {
         **source_metadata,
@@ -159,6 +179,9 @@ def _downstream_request(
         metadata["language"] = language
     if content_profile:
         metadata["content_profile"] = content_profile
+    processing_options = {"workflow_mode": "standard"}
+    if include_reading_guide is not None:
+        processing_options["include_reading_guide"] = include_reading_guide
     return {
         "schema_version": REQUEST_SCHEMA_VERSION,
         "contract_version": REQUEST_CONTRACT_VERSION,
@@ -166,6 +189,10 @@ def _downstream_request(
         "source_type": source_type,
         "source_metadata": metadata,
         "user_instruction": user_instruction,
+        # New source integrations must enter the maintained workflow router.
+        # Profile and language evidence remain in source_metadata so the router
+        # can use trusted labels without an unnecessary classification call.
+        "processing_options": processing_options,
     }
 
 
@@ -176,8 +203,12 @@ def build_package(
     user_instruction: str = "",
     language: str | None = None,
     content_profile: str | None = None,
+    include_reading_guide: bool | None = None,
     epub_chapter_selection: str = "all",
     epub_spine_index: int | None = None,
+    literature_chapter_count: int | None = None,
+    mineru_result_dir: str | os.PathLike[str] | None = None,
+    allow_whole_book_request: bool = False,
 ) -> dict[str, Any]:
     """Extract one immutable local source into an auditable raw-material package.
 
@@ -195,13 +226,28 @@ def build_package(
         raise RichTextImportError(f"output_outside_project:{output}")
 
     source_type, mime_type = detect_format(source)
+    resolved_mineru_result = (
+        Path(mineru_result_dir).expanduser().resolve()
+        if mineru_result_dir is not None
+        else None
+    )
+    if resolved_mineru_result is not None and source_type != "pdf":
+        raise RichTextImportError("mineru_result_only_applies_to_pdf")
     if source_type != "epub" and (
-        epub_chapter_selection != "all" or epub_spine_index is not None
+        epub_chapter_selection != "all"
+        or epub_spine_index is not None
+        or literature_chapter_count is not None
     ):
         raise RichTextImportError("epub_chapter_selection_only_applies_to_epub")
     if epub_spine_index is not None and epub_spine_index < 1:
         raise RichTextImportError("epub_spine_index_must_be_positive")
     if epub_spine_index is not None and epub_chapter_selection != "all":
+        raise RichTextImportError("epub_chapter_selection_is_ambiguous")
+    if literature_chapter_count is not None and literature_chapter_count < 1:
+        raise RichTextImportError("literature_chapter_count_must_be_positive")
+    if literature_chapter_count is not None and (
+        epub_spine_index is not None or epub_chapter_selection != "all"
+    ):
         raise RichTextImportError("epub_chapter_selection_is_ambiguous")
     source_hash_before = sha256_file(source)
     source_size = source.stat().st_size
@@ -226,10 +272,24 @@ def build_package(
                 assets_dir,
                 epub_chapter_selection=epub_chapter_selection,
                 epub_spine_index=epub_spine_index,
+                literature_chapter_count=literature_chapter_count,
+                mineru_result_dir=resolved_mineru_result,
             ),
             source_type,
         )
         result = _normalise_asset_paths(result, staging)
+        if (source_type == 'epub' and epub_chapter_selection == 'all'
+                and epub_spine_index is None and literature_chapter_count is None
+                and not allow_whole_book_request):
+            from .book_routing import logical_chapter_count
+            chapter_count = logical_chapter_count(result['markdown'])
+            if chapter_count > 1:
+                raise RichTextImportError(
+                    f'book_import_requires_book_workflow:logical_chapters={chapter_count}; '
+                    r'use D:\Projects\BookSimplifier\Import-Book.ps1; '
+                    'default split=chapter, reading_guide=false; '
+                    'whole-book-as-one-file requires explicit --allow-whole-book-request'
+                )
         source_hash_after = sha256_file(source)
         if source_hash_after != source_hash_before:
             raise RichTextImportError("source_changed_during_extraction")
@@ -256,7 +316,13 @@ def build_package(
             "quality": result["quality"],
             **result["metadata"],
         }
-        json_write(staging / "source.json", source_metadata)
+        audit_paths = {}
+        if result.get("local_audit"):
+            from .pdf_text_audit import write_text_audit
+            audit_paths = write_text_audit(result["local_audit"], staging / "pdf-source-audit")
+        # Audit evidence is not production input: keep request metadata and its
+        # model/cache routing unchanged.
+        json_write(staging / "source.json", {**source_metadata, **({"local_audits": audit_paths} if audit_paths else {})})
         json_write(staging / "quality.json", {
             "status": result["status"],
             "quality": result["quality"],
@@ -274,11 +340,12 @@ def build_package(
             "anchors": result["anchors"],
             "assets": result["assets"],
             "extractor": extractor,
+            **({"local_audits": audit_paths} if audit_paths else {}),
         }
         json_write(staging / "extraction-result.json", extraction_result)
 
         request_path: str | None = None
-        if result["status"] in {"completed", "partial"}:
+        if result["status"] in {"completed", "partial"} and literature_chapter_count is None:
             request_path = "request.json"
             request = _downstream_request(
                 markdown=result["markdown"],
@@ -287,10 +354,11 @@ def build_package(
                 user_instruction=user_instruction,
                 language=language,
                 content_profile=content_profile,
+                include_reading_guide=include_reading_guide,
             )
             json_write(staging / request_path, request)
 
-        eligible = result["status"] == "completed"
+        eligible = result["status"] == "completed" and literature_chapter_count is None
         manifest = {
             "schema_version": PACKAGE_SCHEMA_VERSION,
             "created_at": extracted_at,
@@ -311,7 +379,13 @@ def build_package(
             "downstream": {
                 "request_path": request_path,
                 "eligible": eligible,
-                "reason": "completed" if eligible else f"source_status_{result['status']}",
+                "reason": (
+                    "completed"
+                    if eligible
+                    else "literature_direct_publish_only"
+                    if literature_chapter_count is not None and result["status"] == "completed"
+                    else f"source_status_{result['status']}"
+                ),
             },
         }
         files = [

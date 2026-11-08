@@ -27,6 +27,7 @@ function parseArgs(argv) {
     assetSource: "",
     cache: "",
     fixtureResponse: "",
+    provider: "",
     plan: "",
     manifest: "",
     splitId: "",
@@ -44,6 +45,10 @@ function parseArgs(argv) {
     else if (arg === "--asset-source") parsed.assetSource = argv[++index] || "";
     else if (arg === "--cache") parsed.cache = argv[++index] || "";
     else if (arg === "--fixture-response") parsed.fixtureResponse = argv[++index] || "";
+    else if (arg === "--provider") {
+      parsed.provider = argv[++index] || "";
+      if (!['codex_exec', 'deepseek'].includes(parsed.provider)) throw new PreprocessInterfaceError('invalid_provider', '--provider must be codex_exec or deepseek');
+    }
     else if (arg === "--plan") parsed.plan = argv[++index] || "";
     else if (arg === "--manifest") parsed.manifest = argv[++index] || "";
     else if (arg === "--split-id") parsed.splitId = argv[++index] || "";
@@ -71,6 +76,7 @@ function usage() {
     "  pr-preprocess --json run --request <request.json|-> --output <audit-run-dir> [--publish <final.md>] [--asset-source <assets-dir>] [--cache <cache-dir>] [--strict]",
     "",
     "Run options:",
+    "  --provider             codex_exec (default) or deepseek; overrides this invocation only",
     "  --dry-run              Validate only; do not call AI or write files",
     "  --no-write             Return the processed summary without writing an output directory",
     "  --publish              Publish the ready Markdown as one exact .md file; keep run artifacts under --output",
@@ -115,6 +121,9 @@ function runSummary(run) {
     processing_state: result.processing_state,
     translation_state: result.translation_state,
     target_zone: result.artifacts?.target_zone || null,
+    needs_classification: result.status === "needs_classification",
+    missing_labels: result.receipt?.workflow_route?.missing_labels || [],
+    processing_plan: result.receipt?.workflow_route?.plan || null,
     output_dir: run.output_dir,
     publication: run.publication,
     files: run.files,
@@ -122,6 +131,7 @@ function runSummary(run) {
       processor_version: result.receipt?.processor_version || null,
       prompt_version: result.receipt?.prompt_version || null,
       model_calls: result.receipt?.model?.calls ?? null,
+      reading_guide: result.receipt?.reading_guide || null,
       validations: result.receipt?.validations || []
     },
     errors: result.errors || []
@@ -147,12 +157,14 @@ function printHuman(value) {
     `material_id=${value.material_id}`,
     `processing_state=${value.processing_state}`,
     `target_zone=${value.target_zone}`,
+    ...(value.needs_classification ? [`待补充分类：${value.missing_labels.join(", ")}`, "修改请求中的分类字段或处理选择后，使用相同输入继续运行。"] : []),
     `output_dir=${value.output_dir || "not_written"}`,
     `published_markdown=${value.publication?.markdown?.path || "not_published"}`
   ].join("\n"));
 }
 
 async function execute(args) {
+  if (args.provider) process.env.AI_PRODUCER_PROVIDER = args.provider;
   if (args.command === "doctor") {
     const report = await getDoctorReport();
     return { ok: true, command: "doctor", ...report };
@@ -230,6 +242,7 @@ export async function main(argv = process.argv.slice(2)) {
     if (args.json) console.log(JSON.stringify(output));
     else printHuman(output);
     if (output.command === "validate" && !output.valid) return 1;
+    if (output.status === "needs_classification") return 3;
     if (args.strict && output.command === "run" && !output.ready) return 2;
     return 0;
   } catch (error) {

@@ -1,13 +1,12 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { PROCESSOR_VERSION } from '../standard-preprocessing/lib/core.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const workflowRoot = path.resolve(__dirname, "..");
 const appScript = path.join(__dirname, "progressive-reading-app.mjs");
-const serverInfoPath = path.join(workflowRoot, "imports", "app-server.json");
 const port = Number(process.env.BROWSER_HIGHLIGHT_TEST_PORT || 39229);
 const baseUrl = `http://127.0.0.1:${port}`;
 const useLivePreprocess = process.env.BROWSER_HIGHLIGHT_TEST_LIVE_PREPROCESS === "1";
@@ -46,7 +45,9 @@ async function waitForHealth() {
 }
 
 async function run() {
-  const testWorkspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "local-ir-browser-workflow-"));
+  const artifactsRoot = 'D:/Artifacts/ProgressiveReading/browser-workflow-tests';
+  await fs.mkdir(artifactsRoot, {recursive:true});
+  const testWorkspaceRoot = await fs.mkdtemp(path.join(artifactsRoot, "fixture-"));
   const testWorkflowRoot = path.join(testWorkspaceRoot, "04 Projects", "渐进阅读工作流");
   await fs.mkdir(testWorkflowRoot, { recursive: true });
   await fs.mkdir(path.join(testWorkflowRoot, "config"), { recursive: true });
@@ -84,8 +85,6 @@ async function run() {
     qaCards: [],
     browser: { destination: "completed", userInstruction: "", sourceMetadata: {}, completionIntent: "pending_archive" }
   }, null, 2)}\n`, "utf8");
-  const previousServerInfo = await fs.readFile(serverInfoPath, "utf8").catch(() => null);
-  await fs.rm(serverInfoPath, { force: true }).catch(() => {});
   const child = spawn(process.execPath, [appScript], {
     cwd: workflowRoot,
     env: {
@@ -119,8 +118,9 @@ async function run() {
       || health.standardImport?.browserTabCreatedOnNormalPath !== false) {
       throw new Error("shared_background_standard_import_health_capability_missing");
     }
-    if (health.standardImport?.maxWorkflowAttempts !== 3 || health.standardImport?.processorVersion !== "1.10.7") throw new Error("standard_import_retry_health_capability_missing");
+    if (health.standardImport?.maxWorkflowAttempts !== 1 || health.standardImport?.processorVersion !== PROCESSOR_VERSION) throw new Error("standard_import_retry_health_capability_missing");
     if (health.standardImport?.transportMaxAttempts !== 3 || health.standardImport?.serializedBySourceUrl !== true) throw new Error("standard_import_transport_reliability_missing");
+    if (health.standardImport?.batchConcurrency !== 4 || health.standardImport?.readableWarningCreatesMarkdown !== true) throw new Error("standard_import_quality_or_concurrency_capability_missing");
     if (health.browserImportBroker?.createRequestEndpoint !== "/api/browser-import/requests" || health.browserImportBroker?.claimTaskEndpoint !== "/api/browser-import/tasks/claim") throw new Error("browser_import_broker_health_capability_missing");
     if (health.browserImportBroker?.maxTaskAttempts !== 3 || health.browserImportBroker?.claimLeaseMs < 10 * 60 * 1000 || health.browserImportBroker?.idempotentRequestCreation !== true || health.browserImportBroker?.idempotentTaskClaim !== true) throw new Error("browser_import_broker_reliability_missing");
     const canonicalCompletedMarkdown = path.join(health.browserCompletedHighlightRoot, canonicalCompletedName);
@@ -271,8 +271,8 @@ async function run() {
     const metadataArtifact = committed.artifacts.find((artifact) => artifact.kind === "browser_ir_metadata");
     if (!markdownArtifact || !metadataArtifact) throw new Error("draft_commit_artifacts_missing");
     const committedMarkdown = await fs.readFile(markdownArtifact.path, "utf8");
-    if (!committedMarkdown.includes("highlight_mode: virtual_metadata")) throw new Error("draft_commit_missing_virtual_mode");
-    if (!committedMarkdown.includes("browser_state_schema: local-ir.document-state/v1")) throw new Error("draft_commit_missing_state_schema");
+    if (!committedMarkdown.includes('highlight_mode: "virtual_metadata"')) throw new Error("draft_commit_missing_virtual_mode");
+    if (!committedMarkdown.includes('browser_state_schema: "local-ir.document-state/v1"')) throw new Error("draft_commit_missing_state_schema");
     if (committedMarkdown.includes("browser_metadata_file:")) throw new Error("draft_commit_exposes_internal_json_path");
     if (committedMarkdown.includes("==virtual highlight metadata==")) throw new Error("draft_commit_embedded_virtual_highlight");
     if (!metadataArtifact.path.includes(`${path.sep}.local-ir${path.sep}browser-document-state${path.sep}`)) throw new Error("draft_commit_metadata_not_internal");
@@ -321,7 +321,7 @@ async function run() {
     for (const expected of [
       "import_method: \"browser_standard_preprocess\"",
       "highlight_mode: \"virtual_metadata\"",
-      "processing_status: ready",
+      'processing_status: "ready"',
       "## 阅读前置卡",
       "## 核心洞察"
     ]) {
@@ -331,7 +331,7 @@ async function run() {
       if (!(await fs.stat(path.join(standardAuditArtifact.path, name)).catch(() => null))) throw new Error(`standard_import_audit_missing:${name}`);
     }
     const standardRequest = JSON.parse(await fs.readFile(path.join(standardAuditArtifact.path, "request.json"), "utf8"));
-    if (standardRequest.processing_options?.input_form !== "written") throw new Error("browser_standard_import_not_fixed_as_written_input");
+    if (standardRequest.source_metadata?.input_form !== "written") throw new Error("browser_standard_import_not_fixed_as_written_input");
     const standardMetadata = JSON.parse(await fs.readFile(standardMetadataArtifact.path, "utf8"));
     if (!standardMetadata.content.conversionMethod.startsWith("progressive_reading_preprocess/")) throw new Error("standard_import_wrong_conversion_method");
     if (!standardMetadata.browser.sourceMetadata.standard_preprocess?.material_id) throw new Error("standard_import_receipt_missing_from_state");
@@ -382,6 +382,7 @@ async function run() {
     if (batchImported.status !== "completed" || batchImported.requested !== 2 || batchImported.imported !== 2 || batchImported.failed !== 0) {
       throw new Error(`batch_standard_import_summary_invalid:${JSON.stringify(batchImported)}`);
     }
+    if (batchImported.concurrency !== 2) throw new Error("batch_standard_import_concurrency_not_applied");
     if (batchImported.transport !== "background_fetch") throw new Error("batch_standard_import_not_on_shared_background_transport");
     for (const item of batchImported.results) {
       if (item.status !== "imported") throw new Error(`batch_standard_import_failed:${item.error || "unknown"}`);
@@ -452,8 +453,8 @@ async function run() {
     if (path.basename(completedMarkdownArtifact.path) !== path.basename(markdownArtifact.path)) throw new Error("complete_changed_save_filename_contract");
     if (!path.basename(completedMarkdownArtifact.path).includes("--浏览器加工--")) throw new Error("complete_changed_save_filename_label");
     const completedMarkdown = await fs.readFile(completedMarkdownArtifact.path, "utf8");
-    if (!completedMarkdown.includes("import_method: browser_draft_commit")) throw new Error("complete_changed_import_method");
-    if (!completedMarkdown.includes("status: done")) throw new Error("complete_missing_done_status");
+    if (!completedMarkdown.includes('import_method: "browser_standard_preprocess"')) throw new Error("complete_changed_import_method");
+    if (!completedMarkdown.includes('status: "done"')) throw new Error("complete_missing_done_status");
     if (completedMarkdown.includes("browser_complete_reading") || completedMarkdown.includes("浏览器完成阅读")) throw new Error("complete_kept_parallel_save_contract");
     const stripFrontmatter = (value) => value.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
     if (stripFrontmatter(completedMarkdown) !== stripFrontmatter(committedMarkdown)) throw new Error("complete_changed_readable_markdown_body");
@@ -488,17 +489,12 @@ async function run() {
       await fs.rm(target, { force: true }).catch(() => {});
     }
     await fs.rm(testWorkspaceRoot, { recursive: true, force: true }).catch(() => {});
-    await fs.rm(serverInfoPath, { force: true }).catch(() => {});
     child.kill();
     await delay(250);
     if (process.platform === "win32" && child.pid) {
       spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
     } else if (child.exitCode === null) {
       child.kill("SIGKILL");
-    }
-    if (previousServerInfo !== null) {
-      await fs.mkdir(path.dirname(serverInfoPath), { recursive: true });
-      await fs.writeFile(serverInfoPath, previousServerInfo, "utf8").catch(() => {});
     }
     if (process.env.BROWSER_HIGHLIGHT_TEST_DEBUG) {
       console.error(stdout);

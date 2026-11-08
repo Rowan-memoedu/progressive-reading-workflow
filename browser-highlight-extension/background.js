@@ -1,7 +1,7 @@
 importScripts("draft-core.js");
 
 const Core = globalThis.LocalIrDraftCore;
-const VERSION = "0.5.14";
+const VERSION = "0.5.17";
 const DEFAULT_PORT = 37829;
 const PORT_SCAN_START = 37829;
 const PORT_SCAN_END = 37849;
@@ -143,7 +143,61 @@ async function saveDraftMap(drafts) {
 
 async function getDraft(url) {
   const { drafts } = await getSettings();
-  return drafts[url] ? Core.normalizeDraft(drafts[url]) : null;
+  const draft = drafts[url] ? Core.normalizeDraft(drafts[url]) : null;
+  if (draft?.status === "submitting" && draft.submitMode === "standard_preprocess" && !draft.importJob) {
+    const interrupted = Core.markFailed(draft, "上次导入没有收到完成回执，来源草稿已保留，请重新导入。");
+    const latest = await getSettings();
+    latest.drafts[url] = interrupted;
+    await saveDraftMap(latest.drafts);
+    return interrupted;
+  }
+  if (draft?.status === "submitting" && draft.submitMode === "standard_preprocess" && draft.importJob) {
+    return refreshStandardImport(draft);
+  }
+  return draft;
+}
+
+// Persist the client key before dispatch. A lost response or suspended worker
+// resumes the same server job rather than repeating generation/publication.
+const refreshingImports = new Map();
+async function refreshStandardImport(draft) {
+  if (refreshingImports.has(draft.url)) return refreshingImports.get(draft.url);
+  const run = (async () => {
+    try {
+      let request;
+      if (draft.importJob.requestId) {
+        request = await requestJsonReliable(`/api/browser-import/requests/${encodeURIComponent(draft.importJob.requestId)}`);
+      } else {
+        request = await requestJsonReliable("/api/highlights/import-local", {
+          method: "POST", body: JSON.stringify({ draft, async: true, client_request_id: draft.importJob.clientRequestId })
+        });
+        draft.importJob.requestId = request.request_id;
+      }
+      const result = request.results?.[0];
+      draft.importJob.stage = result?.stage || (request.terminal ? request.status : "queued");
+      draft.lastError = null;
+      if (request.terminal) {
+        draft.importJob.terminal = true;
+        if (["saved_locked", "imported", "imported_with_warnings", "idempotent_replay"].includes(result?.status)) {
+          draft = Core.markSaved(draft, result);
+        } else draft = Core.markFailed(draft, result?.error || result?.errors?.[0]?.message || request.status);
+      }
+    } catch (error) {
+      // Connection loss does not mean that the durable task failed.
+      if (error.status >= 400 && error.status < 500) {
+        draft = Core.markFailed(draft, error.message);
+        draft.importJob.terminal = true;
+      } else draft.lastError = "暂时无法连接本地服务；任务和输入已保留，将自动查询结果。";
+    }
+    const latest = await getSettings();
+    if (latest.drafts[draft.url]?.importJob?.clientRequestId !== draft.importJob.clientRequestId) return latest.drafts[draft.url] || null;
+    latest.drafts[draft.url] = draft;
+    await saveDraftMap(latest.drafts);
+    await notifyDraftState(draft.url, draft);
+    return draft;
+  })();
+  refreshingImports.set(draft.url, run);
+  try { return await run; } finally { refreshingImports.delete(draft.url); }
 }
 
 async function upsertDraft(rawDraft, tabId = null) {
@@ -174,6 +228,10 @@ async function submitDraft(url, destination = "reading", options = {}) {
   const current = settings.drafts[url];
   if (!current) throw new Error("draft_not_found");
   let draft = Core.normalizeDraft(current);
+  if (draft.status === "submitting" && draft.importJob && !draft.importJob.terminal) {
+    draft = await refreshStandardImport(draft);
+    return { draft, result: draft.receipt, pending: draft.status === "submitting" };
+  }
   if (draft.locked && !options.force) return { draft, result: draft.receipt };
   if (draft.locked && options.force) {
     draft = {
@@ -195,9 +253,17 @@ async function submitDraft(url, destination = "reading", options = {}) {
   draft.submitMode = submitMode;
   draft = Core.markPending(draft);
   draft.status = "submitting";
+  if (submitMode === "standard_preprocess") {
+    draft.importJob = { clientRequestId: `snapshot-${crypto.randomUUID()}`, requestId: null, stage: "queued", terminal: false };
+  }
   settings.drafts[url] = draft;
   await saveDraftMap(settings.drafts);
   await notifyDraftState(url, draft);
+  if (submitMode === "standard_preprocess") {
+    draft = await refreshStandardImport(draft);
+    return { draft, result: draft.status === "submitting" ? { status: "queued", request_id: draft.importJob.requestId } : draft.receipt,
+      pending: draft.status === "submitting", ...(draft.status === "error" ? { error: draft.lastError } : {}) };
+  }
   try {
     const endpoint = submitMode === "standard_preprocess"
       ? "/api/highlights/import-local"
@@ -226,7 +292,7 @@ async function markDirtyDraftsPending() {
   let changed = false;
   for (const [url, value] of Object.entries(settings.drafts)) {
     const draft = Core.normalizeDraft(value);
-    if (!draft.locked && draft.dirty) {
+    if (!draft.locked && draft.dirty && !draft.importJob) {
       settings.drafts[url] = Core.markPending(draft);
       changed = true;
     }
@@ -239,6 +305,10 @@ async function retryPendingDrafts() {
   const imported = [];
   const failed = [];
   for (const draft of Object.values(settings.drafts)) {
+    if (draft.status === "submitting" && draft.importJob) {
+      await refreshStandardImport(Core.normalizeDraft(draft));
+      continue;
+    }
     if (draft.locked || !["editing", "pending_submit", "error"].includes(draft.status)) continue;
     try {
       imported.push(await submitDraft(draft.url, draft.submitDestination || "reading"));
@@ -374,7 +444,7 @@ async function waitForBrowserImportRequest(requestId, timeoutMs = STANDARD_IMPOR
     });
     if (request?.terminal) {
       const result = Array.isArray(request.results) ? request.results[0] : null;
-      if (result?.status === "imported" || result?.status === "idempotent_replay") return result;
+      if (result?.status === "imported" || result?.status === "imported_with_warnings" || result?.status === "idempotent_replay") return result;
       const degradedStatus = new Set(["requires_browser_auth", "requires_js_render"]);
       const status = String(result?.status || request.status || "");
       if (degradedStatus.has(status)) throw new Error(status);
@@ -407,11 +477,26 @@ async function handleContextMenuClick(info, tab) {
   await setContextBadge(tabId, "…", "#1f5fbf");
   try {
     if (info.menuItemId === "local-ir-import-page") {
-      await importCurrentPageFromContext(tab);
+      const result = await importCurrentPageFromContext(tab);
+      if (result?.status === "queued") {
+        await setContextBadge(tabId, "…", "#1f5fbf");
+        return;
+      }
+      if (result?.receipt?.quality_status === "warning") {
+        await setContextBadge(tabId, "!", "#d97706");
+        return;
+      }
     } else if (info.menuItemId === "local-ir-import-link") {
-      await importLinkFromContext(info.linkUrl, tab);
+      const result = await importLinkFromContext(info.linkUrl, tab);
       if (tabId && isSupportedPageUrl(tab?.url)) {
-        await notifyContextProgress(tabId, "succeeded", "链接已标准化并导入本地阅读区");
+        await notifyContextProgress(tabId, result?.receipt?.quality_status === "warning" ? "warning" : "succeeded",
+          result?.receipt?.quality_status === "warning"
+            ? "链接已导入，但生成的 Markdown 有瑕疵，请复核。"
+            : "链接已标准化并导入本地阅读区");
+      }
+      if (result?.receipt?.quality_status === "warning") {
+        await setContextBadge(tabId, "!", "#d97706");
+        return;
       }
     } else {
       return;
@@ -473,14 +558,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return sendResponse({ ok: true, ...submitted });
     }
     if (message?.type === "draft-import-local") {
-      const submitted = await submitDraft(String(message.url || ""), "reading", { mode: "standard_preprocess" });
+      const submitted = await submitDraft(String(message.url || ""), "reading", { mode: "standard_preprocess", force: Boolean(message.force) });
       return sendResponse({ ok: true, ...submitted });
     }
     if (message?.type === "draft-resubmit") {
       const url = String(message.url || "");
       const current = await getDraft(url);
       const destination = current?.submitDestination === "completed" ? "completed" : "reading";
-      const submitted = await submitDraft(url, destination, { force: true });
+      const submitted = await submitDraft(url, destination, { force: true, ...(message.mode ? { mode: message.mode } : {}) });
       return sendResponse({ ok: true, ...submitted });
     }
     sendResponse({ ok: false, error: "unknown_message" });

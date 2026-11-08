@@ -10,4 +10,10 @@ const target = path.join(targetDir, "web-highlighter.min.js");
 
 await fs.mkdir(targetDir, { recursive: true });
 await fs.copyFile(source, target);
+// The classic-script compatibility facade is generated from the same source
+// consumed by Node and Obsidian. All extension loading paths use this file.
+const facade = path.join(workflowRoot, "browser-highlight-extension", "draft-core.js");
+const staging = `${facade}.tmp`;
+await fs.copyFile(path.join(workflowRoot, "document-core", "core.js"), staging);
+await fs.rename(staging, facade);
 console.log(JSON.stringify({ copied: target }, null, 2));

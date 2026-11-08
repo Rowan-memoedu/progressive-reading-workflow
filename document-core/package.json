@@ -1,0 +1,8 @@
+{
+  "name": "@local-ir/document-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node test.mjs", "test:adapters": "node adapters.test.mjs", "test:handoff": "node handoff.test.mjs", "build": "node build.mjs" },
+  "exports": { ".": { "types": "./index.d.ts", "import": "./index.mjs" } }
+}

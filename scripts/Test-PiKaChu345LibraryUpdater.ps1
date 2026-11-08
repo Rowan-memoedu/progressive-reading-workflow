@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 $scriptDirectory = if ($PSScriptRoot) {
     $PSScriptRoot
 } else {
-    'D:/Projects/progressive-reading-workflow\scripts'
+    Join-Path (Get-Location) 'scripts'
 }
 $updater = Join-Path $scriptDirectory 'Update-PiKaChu345Library.ps1'
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('pikachu-library-updater-' + [guid]::NewGuid().ToString('N'))

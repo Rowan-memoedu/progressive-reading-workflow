@@ -5,10 +5,10 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const producerConfigDir = path.join(process.env.USERPROFILE || process.env.HOME || "", "Documents", "New project");
-const producerConfigKeys = ["AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL"];
+const producerConfigKeys = ["AI_PRODUCER_BASE_URL", "DEEPSEEK_READING_API_KEY", "AI_PRODUCER_MODEL"];
 const standardMarkdownProcessingRoute = {
   mode: "local_compatibility_fallback",
-  future_interface_thread: "00000000-0000-0000-0000-000000000000",
+  future_interface_module: "standard-preprocessing/index.mjs",
   replacement_status: "pending_versioned_contract_and_synthetic_fixture",
 };
 
@@ -299,7 +299,7 @@ async function generateStructuredReadingBody({ info, paragraphs, instruction = "
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${config.AI_PRODUCER_API_KEY}`,
+          "Authorization": `Bearer ${config.DEEPSEEK_READING_API_KEY}`,
         },
         body: JSON.stringify({
           model: config.AI_PRODUCER_MODEL,

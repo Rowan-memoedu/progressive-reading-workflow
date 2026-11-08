@@ -73,8 +73,13 @@ function normalizedCookie(cookie, index, nowSeconds) {
 
   const name = String(cookie.name ?? "");
   const value = String(cookie.value ?? "");
-  if (!name || !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/u.test(name)) throw new Error(`chrome_cookie_name_invalid:${index}`);
-  if (/[;\r\n\0]/u.test(value)) throw new Error(`chrome_cookie_value_invalid:${index}`);
+  // Match Chromium ParsedCookie::IsValidCookieName, not the stricter RFC token
+  // grammar: browser cookie names may contain spaces, colons and slashes.
+  if (/[\x00-\x1f\x7f;=]/u.test(name)) throw new Error(`chrome_cookie_name_invalid:${index}`);
+  // Chromium supports value-only cookies, but ambiguous empty-name pairs must
+  // never turn into a different named credential when building the header.
+  if (!name && (!value || value.includes("="))) throw new Error(`chrome_cookie_empty_name_ambiguous:${index}`);
+  if (/[\x00-\x1f\x7f;]/u.test(value)) throw new Error(`chrome_cookie_value_invalid:${index}`);
   if (Buffer.byteLength(`${name}=${value}`, "utf8") > 8192) throw new Error(`chrome_cookie_pair_too_large:${index}`);
 
   const hostOnly = requiredBoolean(cookie.hostOnly, `chrome_cookie_host_only_invalid:${index}`);
@@ -350,7 +355,7 @@ export class ChromeCookieJar {
       || right.domain.length - left.domain.length
       || left.name.localeCompare(right.name)
       || left.storeId.localeCompare(right.storeId));
-    const header = matches.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+    const header = matches.map((cookie) => cookie.name ? `${cookie.name}=${cookie.value}` : cookie.value).join("; ");
     if (Buffer.byteLength(header, "utf8") > CHROME_COOKIE_JAR_MAX_HEADER_BYTES) throw new Error("chrome_cookie_header_too_large");
     return header || null;
   }

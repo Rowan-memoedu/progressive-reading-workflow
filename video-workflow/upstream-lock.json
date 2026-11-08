@@ -1,0 +1,205 @@
+{
+  "repository": "https://github.com/Luke-Evan/videobook",
+  "commit": "95d102de80c2a3cca7da20f744cb5e82e81c3bdc",
+  "license": "Apache-2.0",
+  "files": [
+    {
+      "path": ".gitignore",
+      "bytes": 398,
+      "git_blob": "d4d4acc7fa48a88259e35443701a37d7f9393626",
+      "sha256": "61dbb58d8d12c1e829c66f956cc0847ab27a078cf9b143f4b813c024e8a146cd"
+    },
+    {
+      "path": ".python-version",
+      "bytes": 5,
+      "git_blob": "e4fba2183587225f216eeada4c78dfab6b2e65f5",
+      "sha256": "7b55f8e67b5623c4bef3fa691288da9437d79d3aba156de48d481db32ac7d16d"
+    },
+    {
+      "path": "LICENSE",
+      "bytes": 11339,
+      "git_blob": "44f864cb24406261651cc0fd51146f3575f5c0ff",
+      "sha256": "7c2066edc86d41094385af97f9cbbb5d79c40b916a92f7b66a5a8c70580fded6"
+    },
+    {
+      "path": "README.md",
+      "bytes": 3460,
+      "git_blob": "10555023784b2528eb02529a19fb3491afaea9cb",
+      "sha256": "c40e8e15f282b2b38b748db96b114fc2c3bb54e9d4eb2bcb29cf27b99b752360"
+    },
+    {
+      "path": "instructions.md",
+      "bytes": 19567,
+      "git_blob": "cad65a381202c47ffac5e72fa592d2f294812898",
+      "sha256": "3cb1496cca288ff00a2638478cc930823de3921a5e200651d3a01483ddb5255f"
+    },
+    {
+      "path": "prompts/stitcher_system.md",
+      "bytes": 5523,
+      "git_blob": "3390619fbeded563bd8f4b74f9204fa07e3e73ff",
+      "sha256": "9adc8651ac10b32183a69c7efbabd4f8bd1f04de2e62a8d3932841d9da1c2385"
+    },
+    {
+      "path": "pyproject.toml",
+      "bytes": 155,
+      "git_blob": "06090cf7f66f46e6ee2e352c48b3347ec55c5603",
+      "sha256": "8dfdf805be06a91298f4732c740be7d084a6bc8cd4d0c240dce08e1ef75bbf34"
+    },
+    {
+      "path": "requirements.txt",
+      "bytes": 368,
+      "git_blob": "f19c5950f55c8f197b4431b234a4cdc0dab1a84b",
+      "sha256": "a5d0873d54279165042d8d9857a572faf756abf1eefe04ece96c8d4ee3b460d9"
+    },
+    {
+      "path": "skills/videobook/SKILL.md",
+      "bytes": 8433,
+      "git_blob": "38cec596db55cef43443c3364ea0d117ebf91541",
+      "sha256": "8693448894c1e927e12037c72d35bef7659a2e656442ac72bf0d147f4b3ed8f4"
+    },
+    {
+      "path": "skills/videobook/agents/openai.yaml",
+      "bytes": 252,
+      "git_blob": "3c66f2716038628158653f2f644bdfe4c742ee25",
+      "sha256": "b31d844b9735df895120c4cbc42573345284333736fae7027862048300cdc6e7"
+    },
+    {
+      "path": "skills/videobook/references/capture.md",
+      "bytes": 5447,
+      "git_blob": "d7d17f4ef96ee5a3bfd9e86dd76e512567371cfb",
+      "sha256": "0bb8dffcd8a58cabbf19f4b36ec0b64951fbc3c54dde68a43db9f02684d1b890"
+    },
+    {
+      "path": "skills/videobook/references/correction.md",
+      "bytes": 3480,
+      "git_blob": "5deead735c0ba76df895966eb70177ff3dd503a9",
+      "sha256": "a92fc754e572f061a479a4bb6d53953159871c8400fe93dac6c725c4ace9065b"
+    },
+    {
+      "path": "skills/videobook/references/course-assets.md",
+      "bytes": 4744,
+      "git_blob": "4e6e8c368fe7b8c809cef6ac98eaee562501f825",
+      "sha256": "1ad88ec8e35b261fccb7de5205b222510cfa28f7f5f0b9f0685b83849f9d534b"
+    },
+    {
+      "path": "skills/videobook/references/publish.md",
+      "bytes": 1687,
+      "git_blob": "1a4a2cf8d320756eff1f471293b33f9dee3d448c",
+      "sha256": "e2c28499a7bd27a8ec4ec99fa2cbe84f5bd1c764d59c7e15bc83cf8025344b56"
+    },
+    {
+      "path": "skills/videobook/references/stitcher-prompt.md",
+      "bytes": 6098,
+      "git_blob": "1abfbec927b17e358a609915d702246d510634d4",
+      "sha256": "3e11d324fdec8857f90cee73fa8992859b70d0fcc2a6a6c730d4e5389aa92ccb"
+    },
+    {
+      "path": "skills/videobook/references/transcript.md",
+      "bytes": 4006,
+      "git_blob": "22af022eae5a1f54647700faf1a26dbe97e3042b",
+      "sha256": "f384be1b023c77413d8e435e81d3a0137cfb787b64c64b300dc09e2e315eb5a9"
+    },
+    {
+      "path": "skills/videobook/references/troubleshooting.md",
+      "bytes": 4169,
+      "git_blob": "7fcff681b79283f79ed6971b12bedd206222ec1a",
+      "sha256": "4154fc2d5fb5b0f9ce895aec077b76557e656ea9108168555e5ca666305dd874"
+    },
+    {
+      "path": "skills/videobook/references/writing.md",
+      "bytes": 3567,
+      "git_blob": "79c391de931c5550ec214093acca7d71fb28ea75",
+      "sha256": "42e8d76ea265080235aabeb27df660562fe087f6f8e5d2cc31cc102ca4533507"
+    },
+    {
+      "path": "src/agent.py",
+      "bytes": 1666,
+      "git_blob": "864c7f8986be07bab6c48dd6d0d16a96eae313f8",
+      "sha256": "bee84fa8fcf1cc667d96a3cce290af69bdb0a5d8b22299a839e818546fbe6bbe"
+    },
+    {
+      "path": "src/asr_transcript.py",
+      "bytes": 13682,
+      "git_blob": "9d1ec355b5a487b06497e4ee7839b0c5ee2132bc",
+      "sha256": "6f25ba75750b0673f47cf623d8cc3670e465070705518b0f04af4beb9728ea0e"
+    },
+    {
+      "path": "src/capture_frames.py",
+      "bytes": 14734,
+      "git_blob": "d6062f31ca0d1785b18240a52e19466d7761dc63",
+      "sha256": "b47ce59d8808dd94c09b1294e1bfd0a2616a12333da9375e631d841f58f690e1"
+    },
+    {
+      "path": "src/config.py",
+      "bytes": 802,
+      "git_blob": "388472594235c5eb63d48c0491af5d181f009674",
+      "sha256": "0b169646c8ef2cf1b3c5c85b2f003662865388fd9e96b16b434e54e6150fa1f6"
+    },
+    {
+      "path": "src/course_assets.py",
+      "bytes": 30819,
+      "git_blob": "bb100d6396972f341c509e0661bb2255dbf9e81e",
+      "sha256": "595340d0e3c395ecaf98b2e6ea6e24b4e81d6a1cb5dfd579ed4cb8cf2a61f924"
+    },
+    {
+      "path": "src/dump_transcript.py",
+      "bytes": 3060,
+      "git_blob": "813a45642f7e5f3e250792379d42019ff3d32c96",
+      "sha256": "806ed053b5df23fc989c649cd49f2dc80f2e3574400c55e85b785bb645e46dad"
+    },
+    {
+      "path": "src/extract_frames.py",
+      "bytes": 4408,
+      "git_blob": "a4cacacf1d8470b8d06ad37ed8e0870034356b0f",
+      "sha256": "52e0992a84041504dfb31b7b7f86ced50006b54b441c9b42975e2c491e6f4d95"
+    },
+    {
+      "path": "src/login_utils.py",
+      "bytes": 2721,
+      "git_blob": "00661efa20d983107fb56e542143db5e3391f7dd",
+      "sha256": "d2bfae6d3eb3b8308d815bf9e149a6536112b55011a8bd6a7af79509311abf11"
+    },
+    {
+      "path": "src/make_corrected.py",
+      "bytes": 26462,
+      "git_blob": "63fdd15a5b6c9f117eb947eb79e61781b6901858",
+      "sha256": "d1b8781b64830287f6feecb034683a4d77cefa78e1fa8438c26622fb1b6398ae"
+    },
+    {
+      "path": "src/post_process.py",
+      "bytes": 21342,
+      "git_blob": "cb34f4aae5668d37563d470e7833536caa3239e7",
+      "sha256": "76d014bc199c88c68c718bb0166a1770fad330ba34f35d8dbd13c25eee0e8a67"
+    },
+    {
+      "path": "src/publish.py",
+      "bytes": 14492,
+      "git_blob": "07254879887baa5a8f79f7065bf1d9de6dd00c37",
+      "sha256": "ec4310bb65017877d96e14b4248ecc5ae2388481ff09db8216f3bb92cb6d0d3f"
+    },
+    {
+      "path": "src/scraper.py",
+      "bytes": 11725,
+      "git_blob": "9d0580de76e8dd0a4616d61d5f7b5ac813856a15",
+      "sha256": "d8560afca036e8cd0bdb00386829a3d699b8ae6ba9e9f60e94f082310798a0b7"
+    },
+    {
+      "path": "tests/test_correction.py",
+      "bytes": 3346,
+      "git_blob": "f40068c283a38feff87a67912a2ddf32aa2c8864",
+      "sha256": "07de839c068bed73f1e278c5cafb35fd6c38e17fc44c3c28b1c1c23a575d1b57"
+    },
+    {
+      "path": "tests/test_render.py",
+      "bytes": 1696,
+      "git_blob": "5c2ffe3210cc02824e4a5002d1938f754a726e51",
+      "sha256": "51046ef10610a916cf235ec60c5a02bc9b5495392ad3677a8ffc9e0befef0585"
+    },
+    {
+      "path": "uv.lock",
+      "bytes": 129,
+      "git_blob": "300091e56f8e34cf6602a508253a91250bf85e65",
+      "sha256": "efefd347773f332d1215cfbd39e87d7d9a77b38ab0123a3ba1cfd496c4756a42"
+    }
+  ]
+}

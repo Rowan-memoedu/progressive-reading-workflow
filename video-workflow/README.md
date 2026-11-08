@@ -1,0 +1,53 @@
+# 视频字幕与图文导入
+
+本模块将完整字幕、经核验的截图和可选 Mermaid 图导入标准预处理及渐进阅读发布流程。字幕和来源证据必须保留，失败和模型输出只写入本机产物目录。
+
+## 模式与依赖
+
+默认处理字幕正文；图文模式必须显式选择 `--type illustrated` 或 `--type 图文模式`。兼容别名 `illustrated_strong` 仍可读取。无可用字幕时保留等待状态，不把简介当正文，不自动下载整段音视频或改用 ASR。
+
+上游 VideoBook 代码由 `fetch-public.py` 按固定提交下载，`upstream-lock.json` 记录来源、Apache-2.0 许可及逐文件哈希。`verifyUpstream()` 在使用前核验；本地适配器不改写上游源码。
+
+```powershell
+python video-workflow/fetch-public.py code
+```
+
+可选渲染依赖见 `render-requirements.txt`。通过 `PROGRESSIVE_READING_VIDEO_PYTHON` 指定视频 Python 环境，音频/来源工具另支持 `PR_AUDIO_PYTHON`。截图使用隔离的无头 Chrome 播放器与目标站点范围内的临时凭据；退出清除临时凭据。
+
+## B 站视频与合集
+
+`watch.mjs` 和 `watch-core.mjs` 发现分 P 与合集，身份为 BV 号加 cid。新订阅默认建立当前基线，之后跟踪新增。已发布、仅后续验收失败的任务在显式恢复时核对原文哈希、来源和附件，再进入 verification-only；普通调度不自行恢复 blocked 项目。
+
+订阅设置与时间以 [统一订阅](../docs/UNIFIED_SUBSCRIPTIONS.md) 为准。不要让旧独立任务和统一调度同时处理同一来源。独立 Windows 调度脚本仍保留给既有安装。
+
+数据目录支持 `PROGRESSIVE_READING_VIDEO_HOME`，产物根目录支持 `PROGRESSIVE_READING_ARTIFACT_HOME`。既有 D 盘目录继续兼容，实际 watchlist、状态与调度回执不随源码发布。
+
+## 来源和内容保护
+
+字幕元数据必须与明确的分 P 一致，临时字幕目录隔离。旧书稿和图片不能混入新来源。`run-authenticated.mjs` 将已有登录快照转换成范围受限的临时 Cookie 文件。
+
+`import-transcript.mjs` 是字幕标准入口；`illustrated-strong.mjs` 处理图文模式。正文、导读、截图和板书校订使用一致的模型路由，模型缓存身份包含实际指令适配版本。Codex CLI 只有报告 `turn.completed` 才能接受结果；无已验证等价项的旧 API 参数不能宣称已应用。
+
+媒体证据按 `source_segment_index` / `result_segment_index` 选择字幕，程序逐字回填引文。时间编译只在已声明窗口内后移或缩短，不扩展场景。Mermaid 和 LaTeX 保留原生 Markdown 语义，不把稀疏配图当作完整公式证据。
+
+## 数学板书
+
+`plan-board-followups.py` 只选择来源字幕索引与需补充的画面；`board-followup-frame.mjs` 规划补图窗口。视觉提取仅报告画面所见，不自行改写字幕。`merge-board-evidence.mjs` 按图像哈希保留各次证据，`assemble-board-ledger.py` 输出待审候选。
+
+校订建议必须精确对应原字幕；不匹配项保留拒绝记录，不通过模糊匹配强行应用。来源缺少定义域或取等条件时不能补算为讲师原话。候选须经过来源审阅与显式准入，图像像素及被接受的字幕修订均可追溯。
+
+## 多分 P 与附件
+
+先分别提取字幕、截图并完成板书校订，再用 `merge-reviewed-video-parts.mjs` 平移时间轴、重命名截图，同时保持像素和字幕正文。`process-reviewed-collection.mjs` 从合并来源生成一次正文，不把分别改写的正文拼接为新结果。
+
+配套 book.md 中的截图、Mermaid 与附件经过来源清单、媒体布局和发布校验；上游生成的文章不能替代原始字幕正文。`restore-book-media.mjs` 可恢复已核验媒体，不能用缺少证据的新附件覆盖旧稿。
+
+## 验证与恢复
+
+```powershell
+node --test video-workflow/*.test.mjs
+```
+
+`verify-publication.py` 检查来源、正文、媒体、洞察链接与回执；`verify-collection.py` 检查多分 P 映射；`verify-rendering.py` 独立检查图片、Mermaid 与数学渲染。独立渲染不代表原生 Obsidian 会话已验收。
+
+失败后保留来源、缓存、拒绝项和回执，修复通用流程后重跑原始输入。只恢复已完成阶段，不手工修补成稿冒充自动通过，不覆盖已发布且人工编辑过的内容。

@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output directories
+output/
+tmp_subs/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+memory/
+.claude/settings.local.json
+
+# dedicated Chrome capture profile (cookies, large)
+.capture-profile/
+
+# exported cookies (never commit login state)
+cookies.txt
+*.cookies.txt

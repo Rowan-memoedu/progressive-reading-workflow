@@ -1,0 +1,7 @@
+upstream/output/
+upstream/tmp_subs/
+upstream/.capture-profile/
+upstream/.env*
+upstream/.venv/
+upstream/**/__pycache__/
+upstream/**/*.pyc

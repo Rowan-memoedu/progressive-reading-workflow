@@ -1,6 +1,8 @@
-import fs from "node:fs/promises";
+import { createHash } from 'node:crypto';
+import { configPath, loadConfigFile } from '../rss-import/config.mjs';
 
 import { normalizeUrl } from "./core.mjs";
+import { includesPublication } from "../subscription-workflow/history.mjs";
 
 export const SUBSCRIPTIONS_SCHEMA = "progressive-reading.rss-subscriptions/v1";
 
@@ -31,6 +33,9 @@ function normalizeSubscription(value, index) {
     feed_url: feedUrl,
     site_url: siteUrl,
     fetch_fulltext: item.fetch_fulltext === true,
+    ...(item.history_mode && item.history_mode !== "default" ? {
+      history_mode: item.history_mode, earliest_date: item.earliest_date
+    } : {}),
     user_instruction: String(item.user_instruction || "")
   };
 }
@@ -55,9 +60,15 @@ export function validateSubscriptionRegistry(value) {
   };
 }
 
-export async function loadSubscriptionRegistry(filePath) {
-  const parsed = JSON.parse(await fs.readFile(filePath, "utf8"));
-  return validateSubscriptionRegistry(parsed);
+export async function loadSubscriptionRegistry(filePath = configPath()) {
+  if (!String(filePath).toLowerCase().endsWith('.md')) throw new Error('rss_subscription_input_is_now_the_three_section_markdown_document');
+  const config = await loadConfigFile(filePath);
+  return validateSubscriptionRegistry({schema_version:SUBSCRIPTIONS_SCHEMA,registry_version:'2.0.0',
+    subscriptions:config.subscriptions.filter(item=>item.route==='reports').map(item=>({
+      id:'feed-'+createHash('sha256').update(item.url).digest('hex').slice(0,20),
+      display_name:item.name,enabled:true,feed_url:item.url,site_url:new URL(item.url).origin+'/',
+      fetch_fulltext:true,user_instruction:'',history_mode:item.history_mode,earliest_date:item.earliest_date
+    }))});
 }
 
 export function subscriptionRegistryResult(registry, configPath) {
@@ -84,7 +95,10 @@ export async function runSubscriptionBatch({ registry, options = {}, syncOne, ba
         ...options,
         "feed-url": subscription.feed_url,
         "user-instruction": options["user-instruction"] ?? subscription.user_instruction,
-        "fetch-fulltext": options["fetch-fulltext"] === true || subscription.fetch_fulltext
+        "fetch-fulltext": options["fetch-fulltext"] === true || subscription.fetch_fulltext,
+        ...(subscription.history_mode === "since" ? {
+          acceptItem: item => includesPublication(subscription, item.published_at)
+        } : {})
       });
       results.push({ subscription_id: subscription.id, display_name: subscription.display_name, ok: true, result });
     } catch (error) {

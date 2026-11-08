@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Install', 'Status', 'Remove')]
+    [ValidateSet('Install', 'Status', 'Remove', 'Pause', 'Resume')]
     [string]$Action = 'Status'
 )
 
@@ -41,6 +41,20 @@ if ($Action -eq 'Install') {
         $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -Mode {1}' -f $runner, $definition.Mode
         $taskAction = New-ScheduledTaskAction -Execute $pwsh -Argument $arguments -WorkingDirectory $projectRoot
         Register-ScheduledTask -TaskName $definition.Name -Action $taskAction -Trigger $definition.Trigger -Principal $principal -Settings $settings -Description "Progressive Reading RSS $($definition.Mode) CLI orchestration" -Force | Out-Null
+    }
+}
+elseif ($Action -in @('Pause', 'Resume')) {
+    foreach ($definition in $taskDefinitions) {
+        $task = Get-ScheduledTask -TaskName $definition.Name -ErrorAction Stop
+        if ($task.Actions[0].WorkingDirectory -ne $projectRoot -or -not $task.Actions[0].Arguments.Contains($runner)) {
+            throw "RSS report task ownership mismatch: $($definition.Name)"
+        }
+        if ($Action -eq 'Pause') {
+            Disable-ScheduledTask -TaskName $definition.Name | Out-Null
+            if ($task.State -eq 'Running') { Stop-ScheduledTask -TaskName $definition.Name }
+        } else {
+            Enable-ScheduledTask -TaskName $definition.Name | Out-Null
+        }
     }
 }
 elseif ($Action -eq 'Remove') {

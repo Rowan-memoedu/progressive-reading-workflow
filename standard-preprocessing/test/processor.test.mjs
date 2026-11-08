@@ -4,10 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { processMaterial, pruneUnreferencedReadingAnchors } from "../lib/core.mjs";
-import { chunkSourceTranslationBlocks, collapseDenseSourceTranslationBlocks, expandDenseSourceTranslationBlocks, findEnglishNaturalLanguageResidues, normalizePureOralNoise, normalizeTranslationTokenWrappers, protectTranslationMarkdown, restoreTranslationMarkdown, stripUnexpectedTranslationInlineSyntax } from "../lib/producer.mjs";
+import { processMaterial, pruneUnreferencedReadingAnchors, PROCESSOR_VERSION } from "../lib/core.mjs";
+import { bibliographicReferenceBlockKeys, chunkSourceTranslationBlocks, collapseDenseSourceTranslationBlocks, expandDenseSourceTranslationBlocks, extractProtectedHttpUrls, findEnglishNaturalLanguageResidues, isBibliographicReferenceBlock, isBilingualGlossaryBlock, mapConcurrentOrdered, normalizePureOralNoise, normalizeTranslationTokenWrappers, producerTranslationConcurrency, protectTranslationMarkdown, restoreTranslationMarkdown, stripUnexpectedTranslationInlineSyntax, translationLiteralBlockKeys, translationProtectedSyntax } from "../lib/producer.mjs";
 import { validateMathLectureTerminology } from "../lib/math-lecture.mjs";
 import { SyntheticProducer } from "../test-support/synthetic-producer.mjs";
+import { GUIDE_COVERAGE_VERSION } from '../lib/guide-coverage.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtures = path.resolve(here, "..", "fixtures");
@@ -15,6 +16,23 @@ const fixtures = path.resolve(here, "..", "fixtures");
 async function fixture(name) {
   return JSON.parse(await fs.readFile(path.join(fixtures, name), "utf8"));
 }
+
+test("bounded translation concurrency preserves chunk order", async () => {
+  let active = 0;
+  let peak = 0;
+  const output = await mapConcurrentOrdered([40, 5, 20, 1, 10], 3, async (delay, index) => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    active -= 1;
+    return index;
+  });
+  assert.deepEqual(output, [0, 1, 2, 3, 4]);
+  assert.equal(peak, 3);
+  assert.equal(producerTranslationConcurrency({}), 4);
+  assert.equal(producerTranslationConcurrency({ AI_PRODUCER_TRANSLATION_CONCURRENCY: "99" }), 8);
+  assert.equal(producerTranslationConcurrency({ AI_PRODUCER_TRANSLATION_CONCURRENCY: "invalid" }), 4);
+});
 
 test("monolingual material renders the locked reading-front-card contract and real block links", async () => {
   const producer = new SyntheticProducer();
@@ -79,6 +97,28 @@ test("standalone programming statements are classified as protected code blocks"
   assert.equal(byMarkdown.get('System.out.println("Hello, World!");'), "code");
   assert.equal(byMarkdown.get("public static void main(String[] args)"), "code");
   assert.equal(byMarkdown.get("The following statement prints a greeting."), "paragraph");
+});
+
+test("PDF structure comments do not hide fenced code from protected block classification", async () => {
+  const producer = new SyntheticProducer();
+  const request = await fixture("monolingual.request.json");
+  request.material.markdown = [
+    "# Programming example",
+    "",
+    "Translate this explanation.",
+    "",
+    "<!-- pdf-structure:code page=14 -->",
+    "```java",
+    "public class Welcome {",
+    "    public static void main(String[] args) {}",
+    "}",
+    "```"
+  ].join("\n");
+  const result = await processMaterial(request, { producer });
+  assert.equal(result.status, "completed");
+  const code = producer.lastPayload.blocks.find((block) => block.markdown.includes("public class Welcome"));
+  assert.equal(code?.type, "code");
+  assert.match(result.artifacts.reading_markdown, /public class Welcome/u);
 });
 
 test("final anchor pruning removes only known unreferenced generated anchors", () => {
@@ -156,6 +196,25 @@ test("injecting original URL and Markdown restores the same material_id with a n
   assert.ok(restored.artifacts.bilingual.alignments.every((item) => item.status === "aligned"));
 });
 
+test("explicit existing-translation-only input preserves provenance without demanding an unavailable original body", async () => {
+  const request = await fixture("translation-missing-original.request.json");
+  request.source_metadata.original_url = "https://example.test/member-only-original";
+  request.source_metadata.translation.existing_translation_only = true;
+  const result = await processMaterial(request, { producer: new SyntheticProducer() });
+  assert.equal(result.status, "completed");
+  assert.equal(result.translation_state, "preserved_translation");
+  assert.equal(result.artifacts.target_zone, "local-ir-reading");
+  assert.equal(result.source_metadata.translation.is_translation, true);
+  assert.equal(result.artifacts.bilingual.detection.has_original, false);
+  delete request.source_metadata.original_url;
+  const missing = await processMaterial(request, { producer: new SyntheticProducer() });
+  assert.equal(missing.status, "quarantined");
+  delete request.source_metadata.translation.existing_translation_only;
+  request.source_metadata.original_url = "https://example.test/member-only-original";
+  const ordinary = await processMaterial(request, { producer: new SyntheticProducer() });
+  assert.equal(ordinary.translation_state, "alignment_pending");
+});
+
 test("invalid model output retries three times and degrades without losing body blocks", async () => {
   const producer = new SyntheticProducer({ invalid: true });
   const result = await processMaterial(await fixture("monolingual.request.json"), { producer });
@@ -165,7 +224,8 @@ test("invalid model output retries three times and degrades without losing body 
   assert.equal(result.receipt.model.calls, 3);
   assert.equal(result.artifacts.body_blocks.length, 4);
   assert.ok(result.errors.some((item) => item.code === "producer_output_rejected"));
-  assert.match(result.artifacts.reading_markdown, /本次未生成通过校验的核心洞察/);
+  assert.equal(result.artifacts.semantic.judgments, null);
+  assert.doesNotMatch(result.artifacts.reading_markdown, /本次未生成通过校验的核心洞察/);
 });
 
 test("five-level judgments render both extremes without changing the reading-depth scale", async () => {
@@ -226,7 +286,7 @@ test("third rejected generation can enter the bounded insight-contract repair pa
   assert.deepEqual(result.receipt.model.attempts[2].insight_contract_repair.repaired_indexes, [0]);
 });
 
-test("insight-contract repair selects the best repairable generation instead of the final regression", async () => {
+test("a valid target and short generated description end retries immediately", async () => {
   const base = new SyntheticProducer();
   const producer = {
     calls: 0,
@@ -264,11 +324,10 @@ test("insight-contract repair selects the best repairable generation instead of 
   };
   const result = await processMaterial(await fixture("monolingual.request.json"), { producer });
   assert.equal(result.status, "completed");
-  assert.equal(producer.calls, 3);
-  assert.equal(producer.repairCalls, 1);
-  assert.equal(producer.selectedDescription, "这是一条仅需局部补全的说明。");
-  assert.equal(result.receipt.model.attempts[1].insight_contract_repair.status, "accepted");
-  assert.equal(result.receipt.model.attempts[2].insight_contract_repair, undefined);
+  assert.equal(producer.calls, 2);
+  assert.equal(producer.repairCalls, 0);
+  assert.equal(result.artifacts.semantic.insights[0].description, "这是一条仅需局部补全的说明。");
+  assert.equal(result.receipt.model.attempts.length, 2);
 });
 
 test("attribution boilerplate is removed deterministically anywhere in an insight without another model attempt", async () => {
@@ -516,6 +575,71 @@ test("source translation renders Chinese prose while preserving formulas, code, 
   assert.equal(result.receipt.validations.find((item) => item.name === "translation_protected_syntax")?.status, "passed");
 });
 
+test("translation URL protection stops at an inline-code fence before adjacent CJK prose", () => {
+  const url = "https://arxiv.org/abs/2023.1234";
+  const source = `Run \`download-paper ${url}\` command to add the paper.`;
+  const translated = `运行 \`download-paper ${url}\`命令，将论文加入日志。`;
+  const sourceSyntax = translationProtectedSyntax(source);
+  const translatedSyntax = translationProtectedSyntax(translated);
+
+  assert.deepEqual(sourceSyntax.urls, [url]);
+  assert.deepEqual(translatedSyntax.urls, [url]);
+  assert.deepEqual(translatedSyntax.inlineCode, sourceSyntax.inlineCode);
+  assert.deepEqual(extractProtectedHttpUrls(`\`(retrieve '${url}')\` and \`${url}\`?`), [url, url]);
+});
+
+test("source translation accepts preserved inline-code URLs next to translated punctuation", async () => {
+  const url = "https://arxiv.org/abs/2023.1234";
+  const request = {
+    schema_version: "progressive-reading.preprocess.request/v1",
+    contract_version: "1.0.0",
+    material: { markdown: `# Retrieval\n\nUse \`(retrieve '${url}')\` and later ask about \`${url}\`?` },
+    source_type: "browser_capture_markdown",
+    source_metadata: { source_url: "https://example.invalid/retrieval", source_is_original: true },
+    user_instruction: "翻译成简体中文，代码与 URL 保持不变。",
+    processing_options: {
+      cleaning_mode: "source_translation",
+      input_form: "written",
+      translation_target_language: "zh-CN",
+      preserve_source_voice: true,
+      forbid_visible_timestamps: true,
+      attribute_unverified_claims: true
+    }
+  };
+  const producer = {
+    async generate(payload) {
+      const [heading, paragraph] = payload.blocks;
+      return {
+        provider: "synthetic",
+        model: "inline-code-url-boundary-v1",
+        usage: null,
+        output: {
+          cleaned_blocks: [
+            { source_block_key: heading.source_block_key, markdown: "# 检索" },
+            { source_block_key: paragraph.source_block_key, markdown: `使用 \`(retrieve '${url}')\`，随后询问 \`${url}\`？` }
+          ],
+          judgments: {
+            value: { level: "medium", reason: "包含检索命令示例。" },
+            density: { level: "medium", reason: "信息集中。" },
+            continue_reading: { level: 2, reason: "适合阅读关键结论。" }
+          },
+          insights: [{
+            title: "检索命令保持原样",
+            description: "这一示例说明技术文章翻译时，反引号中的检索命令与 URL 必须逐字保留；中文标点可以紧随代码围栏出现，但不能因此被错误识别为 URL 内容变化。",
+            target_block_key: paragraph.source_block_key
+          }],
+          translation: { is_bilingual: false, alignments: [] }
+        }
+      };
+    }
+  };
+
+  const result = await processMaterial(request, { producer });
+  assert.equal(result.status, "completed");
+  assert.equal(result.processing_state, "rendered");
+  assert.deepEqual(result.errors, []);
+});
+
 test("translation protection restores Markdown list markers and formulas byte-for-byte", () => {
   const source = "* Compute $x+y$ with `sum(x, y)` and see [the local copy](assets/example.py).";
   const protectedValue = protectTranslationMarkdown(source, { includeMath: true });
@@ -685,9 +809,15 @@ test("source translation renders its accepted body heading instead of untranslat
   assert.doesNotMatch(result.artifacts.reading_markdown, /^# Introduction to Theoretical Computer Science/mu);
 });
 
-test("translation completeness rejects residual English natural-language clauses but allows names and acronyms", async () => {
-  assert.deepEqual(findEnglishNaturalLanguageResidues("引语， attributed to Edsger Dijkstra。"), ["attributed to Edsger Dijkstra"]);
+test("retained English is observable but does not reject a mixed Chinese translation", async () => {
+  assert.deepEqual(findEnglishNaturalLanguageResidues("引语， attributed to Edsger Dijkstra。"), []);
+  assert.deepEqual(findEnglishNaturalLanguageResidues("可以 asking for help，也可以 depend on others，利用 gains from trade。"), []);
+  assert.deepEqual(findEnglishNaturalLanguageResidues("保留 one two three four five six seven eight nine ten。"), []);
+  assert.deepEqual(findEnglishNaturalLanguageResidues("示例 " + "word ".repeat(40)), []);
+  assert.deepEqual(findEnglishNaturalLanguageResidues("残留 " + "word ".repeat(41)), ["word ".repeat(41).trim()]);
   assert.deepEqual(findEnglishNaturalLanguageResidues("署名：Edsger Dijkstra；主题涉及 NP 与 RSA。"), []);
+  assert.deepEqual(findEnglishNaturalLanguageResidues("该名称来自 Bourne Again SHell，并缩写为 BASH。"), []);
+  assert.deepEqual(findEnglishNaturalLanguageResidues("This Ordinary sentence Has internal capitals and remains completely untranslated in the output."), []);
   const request = {
     schema_version: "progressive-reading.preprocess.request/v1",
     contract_version: "1.0.0",
@@ -708,7 +838,7 @@ test("translation completeness rejects residual English natural-language clauses
         output: {
           cleaned_blocks: [
             { source_block_key: payload.blocks[0].source_block_key, markdown: "# 引语" },
-            { source_block_key: payload.blocks[1].source_block_key, markdown: "这句话解释了计算机的作用， attributed to Edsger Dijkstra。" }
+            { source_block_key: payload.blocks[1].source_block_key, markdown: "这句话解释了计算机的作用， " + "ordinary untranslated prose remains in the output ".repeat(6) }
           ],
           judgments: {
             value: { level: "medium", reason: "验证翻译完整性。" },
@@ -722,9 +852,105 @@ test("translation completeness rejects residual English natural-language clauses
     }
   };
   const result = await processMaterial(request, { producer });
-  assert.equal(result.status, "completed_with_warnings");
-  assert.equal(producer.calls, 3);
-  assert.match(result.errors[0].message, /translation_english_residue/u);
+  assert.equal(producer.calls, 1);
+  assert.equal(result.status, "completed");
+  assert.deepEqual(result.errors, []);
+});
+
+test("translation completeness allows unchanged bibliographic references but not ordinary English prose", async () => {
+  assert.equal(isBibliographicReferenceBlock("- P. Deitel, H. Deitel, Java: How to Program"), true);
+  assert.equal(isBibliographicReferenceBlock("- Y. Daniel Liang, Introduction to Java Programming, 2020."), true);
+  assert.equal(isBibliographicReferenceBlock("The quotation is attributed to Edsger Dijkstra."), false);
+  const fragmented = [
+    { source_block_key: "heading", markdown: "## Reference books" },
+    { source_block_key: "authors", markdown: "- Allen B. Downey and Chris Mayfield." },
+    { source_block_key: "title", markdown: "Think Java, How to Think Like a" },
+    { source_block_key: "tail", markdown: "Computer Scientist, O'Reilly, 2016." },
+    { source_block_key: "next", markdown: "## Course syllabus" },
+    { source_block_key: "prose", markdown: "This ordinary English sentence must be translated." }
+  ];
+  assert.deepEqual([...bibliographicReferenceBlockKeys(fragmented)], ["authors", "title", "tail"]);
+  assert.equal(isBilingualGlossaryBlock("- Standard input/output 标准输入输出 Assignment operator 赋值运算符"), true);
+  assert.equal(isBilingualGlossaryBlock("This ordinary English sentence includes 中文。"), false);
+  const glossary = [
+    { source_block_key: "glossary-heading", markdown: "## Appendix – Terms" },
+    { source_block_key: "glossary-entry", markdown: "- Standard input/output 标准输入输出 Assignment operator 赋值运算符" },
+    { source_block_key: "next-heading", markdown: "## Exercises" },
+    { source_block_key: "exercise", markdown: "Translate this ordinary English instruction." }
+  ];
+  assert.deepEqual([...translationLiteralBlockKeys(glossary)], ["glossary-entry"]);
+  const request = {
+    schema_version: "progressive-reading.preprocess.request/v1",
+    contract_version: "1.0.0",
+    material: { markdown: "# References\n\n- P. Deitel, H. Deitel, Java: How to Program" },
+    source_type: "synthetic_bibliography",
+    source_metadata: { source_url: "https://example.invalid/bibliography", source_is_original: true },
+    user_instruction: "正文翻译为简体中文，书目记录原样保留。",
+    processing_options: { cleaning_mode: "source_translation", translation_target_language: "zh-CN" }
+  };
+  const producer = {
+    async generate(payload) {
+      return {
+        provider: "synthetic",
+        model: "bibliography-preservation-v1",
+        usage: null,
+        output: {
+          cleaned_blocks: [
+            { source_block_key: payload.blocks[0].source_block_key, markdown: "# 参考文献" },
+            { source_block_key: payload.blocks[1].source_block_key, markdown: payload.blocks[1].markdown }
+          ],
+          judgments: {
+            value: { level: "medium", reason: "验证书目保真。" },
+            density: { level: "low", reason: "仅包含书目记录。" },
+            continue_reading: { level: 1, reason: "用于核对来源。" }
+          },
+          insights: [],
+          translation: { is_bilingual: false, alignments: [] }
+        }
+      };
+    }
+  };
+  const result = await processMaterial(request, { producer });
+  assert.equal(result.status, "completed");
+  assert.match(result.artifacts.reading_markdown, /P\. Deitel, H\. Deitel, Java: How to Program/u);
+});
+
+test("source translation preserves English GFM tables as protected atomic blocks", async () => {
+  const table = "| Name | Count |\n| --- | ---: |\n| Alpha | 2 |";
+  const request = {
+    schema_version: "progressive-reading.preprocess.request/v1",
+    contract_version: "1.0.0",
+    material: { markdown: `# Data table\n\n${table}` },
+    source_type: "synthetic_table_translation",
+    source_metadata: { source_url: "https://example.invalid/table", source_is_original: true },
+    user_instruction: "正文翻译为简体中文，表格原样保护。",
+    processing_options: { cleaning_mode: "source_translation", translation_target_language: "zh-CN" }
+  };
+  const producer = {
+    async generate(payload) {
+      return {
+        provider: "synthetic",
+        model: "table-preservation-v1",
+        usage: null,
+        output: {
+          cleaned_blocks: [
+            { source_block_key: payload.blocks[0].source_block_key, markdown: "# 数据表" },
+            { source_block_key: payload.blocks[1].source_block_key, markdown: payload.blocks[1].markdown }
+          ],
+          judgments: {
+            value: { level: "medium", reason: "验证表格保真。" },
+            density: { level: "low", reason: "仅包含一个表格。" },
+            continue_reading: { level: 1, reason: "用于查看表格。" }
+          },
+          insights: [],
+          translation: { is_bilingual: false, alignments: [] }
+        }
+      };
+    }
+  };
+  const result = await processMaterial(request, { producer });
+  assert.equal(result.status, "completed");
+  assert.match(result.artifacts.reading_markdown, /\| Name \| Count \|/u);
 });
 
 test("translation restoration preserves display-math dollar delimiters literally", () => {
@@ -802,8 +1028,8 @@ test("deterministic normalization preserves fenced-code whitespace exactly", asy
   assert.equal(result.status, "completed");
   assert.equal(codeBlock.markdown, code);
   assert.equal(codeBlock.source_hash, codeBlock.output_hash);
-  assert.equal(result.receipt.processor_version, "1.10.7");
-  assert.equal(result.receipt.prompt_version, "source-translation-v2.2-five-level-judgments");
+  assert.equal(result.receipt.processor_version, PROCESSOR_VERSION);
+  assert.equal(result.receipt.prompt_version, "source-translation-v2.2-five-level-judgments:" + GUIDE_COVERAGE_VERSION);
 });
 
 test("deterministic oral-noise normalization removes only known conversation mechanics", () => {

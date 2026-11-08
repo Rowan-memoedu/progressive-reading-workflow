@@ -36,6 +36,20 @@ def _write_epub(path: Path, entries: list[tuple[str, bytes]]) -> None:
 
 
 class ExtractEpubTests(unittest.TestCase):
+    def test_pretty_xhtml_collapses_inline_whitespace_but_preserves_code(self):
+        opf = b'''<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier>x</dc:identifier><dc:title>T</dc:title><dc:language>en</dc:language></metadata><manifest><item id="main" href="main.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="main"/></spine></package>'''
+        chapter = b'''<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Chapter 1</h1><p>Alpha
+          <span>beta</span>
+          gamma.</p><pre><code>if ready:
+    run()</code></pre></body></html>'''
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / 'pretty.epub'
+            _write_epub(source, [('OEBPS/content.opf', opf), ('OEBPS/main.xhtml', chapter)])
+            result = extract_epub(source, root / 'assets')
+            self.assertIn('Alpha beta gamma.', result['markdown'])
+            self.assertIn('if ready:\n    run()', result['markdown'])
+
     def test_explicit_spine_index_reads_original_position_only(self) -> None:
         opf = b"""<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier>x</dc:identifier><dc:title>T</dc:title><dc:language>en</dc:language></metadata>

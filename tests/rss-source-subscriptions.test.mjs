@@ -44,14 +44,18 @@ function fixtureRegistry() {
   };
 }
 
-test("validates and normalizes a project-local RSS subscription registry", async (t) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rss-subscriptions-"));
+test("derives the report registry only from the third Markdown region", async (t) => {
+  const fixtureRoot='D:/Artifacts/RSS-Routing-20260915/tests';await fs.mkdir(fixtureRoot,{recursive:true});
+  const root = await fs.mkdtemp(path.join(fixtureRoot, "rss-subscriptions-"));
   t.after(async () => fs.rm(root, { recursive: true, force: true }));
-  const configPath = path.join(root, "subscriptions.json");
-  await fs.writeFile(configPath, `${JSON.stringify(fixtureRegistry(), null, 2)}\n`, "utf8");
+  const configPath = path.join(root, "subscriptions.md");
+  await fs.writeFile(configPath,'```json\n{}\n```\n## ① 标准流程导入\n标准：https://standard.example/feed\n## ② 原文直接导入\n原文：https://original.example/feed\n## ③ 日报与周报\nAlpha Feed：https://example.test/feed?utm_source=config\n');
   const registry = await loadSubscriptionRegistry(configPath);
   assert.equal(registry.subscriptions[0].feed_url, "https://example.test/feed");
-  assert.equal(registry.subscriptions[0].user_instruction, "保留术语。");
+  assert.equal(registry.subscriptions.length,1);
+  assert.equal(registry.subscriptions[0].display_name,'Alpha Feed');
+  assert.equal(registry.subscriptions[0].fetch_fulltext,true);
+  await assert.rejects(loadSubscriptionRegistry(path.join(root,'old.json')),/three_section_markdown/);
 
   const schema = JSON.parse(await fs.readFile(path.join(projectRoot, "rss-source", "contracts", "subscriptions.v1.schema.json"), "utf8"));
   const ajv = new Ajv2020({ strict: false, allErrors: true });

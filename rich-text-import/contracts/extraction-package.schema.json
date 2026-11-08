@@ -24,9 +24,9 @@
       "type": "object",
       "required": ["format", "file_name", "mime_type", "sha256", "bytes", "copy_path"],
       "properties": {
-        "format": { "enum": ["pdf", "epub", "docx"] },
+        "format": { "enum": ["pdf", "epub", "docx", "txt"] },
         "file_name": { "type": "string", "minLength": 1 },
-        "mime_type": { "enum": ["application/pdf", "application/epub+zip", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"] },
+        "mime_type": { "enum": ["application/pdf", "application/epub+zip", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text/plain"] },
         "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "bytes": { "type": "integer", "minimum": 1 },
         "copy_path": { "type": "string", "minLength": 1 }

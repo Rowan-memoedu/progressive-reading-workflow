@@ -7,8 +7,11 @@
 
   const LEGACY_MODE_KEY = "localIrHighlightEnabled";
   const MODE_KEY = "localIrAuthoringMode";
+  const DOCK_POSITION_KEY = "localIrDockPosition";
   const MAX_PAGE_TEXT = 300000;
-  const MAX_HTML = 1000000;
+  const MAX_HTML = 4000000;
+  let importPollTimer = null;
+  let importPollRunning = false;
   const MAX_CONTEXT = 8000;
   const TYPE_LABELS = {
     highlight: "仅高亮",
@@ -35,6 +38,63 @@
   let toastTimer = null;
   let ui = null;
   let standardImportBusy = false;
+  let dockPosition = null;
+
+  function positionDock(value = dockPosition) {
+    if (!ui || !Number.isFinite(value?.x) || !Number.isFinite(value?.y)) return;
+    const rect = ui.dock.getBoundingClientRect();
+    const position = {
+      x: Math.max(8, Math.min(value.x, Math.max(8, window.innerWidth - rect.width - 8))),
+      y: Math.max(8, Math.min(value.y, Math.max(8, window.innerHeight - rect.height - 8)))
+    };
+    Object.assign(ui.dock.style, { left: `${position.x}px`, top: `${position.y}px`, right: "auto", bottom: "auto" });
+    return position;
+  }
+
+  function makeDockMovable(dock, handle) {
+    let drag = null;
+    const remember = () => {
+      dockPosition = positionDock();
+      if (dockPosition) chrome.storage.local.set({ [DOCK_POSITION_KEY]: dockPosition }, () => { void chrome.runtime.lastError; });
+    };
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || event.isPrimary === false) return;
+      event.preventDefault();
+      const rect = dock.getBoundingClientRect();
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: rect.left, top: rect.top };
+      dock.classList.add("is-dragging");
+      handle.setPointerCapture?.(event.pointerId);
+    });
+    window.addEventListener("pointermove", (event) => {
+      if (!drag || event.pointerId !== drag.id) return;
+      event.preventDefault();
+      dockPosition = positionDock({ x: drag.left + event.clientX - drag.x, y: drag.top + event.clientY - drag.y });
+    }, { passive: false });
+    const finish = (event) => {
+      if (!drag || event.pointerId !== drag.id) return;
+      const id = drag.id;
+      drag = null;
+      dock.classList.remove("is-dragging");
+      if (handle.hasPointerCapture?.(id)) handle.releasePointerCapture(id);
+      remember();
+    };
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+    handle.addEventListener("lostpointercapture", finish);
+    handle.addEventListener("keydown", (event) => {
+      const directions = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+      const direction = directions[event.key];
+      if (!direction) return;
+      event.preventDefault();
+      const rect = dock.getBoundingClientRect();
+      const step = event.shiftKey ? 40 : 10;
+      dockPosition = positionDock({ x: rect.left + direction[0] * step, y: rect.top + direction[1] * step });
+      remember();
+    });
+    window.addEventListener("resize", () => positionDock());
+    if (typeof ResizeObserver === "function") new ResizeObserver(() => positionDock()).observe(dock);
+    positionDock();
+  }
 
   function trimText(value, maxChars) {
     return String(value || "")
@@ -61,7 +121,7 @@
       node.id = "local-ir-browser-toast";
       document.documentElement.appendChild(node);
     }
-    node.className = `local-ir-browser-toast ${kind === "error" ? "is-error" : "is-ok"}`;
+    node.className = `local-ir-browser-toast ${kind === "error" ? "is-error" : kind === "warning" ? "is-warning" : "is-ok"}`;
     node.textContent = text;
     clearTimeout(toastTimer);
     toastTimer = timeoutMs > 0 ? setTimeout(() => node.remove(), timeoutMs) : null;
@@ -71,12 +131,15 @@
     const clone = document.documentElement.cloneNode(true);
     clone.querySelectorAll("#local-ir-browser-toast, #local-ir-browser-workbench").forEach((node) => node.remove());
     clone.querySelectorAll("mark.local-ir-browser-highlight").forEach((mark) => mark.replaceWith(...mark.childNodes));
+    clone.querySelectorAll("style,script:not([type^='math/tex'])").forEach(node => node.remove());
+    const html = `<!doctype html>\n${clone.outerHTML}`;
+    if (html.length > MAX_HTML) throw new Error("页面超过完整捕获上限，已停止导入以免截断公式和正文。");
     return {
       url: location.href,
       title: document.title || "",
       pageText: trimText(document.body?.innerText || "", MAX_PAGE_TEXT),
       sourceText: String(document.body?.textContent || "").slice(0, MAX_PAGE_TEXT),
-      html: trimText(`<!doctype html>\n${clone.outerHTML}`, MAX_HTML),
+      html,
       sourceType: "browser_page",
       sourceMetadata: {
         source_url: location.href,
@@ -251,13 +314,20 @@
     if (!summary) ui.status.textContent = "尚未初始化";
     else if (summary.status === "saved_locked") ui.status.textContent = `已保存并锁定 · ${summary.annotations} 条批注`;
     else if (summary.status === "completed_pending_archive") ui.status.textContent = `已完成阅读 · 待归档 · ${summary.annotations} 条批注`;
-    else if (summary.status === "submitting" && summary.submitMode === "standard_preprocess") ui.status.textContent = "正在标准化并导入本地…";
+    else if (summary.status === "submitting" && summary.submitMode === "standard_preprocess") {
+      const stages = { queued: "等待后台处理", capture_conversion: "正在提取正文与公式", workflow_routing: "正在确定处理步骤",
+        profile_translation: "正在翻译", reading_guide: "正在生成导读", spoken_to_written: "正在转为书面语", body_structuring: "正在整理正文", profile_standardization: "正在整理格式" };
+      ui.status.textContent = summary.lastError || `${stages[draft.importJob?.stage] || "正在导入"}…（可刷新页面）`;
+    }
     else if (summary.status === "submitting") ui.status.textContent = "正在保存…";
     else if (summary.status === "error") ui.status.textContent = `提交失败，已保留草稿 · ${summary.lastError || "unknown"}`;
     else ui.status.textContent = `未保存 v${summary.revision} · ${summary.annotations} 条批注 · ${summary.qaCards} 张卡`;
     const locked = Boolean(summary?.locked);
     const canReimport = summary?.status === "saved_locked";
     const submitting = summary?.status === "submitting";
+    ui.initializer.disabled = submitting;
+    ui.importLocal.disabled = submitting;
+    ui.status.title = ui.status.textContent;
     const retryStandardImport = summary?.status === "error" && summary.submitMode === "standard_preprocess";
     for (const button of [ui.processing, ui.cloze, ui.undo, ui.musing, ui.qa, ui.complete]) button.disabled = locked || submitting;
     ui.abandon.disabled = submitting;
@@ -266,6 +336,38 @@
     ui.importLocal.textContent = canReimport || retryStandardImport ? "重新导入" : submitting ? "导入中…" : "导入本地";
     ui.processing.classList.toggle("is-active", authoringMode === "processing");
     ui.cloze.classList.toggle("is-active", authoringMode === "cloze");
+    if (submitting && draft.importJob) scheduleImportPoll();
+    else { clearTimeout(importPollTimer); importPollTimer = null; }
+  }
+
+  function scheduleImportPoll() {
+    if (importPollTimer || importPollRunning) return;
+    importPollTimer = setTimeout(async () => {
+      importPollTimer = null;
+      importPollRunning = true;
+      try {
+        const response = await sendMessage({ type: "draft-get", url: location.href });
+        if (response.ok && response.draft) applyDraftUpdate(response.draft);
+      } catch {
+        if (draft?.status === "submitting") {
+          draft.lastError = "暂时无法查询进度，已保留任务，正在恢复连接…";
+          renderStatus();
+        }
+      } finally {
+        importPollRunning = false;
+        if (draft?.status === "submitting") scheduleImportPoll();
+      }
+    }, 1500);
+  }
+
+  function applyDraftUpdate(value) {
+    const wasImporting = draft?.status === "submitting" && draft?.submitMode === "standard_preprocess";
+    draft = value ? Core.normalizeDraft(value) : null;
+    if (wasImporting && draft?.status === "saved_locked") {
+      const warning = draft.receipt?.receipt?.quality_status === "warning" || draft.receipt?.warnings?.length;
+      showToast(warning ? "已导入阅读区；部分格式保留了原始表示，请查看导入记录。" : "译文和导读已按所选步骤完成，已导入本地阅读区。", warning ? "warning" : "ok", warning ? 8000 : 4200);
+    } else if (wasImporting && draft?.status === "error") showToast(`导入失败：${draft.lastError}`, "error", 8000);
+    renderStatus();
   }
 
   function closeDialog() {
@@ -434,9 +536,11 @@
     if (!draft.locked) await persistDraft();
     const standardize = options.mode === "standard_preprocess";
     const response = await sendMessage({
-      type: force ? "draft-resubmit" : standardize ? "draft-import-local" : "draft-submit",
+      type: standardize ? "draft-import-local" : force ? "draft-resubmit" : "draft-submit",
       url: location.href,
-      destination
+      destination,
+      force,
+      mode: options.mode
     });
     if (!response.ok) {
       const error = response.error || "unknown";
@@ -445,11 +549,24 @@
     }
     draft = Core.normalizeDraft(response.draft);
     renderStatus();
+    if (draft.status === "error") {
+      showToast(`导入失败：${draft.lastError}`, "error", 8000);
+      return { ok: false, error: draft.lastError };
+    }
+    if (response.pending || draft.status === "submitting") {
+      showToast("已提交后台处理，进度会持续显示；刷新或关闭页面后任务仍会继续。", "ok", 5000);
+      return { ok: true, draft, result: response.result || { status: "queued" }, pending: true };
+    }
     const resolvedDestination = draft.submitDestination === "completed" ? "completed" : "reading";
-    showToast(force
-      ? resolvedDestination === "completed" ? "已重新导入待归档区" : "已重新导入本地阅读区"
-      : standardize ? "已标准化并导入本地阅读区"
-        : destination === "completed" ? "已完成阅读并进入待归档区" : "已保存并锁定当前版本");
+    const qualityStatus = String(response.result?.receipt?.quality_status || "ready");
+    if (standardize && qualityStatus === "warning") {
+      showToast("已导入本地阅读区，但生成的 Markdown 有瑕疵，请复核。", "warning", 8000);
+    } else {
+      showToast(force
+        ? resolvedDestination === "completed" ? "已重新导入待归档区" : "已重新导入本地阅读区"
+        : standardize ? "已标准化并导入本地阅读区"
+          : destination === "completed" ? "已完成阅读并进入待归档区" : "已保存并锁定当前版本");
+    }
     return { ok: true, draft, result: response.result || null };
   }
 
@@ -479,7 +596,7 @@
     try {
       await initializeDraft({ authoring: false });
       showToast("正在调用标准接口加工并导入本地…", "ok", 0);
-      const submitted = await submit("reading", { mode: "standard_preprocess" });
+      const submitted = await submit("reading", { mode: "standard_preprocess", force: Boolean(draft?.locked) });
       if (!submitted.ok) throw new Error(submitted.error || "standard_import_failed");
       return submitted;
     } catch (error) {
@@ -487,7 +604,7 @@
       throw error;
     } finally {
       standardImportBusy = false;
-      setImportLaunchersDisabled(false);
+      setImportLaunchersDisabled(draft?.status === "submitting");
     }
   }
 
@@ -499,9 +616,15 @@
     const shadow = host.attachShadow({ mode: "open" });
     const style = document.createElement("style");
     style.textContent = `
-      :host{all:initial}[hidden]{display:none!important}.dock{position:fixed;right:18px;bottom:18px;z-index:2147483646;display:flex;align-items:center;gap:6px;padding:8px;background:#fff;border:1px solid #d0d5dd;border-radius:12px;box-shadow:0 8px 28px rgba(16,24,40,.18);font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#344054}.dock.is-compact{padding:6px}.controls{display:flex;align-items:center;gap:6px}.mode{font-weight:650}.mode.is-active{border-color:#1f5fbf;background:#eef4ff;color:#174a96}button{border:1px solid #c9d0dc;border-radius:7px;padding:6px 9px;background:#fff;color:#1d2939;cursor:pointer;font:inherit}button:hover,button.is-active{border-color:#1f5fbf;background:#eef4ff}button.initialize{background:#1f5fbf;color:#fff;border-color:#1f5fbf;font-weight:650}button.primary{background:#1f5fbf;color:#fff;border-color:#1f5fbf}button.complete{background:#067647;color:#fff;border-color:#067647}button.abandon{background:#d92d20;color:#fff;border-color:#d92d20}button.abandon:hover{background:#b42318;border-color:#b42318}button:disabled{opacity:.45;cursor:not-allowed}.status{max-width:210px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.overlay{display:none;position:fixed;inset:0;z-index:2147483647;background:rgba(16,24,40,.38);align-items:center;justify-content:center}.overlay.is-open{display:flex}.dialog{width:min(900px,92vw);max-height:84vh;overflow:auto;background:#fff;border-radius:14px;padding:18px;box-shadow:0 24px 64px rgba(16,24,40,.28);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#1d2939}.dialog h2{margin:0 0 14px;font-size:18px}.field{display:grid;gap:5px;margin:12px 0}.field span{font-weight:650}.field textarea{box-sizing:border-box;width:100%;min-height:92px;border:1px solid #c9d0dc;border-radius:8px;padding:9px;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.type-buttons,.dialog-actions{display:flex;flex-wrap:wrap;gap:7px}.dialog-actions{justify-content:flex-end;margin-top:16px}.qa-list{display:grid;gap:7px}.qa-list>div{display:flex;justify-content:space-between;gap:10px;padding:8px;border:1px solid #eaecf0;border-radius:7px}`;
+      :host{all:initial}[hidden]{display:none!important}.dock{position:fixed;right:18px;bottom:18px;z-index:2147483646;max-width:calc(100vw - 16px);box-sizing:border-box;display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:8px;background:#fff;border:1px solid #d0d5dd;border-radius:12px;box-shadow:0 8px 28px rgba(16,24,40,.18);font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#344054}.dock.is-compact{padding:6px}.controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px}.dock-handle{flex:0 0 18px;align-self:stretch;padding:2px 0;border-color:transparent;cursor:grab;touch-action:none;user-select:none;color:#667085}.dock.is-dragging,.dock.is-dragging .dock-handle{cursor:grabbing}.dock-handle:focus-visible{outline:2px solid #1f5fbf;outline-offset:2px}.mode{font-weight:650}.mode.is-active{border-color:#1f5fbf;background:#eef4ff;color:#174a96}button{border:1px solid #c9d0dc;border-radius:7px;padding:6px 9px;background:#fff;color:#1d2939;cursor:pointer;font:inherit}button:hover,button.is-active{border-color:#1f5fbf;background:#eef4ff}button.initialize{background:#1f5fbf;color:#fff;border-color:#1f5fbf;font-weight:650}button.primary{background:#1f5fbf;color:#fff;border-color:#1f5fbf}button.complete{background:#067647;color:#fff;border-color:#067647}button.abandon{background:#d92d20;color:#fff;border-color:#d92d20}button.abandon:hover{background:#b42318;border-color:#b42318}button:disabled{opacity:.45;cursor:not-allowed}.status{max-width:min(320px,50vw);white-space:normal;overflow-wrap:anywhere}.overlay{display:none;position:fixed;inset:0;z-index:2147483647;background:rgba(16,24,40,.38);align-items:center;justify-content:center}.overlay.is-open{display:flex}.dialog{width:min(900px,92vw);max-height:84vh;overflow:auto;background:#fff;border-radius:14px;padding:18px;box-shadow:0 24px 64px rgba(16,24,40,.28);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#1d2939}.dialog h2{margin:0 0 14px;font-size:18px}.field{display:grid;gap:5px;margin:12px 0}.field span{font-weight:650}.field textarea{box-sizing:border-box;width:100%;min-height:92px;border:1px solid #c9d0dc;border-radius:8px;padding:9px;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.type-buttons,.dialog-actions{display:flex;flex-wrap:wrap;gap:7px}.dialog-actions{justify-content:flex-end;margin-top:16px}.qa-list{display:grid;gap:7px}.qa-list>div{display:flex;justify-content:space-between;gap:10px;padding:8px;border:1px solid #eaecf0;border-radius:7px}`;
     const dock = document.createElement("div");
     dock.className = "dock";
+    const dragHandle = document.createElement("button");
+    dragHandle.className = "dock-handle";
+    dragHandle.type = "button";
+    dragHandle.textContent = "⋮⋮";
+    dragHandle.title = "拖动工具框；聚焦后可用方向键移动";
+    dragHandle.setAttribute("aria-label", "拖动工具框");
     const initializer = document.createElement("button");
     initializer.className = "initialize";
     initializer.textContent = "初始化加工";
@@ -545,8 +668,7 @@
     const abandon = makeButton("放弃阅读", () => void discardCurrentDraft().catch((error) => showToast(`放弃阅读失败：${error.message}`, "error", 8000)), "abandon");
     const status = document.createElement("span");
     status.className = "status";
-    controls.appendChild(status);
-    dock.append(initializer, importLocal, controls);
+    dock.append(dragHandle, initializer, importLocal, controls, status);
     const overlay = document.createElement("div");
     overlay.className = "overlay";
     const dialog = document.createElement("div");
@@ -555,6 +677,7 @@
     overlay.addEventListener("click", (event) => { if (event.target === overlay) closeDialog(); });
     shadow.append(style, dock, overlay);
     ui = { dock, initializer, importLocal, controls, processing, cloze, undo: undoButton, musing, qa, save, complete, abandon, status, overlay, dialog };
+    makeDockMovable(dock, dragHandle);
     renderStatus();
     return ui;
   }
@@ -643,7 +766,8 @@
     openAnnotation(id);
   }, true);
 
-  chrome.storage.local.get({ [MODE_KEY]: null, [LEGACY_MODE_KEY]: false }, async (data) => {
+  chrome.storage.local.get({ [MODE_KEY]: null, [LEGACY_MODE_KEY]: false, [DOCK_POSITION_KEY]: null }, async (data) => {
+    dockPosition = data[DOCK_POSITION_KEY];
     authoringMode = Core.normalizeAuthoringMode(data[MODE_KEY], Boolean(data[LEGACY_MODE_KEY]));
     if (data[MODE_KEY] !== authoringMode) chrome.storage.local.set({ [MODE_KEY]: authoringMode });
     const response = await sendMessage({ type: "draft-get", url: location.href });
@@ -656,9 +780,15 @@
   });
 
   chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName !== "local" || !changes[MODE_KEY]) return;
-    authoringMode = Core.normalizeAuthoringMode(changes[MODE_KEY].newValue);
-    renderStatus();
+    if (areaName !== "local") return;
+    if (changes[DOCK_POSITION_KEY]) {
+      dockPosition = changes[DOCK_POSITION_KEY].newValue;
+      positionDock();
+    }
+    if (changes[MODE_KEY]) {
+      authoringMode = Core.normalizeAuthoringMode(changes[MODE_KEY].newValue);
+      renderStatus();
+    }
   });
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -688,12 +818,12 @@
       if (message?.type === "context-import-progress") {
         const phase = String(message.phase || "started");
         const text = String(message.message || "正在导入到渐进阅读…");
-        showToast(text, phase === "failed" ? "error" : "ok", phase === "started" ? 0 : phase === "failed" ? 8000 : 4200);
+        showToast(text, phase === "failed" ? "error" : phase === "warning" ? "warning" : "ok", phase === "started" ? 0 : new Set(["failed", "warning"]).has(phase) ? 8000 : 4200);
         sendResponse({ ok: true });
         return;
       }
       if (message?.type === "draft-state") {
-        draft = message.draft ? Core.normalizeDraft(message.draft) : null;
+        applyDraftUpdate(message.draft);
         if (!draft) {
           mergeSelection = [];
           closeDialog();
@@ -708,5 +838,8 @@
     return true;
   });
 
-  document.addEventListener("mouseup", () => window.setTimeout(() => void captureSelection(), 35), true);
+  document.addEventListener("mouseup", (event) => {
+    if (isEditableNode(event.target)) return;
+    window.setTimeout(() => void captureSelection(), 35);
+  }, true);
 })();

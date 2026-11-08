@@ -1,0 +1,33 @@
+{
+  "schema": "progressive-reading.remnote-formal-archive-release/v1",
+  "version": "0.4.0",
+  "status": "button_handler_canary_passed_live_modal_pending",
+  "runtime_entry": "scripts/import-remnote-queue.mjs",
+  "dry_run_entry": "npm run remnote:archive:dry:json",
+  "test_entry": "npm run remnote:archive:check",
+  "canary_build_entry": "npm run remnote:archive:canary:build -- --run-id <unique-run-id>",
+  "canary_verify_entry": "npm run remnote:archive:canary:verify -- --run-id <unique-run-id>",
+  "verification": "remnote-formal-archive/VERIFICATION.md",
+  "contract": "remnote-formal-archive/README.md",
+  "producer_contract": "remnote-formal-archive/contracts/local-ir-producer-compatibility.v2.md",
+  "human_content_contract": "remnote-formal-archive/contracts/remnote-human-content-boundary.v1.md",
+  "package_schema": "remnote-formal-archive/schemas/local-ir-export-package.v2.schema.json",
+  "receipt_schema": "remnote-formal-archive/schemas/archive-receipt.v2.schema.json",
+  "rollback": "node scripts/import-remnote-queue.mjs --rollback-receipt <receipt.json> --json",
+  "zero_content_contract": {
+    "confirmation_schema": "progressive-reading.no-remnote-content-confirmation/v1",
+    "package_field": "localArchive.noRemnoteContentConfirmation",
+    "remote_mode": "no_remnote_content",
+    "remote_write_performed": false
+  },
+  "blockers": [
+    "rendered host confirmation modal requires installation-specific verification",
+    "receipt-to-plugin and sidecar final-state synchronization is not yet released"
+  ],
+  "runtime_policy": {
+    "engineering_thread_runtime_dependency": false,
+    "production_apply_allowed": false,
+    "dry_run_allowed": true,
+    "reason": "rendered live modal verification and receipt-to-plugin finalization are not yet released"
+  }
+}

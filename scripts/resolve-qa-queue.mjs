@@ -3,10 +3,11 @@ import { readdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
+import {loadBatchProducerConfig, requestProducerText} from '../standard-preprocessing/lib/producer.mjs';
 
 const DEFAULT_QUEUE_DIR = "RemNote 导出队列";
 const CONFIG_DIR = path.join(os.homedir(), "Documents", "New project");
-const REQUIRED_CONFIG = ["AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL"];
+const REQUIRED_CONFIG = ["AI_PRODUCER_BASE_URL", "DEEPSEEK_READING_API_KEY", "AI_PRODUCER_MODEL"];
 
 const args = parseArgs(process.argv.slice(2));
 const root = process.cwd();
@@ -40,7 +41,7 @@ async function main() {
     return;
   }
 
-  const config = await loadProducerConfig();
+  const config = await loadBatchProducerConfig();
   for (const item of tasks) {
     const result = await resolvePackageData(item.data, config);
     if (result.changed) await savePackage(item.filePath, item.data);
@@ -141,11 +142,17 @@ async function resolveCard(config, data, card) {
     ]
   };
 
+  if (config.AI_PRODUCER_PROVIDER === 'codex_exec') {
+    const raw = await requestProducerText(config, {
+      system:payload.messages[0].content, user:payload.messages[1].content
+    });
+    return parseJsonObject(raw.choices?.[0]?.message?.content || '');
+  }
   const response = await fetch(chatCompletionsUrl(config.AI_PRODUCER_BASE_URL), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${config.AI_PRODUCER_API_KEY}`
+      "Authorization": `Bearer ${config.DEEPSEEK_READING_API_KEY}`
     },
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(120000)

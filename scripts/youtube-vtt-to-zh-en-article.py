@@ -13,24 +13,12 @@ import urllib.request
 CONFIG_DIR = Path.home() / "Documents" / "New project"
 
 
-def load_config() -> dict[str, str]:
-    config: dict[str, str] = {}
-    for key in ("AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL"):
-        value = os.environ.get(key)
-        if value:
-            config[key] = value
-
-    if not all(config.get(key) for key in ("AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL")):
-        config_file = next(CONFIG_DIR.glob("DeepSeek API*.md"))
-        for line in config_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.startswith("AI_PRODUCER_") and "=" in line:
-                key, value = line.split("=", 1)
-                config.setdefault(key.strip(), value.strip())
-
-    for key in ("AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL"):
-        if not config.get(key):
-            raise RuntimeError(f"Missing {key}")
-    return config
+def load_config() -> dict:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'standard-preprocessing'))
+    from batch_transport import BatchClient
+    client = BatchClient()
+    return {'client':client, 'AI_PRODUCER_MODEL':client.model, 'AI_PRODUCER_BASE_URL':'codex_exec'}
 
 
 def clean_caption_line(line: str) -> str:
@@ -168,17 +156,7 @@ def call_deepseek(config: dict[str, str], batch: list[dict[str, str]], index: in
             },
         ],
     }
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {config['AI_PRODUCER_API_KEY']}",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=180) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    data = config['client'].raw(payload['messages'], temperature=payload['temperature'])
     content = data["choices"][0]["message"]["content"].strip()
     content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.S)
     parsed = json.loads(content)

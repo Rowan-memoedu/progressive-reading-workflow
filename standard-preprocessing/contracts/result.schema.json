@@ -19,17 +19,25 @@
   "properties": {
     "schema_version": { "const": "progressive-reading.preprocess.result/v1" },
     "contract_version": { "const": "1.0.0" },
-    "status": { "enum": ["completed", "completed_with_warnings", "quarantined", "failed", "idempotent_replay"] },
+    "status": { "enum": ["completed", "completed_with_warnings", "quarantined", "failed", "idempotent_replay", "needs_classification"] },
     "material_id": { "type": ["string", "null"], "minLength": 1 },
     "idempotency_key": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9._-]{1,128}$" },
-    "processing_state": { "enum": ["rendered", "degraded", "quarantined", "failed"] },
-    "translation_state": { "enum": ["not_translation", "translation_original_missing", "alignment_pending", "aligned", "generated_translation", "unknown"] },
+    "processing_state": { "enum": ["rendered", "degraded", "quarantined", "failed", "needs_classification"] },
+    "translation_state": { "enum": ["not_translation", "translation_original_missing", "alignment_pending", "aligned", "generated_translation", "unknown", "preserved_bilingual", "preserved_translation"] },
     "artifacts": { "$ref": "#/$defs/artifacts" },
     "source_metadata": { "$ref": "#/$defs/sourceMetadata" },
     "receipt": { "$ref": "#/$defs/receipt" },
     "errors": { "type": "array", "items": { "$ref": "#/$defs/error" } }
   },
   "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "needs_classification" } } },
+      "then": { "properties": { "processing_state": { "const": "needs_classification" }, "artifacts": { "maxProperties": 0 }, "receipt": { "required": ["workflow_route"], "properties": { "workflow_route": { "required": ["needs_classification", "missing_labels", "stages"], "properties": { "needs_classification": { "const": true }, "missing_labels": { "minItems": 1 }, "stages": { "maxItems": 0 } } } } } } }
+    },
+    {
+      "if": { "properties": { "artifacts": { "properties": { "semantic": { "type": "object", "required": ["judgments"], "properties": { "judgments": { "type": "null" } } } }, "required": ["semantic"] } } },
+      "then": { "properties": { "receipt": { "anyOf": [ { "required": ["cleaning_policy"], "properties": { "cleaning_policy": { "required": ["include_reading_guide"], "properties": { "include_reading_guide": { "const": false } } } } }, { "required": ["reading_guide"], "properties": { "reading_guide": { "required": ["status"], "properties": { "status": { "const": "failed" } } } } } ] }, "artifacts": { "properties": { "semantic": { "properties": { "insights": { "maxItems": 0 } } } } } } }
+    },
     {
       "if": { "properties": { "processing_state": { "const": "rendered" } } },
       "then": {
@@ -150,8 +158,8 @@
         "title": { "type": "string", "minLength": 1 },
         "description": {
           "type": "string",
-          "minLength": 60,
-          "$comment": "Runtime validation counts non-whitespace characters; JSON Schema minLength is only the structural lower bound."
+          "minLength": 1,
+          "$comment": "Nonempty generated content is required; prose length is advisory."
         },
         "target_block_key": { "type": "string", "minLength": 1 }
       },
@@ -161,8 +169,8 @@
       "type": "object",
       "required": ["judgments", "insights"],
       "properties": {
-        "judgments": { "$ref": "#/$defs/judgments" },
-        "insights": { "type": "array", "maxItems": 24, "items": { "$ref": "#/$defs/insight" } }
+        "judgments": { "anyOf": [{ "$ref": "#/$defs/judgments" }, { "type": "null" }] },
+        "insights": { "type": "array", "items": { "$ref": "#/$defs/insight" } }
       },
       "additionalProperties": false
     },
@@ -257,6 +265,7 @@
             "has_translation": { "type": "boolean" },
             "has_original": { "type": "boolean" },
             "requires_original_url": { "type": "boolean" },
+            "existing_translation_only": { "type": "boolean" },
             "original_url": { "type": ["string", "null"] }
           },
           "additionalProperties": false
@@ -295,6 +304,7 @@
       "type": "object",
       "required": ["mode", "preserve_source_voice", "forbid_visible_timestamps", "require_content_headings", "attribute_unverified_claims"],
       "properties": {
+        "include_reading_guide": { "type": "boolean" },
         "mode": { "enum": ["semantic_only", "source_voice_structuring", "lossless_spoken_to_written", "source_translation"] },
         "preserve_source_voice": { "type": "boolean" },
         "forbid_visible_timestamps": { "type": "boolean" },
@@ -354,7 +364,7 @@
       "required": ["version", "prompt_version", "skipped", "calls", "attempts", "call_ledger"],
       "properties": {
         "version": { "const": "workflow-router/v1" },
-        "prompt_version": { "enum": ["workflow-router-v1.0-concise", "workflow-router-v1.1-form-boundary", "workflow-router-v1.2-formal-content-boundary"] },
+        "prompt_version": { "enum": ["workflow-router-v1.0-concise", "workflow-router-v1.1-form-boundary", "workflow-router-v1.2-formal-content-boundary", "workflow-router-v1.3-demand-driven"] },
         "skipped": { "type": "boolean" },
         "reason": { "type": "string", "minLength": 1 },
         "provider": { "type": "string", "minLength": 1 },
@@ -373,6 +383,8 @@
         "processor_version": { "type": "string", "minLength": 1 },
         "prompt_version": { "type": "string", "minLength": 1 },
         "cleaning_policy": { "$ref": "#/$defs/cleaningPolicy" },
+        "reading_guide": { "type": "object", "required": ["status", "calls"], "properties": { "status": { "enum": ["skipped", "generated", "failed"] }, "calls": { "type": "integer", "minimum": 0 }, "reason": { "type": "string" }, "decision": { "type": "object" } }, "additionalProperties": false },
+        "body_refinement": { "type": "object" },
         "material_id": { "type": "string", "minLength": 1 },
         "idempotency_key": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$" },
         "created_at": { "type": "string", "minLength": 1 },
@@ -433,9 +445,13 @@
             "content_profile": { "$ref": "#/$defs/routingDecision" },
             "source_language": { "$ref": "#/$defs/routingDecision" },
             "translation_required": { "type": "boolean" },
+            "plan": { "type": ["object", "null"] },
+            "needs_classification": { "type": "boolean" },
+            "missing_labels": { "type": "array", "items": { "type": "string" } },
+            "classification_reason": { "type": ["string", "null"] },
             "original_placement": { "const": "after_translation" },
             "classifier": { "$ref": "#/$defs/workflowClassifier" },
-            "stages": { "type": "array", "minItems": 1, "items": { "type": "object" } }
+            "stages": { "type": "array", "items": { "type": "object" } }
           },
           "additionalProperties": false
         },

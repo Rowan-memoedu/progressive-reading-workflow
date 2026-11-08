@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>订阅管理 · 渐进阅读</title><link rel="stylesheet" href="/subscriptions/style.css"><script type="module" src="/subscriptions/app.mjs"></script></head>
+<body>
+<main>
+  <header><div><p class="eyebrow">渐进阅读 / 订阅</p><h1>订阅与阅读安排</h1><p class="intro">在这里管理来源和处理方式，在 Markdown 日报、周报中选择想读的内容。</p></div><nav aria-label="页面导航"><a href="/import">链接导入</a><a href="#reports">日报与周报</a></nav></header>
+  <p id="health" class="notice" role="status">正在读取订阅状态…</p>
+  <p id="message" role="status" aria-live="polite"></p>
+  <p id="zhihu-validation" class="hint" hidden></p>
+  <section class="section" aria-labelledby="sources-title">
+    <div class="section-head"><div><h2 id="sources-title">订阅来源</h2><p class="hint">在编辑中设置接收范围。扩大范围后，下次检查会补收来源仍可取得的内容。</p></div><button id="add" type="button">添加订阅</button></div>
+    <div id="sources" class="source-list" aria-live="polite"><p>正在加载…</p></div>
+  </section>
+  <section class="section editor" id="editor" aria-labelledby="editor-title" hidden>
+    <div class="section-head"><h2 id="editor-title">添加订阅</h2><button class="secondary" id="cancel" type="button">取消</button></div>
+    <form id="source-form">
+      <div class="form-grid">
+        <label>名称<input id="name" name="name" required maxlength="160" autocomplete="off"></label>
+        <label>来源类型<select id="kind" name="kind"><option value="rss">RSS / Atom</option><option value="bilibili_video">B 站多 P 视频</option><option value="bilibili_collection">B 站合集</option><option value="zhihu_author">知乎作者</option><option value="zhihu_column">知乎专栏</option></select></label>
+        <label class="wide">来源链接<input id="url" name="url" type="url" required placeholder="https://" aria-describedby="url-hint" autocomplete="off"><span id="url-hint" class="hint">填写 RSS 或 Atom 订阅地址。</span></label>
+        <label>处理方式<select id="mode" name="mode"><option value="standard_preprocess">标准流程，自动入库</option><option value="original_text">提取原文，自动入库</option><option value="reports" selected>日报 / 周报，勾选后入库</option></select></label>
+        <label>阅读区内的目录<input id="destination" name="destination" value="RSS" required placeholder="例如：RSS 或 视频/某课程"></label>
+        <label>接收范围<select id="history_mode" name="history_mode" aria-describedby="scope-hint"><option value="default">沿用现有范围</option><option value="since">设定最早时间</option><option value="all">不限时间</option></select></label>
+        <label id="earliest-field" hidden>最早发布日期<input id="earliest_date" name="earliest_date" type="date" aria-describedby="scope-hint"></label>
+        <p class="hint wide" id="scope-hint"></p>
+      </div>
+      <p id="mode-hint" class="hint"></p>
+      <label class="check"><input id="enabled" type="checkbox" checked>启用此订阅</label>
+      <p id="form-error" class="error" role="alert"></p>
+      <div class="actions"><button id="save" type="submit">保存订阅</button><span class="hint">保存后从下一次来源检查开始生效，也可手动检查。</span></div>
+    </form>
+  </section>
+  <section class="section" id="conflict-section" aria-labelledby="conflict-title" hidden><h2 id="conflict-title">需要选择处理方式</h2><p class="hint">同一材料来自不同订阅且模式冲突。选择一次后继续入队，其余材料正常处理。</p><div id="conflicts"></div></section>
+  <div class="columns">
+    <section class="section" aria-labelledby="schedule-title"><h2 id="schedule-title">运行安排</h2><p class="hint">北京时间。每个来源周期会重试堵塞项。队列持续处理，不设每日篇数上限。</p><dl id="schedule"></dl><div class="actions" id="run-buttons"><button class="secondary" data-run="rss" type="button">检查 RSS</button><button class="secondary" data-run="bilibili" type="button">检查 B 站</button><button class="secondary" data-run="zhihu" type="button">检查知乎</button></div><p id="source-run-status" class="run-status hint" role="status" hidden></p><p class="hint">知乎作者与专栏使用现有登录快照，访问受限时在这里显示原因。</p></section>
+    <section class="section" id="reports" aria-labelledby="reports-title"><div class="section-head"><h2 id="reports-title">日报与周报</h2></div><p class="hint">点击“编辑”会打开 Markdown 原文件。每条只勾选一项，保存后自动入队。未勾选或多选的条目会在新一期重新提供空白选框。</p><div class="actions"><button class="secondary" data-run="daily" type="button">生成日报</button><button class="secondary" data-run="weekly" type="button">生成周报</button></div><p id="report-run-status" class="run-status hint" role="status" hidden></p><ul id="report-list"></ul></section>
+  </div>
+  <section class="section" aria-labelledby="queue-title"><div class="section-head"><h2 id="queue-title">队列与运行记录</h2><div class="actions"><button class="secondary" data-run="retry" type="button">重试堵塞项</button><button id="refresh" class="secondary" type="button">刷新状态</button></div></div><p id="retry-run-status" class="run-status hint" role="status" hidden></p><p id="queue-summary" class="hint"></p><div id="queue"></div><details id="job-history"><summary>最近的任务</summary><ol id="jobs"></ol></details></section>
+  <footer>停用订阅会停止接收新内容，已有正文、批注和选择记录保留。</footer>
+</main>
+</body></html>

@@ -23,7 +23,7 @@ from lxml import etree
 _CONTAINER_PATH = "META-INF/container.xml"
 _EPUB_NS = "http://www.idpf.org/2007/ops"
 EXTRACTOR_NAME = "rich-text-import.epub"
-EXTRACTOR_VERSION = "0.1.0"
+EXTRACTOR_VERSION = "0.2.0"
 _BLOCK_TAGS = {
     "address",
     "article",
@@ -178,6 +178,9 @@ def _extract_nav_toc(
         try:
             target_path = _resolve_archive_path(nav_path, href)
             entry["source_path"] = target_path
+            fragment = unquote(urlsplit(href).fragment)
+            if fragment:
+                entry["fragment"] = fragment
             if target_path in chapter_anchor_by_path:
                 entry["chapter_anchor"] = chapter_anchor_by_path[target_path]
         except ValueError:
@@ -206,6 +209,9 @@ def _extract_ncx_toc(
         try:
             target_path = _resolve_archive_path(ncx_path, href)
             entry["source_path"] = target_path
+            fragment = unquote(urlsplit(href).fragment)
+            if fragment:
+                entry["fragment"] = fragment
             if target_path in chapter_anchor_by_path:
                 entry["chapter_anchor"] = chapter_anchor_by_path[target_path]
         except ValueError:
@@ -278,7 +284,11 @@ class _MarkdownRenderer:
 
     def _inline(self, node: etree._Element) -> str:
         tag = _local_name(node)
+        # XHTML formatting whitespace is collapsed by readers, except pre/code.
+        preserve = any(_local_name(parent) in {"pre", "code"} for parent in [node, *node.iterancestors()])
         prefix = node.text or ""
+        if not preserve:
+            prefix = re.sub(r"[\t\r\n ]+", " ", prefix)
         children = "".join(self._render_inline_child(child) for child in node)
         content = prefix + children
         if tag == "a":
@@ -301,7 +311,10 @@ class _MarkdownRenderer:
 
     def _render_inline_child(self, child: etree._Element) -> str:
         rendered = self._inline(child)
-        return rendered + (child.tail or "")
+        tail = child.tail or ""
+        if not any(_local_name(parent) in {"pre", "code"} for parent in child.iterancestors()):
+            tail = re.sub(r"[\t\r\n ]+", " ", tail)
+        return rendered + tail
 
     def _image_markdown(self, node: etree._Element) -> str:
         src = node.get("src", "")
@@ -344,6 +357,17 @@ class _MarkdownRenderer:
             level = int(tag[1])
             return f"{anchor}{'#' * level} {_element_text(node)}\n\n"
         if tag == "p":
+            class_names = (node.get("class") or "").split()
+            heading_level = next(
+                (
+                    int(match.group(1))
+                    for class_name in class_names
+                    if (match := re.fullmatch(r"heading[-_ ]?([1-6])", class_name, re.I))
+                ),
+                None,
+            )
+            if heading_level is not None:
+                return f"{anchor}{'#' * heading_level} {_element_text(node)}\n\n"
             body = self._inline(node).strip()
             return f"{anchor}{body}\n\n" if body or anchor else ""
         if tag == "figure":
@@ -731,6 +755,15 @@ def extract_epub(
                         + ", ".join(repr(item) for item in unresolved_toc)
                     )
             metadata["toc_kind"] = toc_kind
+            for entry in toc_entries:
+                source_path = entry.get("source_path")
+                fragment = entry.get("fragment")
+                if source_path and fragment:
+                    target_anchor = element_anchor_by_key.get((source_path, fragment))
+                    if target_anchor:
+                        entry["target_anchor"] = target_anchor
+                elif source_path in chapter_anchor_by_path:
+                    entry["target_anchor"] = chapter_anchor_by_path[source_path]
             metadata["toc"] = toc_entries
             metadata["selected_chapter_has_toc_entry"] = bool(toc_entries)
             metadata["chapter_selection"] = selection_mode

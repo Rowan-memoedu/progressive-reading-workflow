@@ -20,6 +20,7 @@ import {
 import { SyntheticProducer } from "../test-support/synthetic-producer.mjs";
 import { preprocessBrowserCapture } from "../integrations/browser-capture.mjs";
 import { preprocessNetworkMarkdown } from "../integrations/network-import.mjs";
+import { verifyChapterPublication } from "../../scripts/import-wiki-chapters.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const standardRoot = path.resolve(here, "..");
@@ -61,7 +62,7 @@ test("network and browser adapters call the same validated interface", async () 
     cacheDir: false
   });
   assert.equal(isReadyResult(network.result), true);
-  assert.equal(networkProducer.lastPayload.cleaning_policy.mode, "source_voice_structuring");
+  assert.equal(networkProducer.lastPayload.cleaning_policy.mode, "semantic_only");
 
   const browserProducer = new SyntheticProducer();
   const browser = await preprocessBrowserCapture({
@@ -72,12 +73,12 @@ test("network and browser adapters call the same validated interface", async () 
   });
   assert.equal(isReadyResult(browser.result), true);
   assert.equal(browserProducer.lastPayload.source_type, "browser_capture_markdown");
-  assert.equal(browserProducer.lastPayload.cleaning_policy.mode, "source_voice_structuring");
+  assert.equal(browserProducer.lastPayload.cleaning_policy.mode, "semantic_only");
   assert.equal(browser.result.receipt.workflow_route.input_form.value, "written");
-  assert.equal(browser.result.receipt.workflow_route.input_form.method, "request_override");
+  assert.equal(browser.result.receipt.workflow_route.input_form.method, "source_metadata");
 });
 
-test("browser adapter reruns a degraded workflow and bypasses its cached review result", async () => {
+test("browser adapter leaves bounded retries to stages without rerunning the whole workflow", async () => {
   const invalid = new SyntheticProducer({ invalid: true });
   const valid = new SyntheticProducer();
   const producer = {
@@ -102,10 +103,10 @@ test("browser adapter reruns a degraded workflow and bypasses its cached review 
     outputDir: path.join(root, "run"),
     cacheDir: path.join(root, "cache")
   });
-  assert.equal(isReadyResult(run.result), true);
-  assert.equal(producer.calls, 4);
-  assert.deepEqual(run.workflow_attempts.map((attempt) => attempt.processing_state), ["degraded", "rendered"]);
-  assert.equal(run.workflow_attempts[1].attempt, 2);
+  assert.equal(isReadyResult(run.result), false);
+  assert.equal(producer.calls, 3);
+  assert.deepEqual(run.workflow_attempts.map((attempt) => attempt.processing_state), ["degraded"]);
+  assert.equal(run.result.receipt.reading_guide.status, "failed");
 });
 
 test("programmatic interface validates, writes committed artifacts, removes stale alternates, and replays idempotently", async () => {
@@ -185,6 +186,41 @@ test("publisher writes one flat Markdown file and relocates relative image asset
   await assert.rejects(fs.stat(path.join(root, "阅读区", "PDF", "带图片材料", "reading.md")), { code: "ENOENT" });
 });
 
+test("translated publication folds only the original and preserves source checks and old replays", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "pr-original-fold-"));
+  const source = "    indentedCode()\n\n# Source heading\n\n> Existing quotation\n\n- Item\n  - Nested item\n\n```js\nconst value = 1;\n```\n\n$$x^2$$\n\n[Reference](https://example.invalid/source)";
+  const prefix = "# Reading\n\n## 正文\n\n完整译文保持不变。\n\n---\n\n## 原文\n\n";
+  const expanded = prefix + source + "\n";
+  const result = {
+    status: "completed", processing_state: "rendered", translation_state: "generated_translation",
+    material_id: "mat-original-fold", idempotency_key: "idem-original-fold",
+    artifacts: { target_zone: "local-ir-reading", reading_markdown: expanded, semantic: { judgments: null, insights: [] } },
+    receipt: { cleaning_policy: { include_reading_guide: false } }
+  };
+  const before = structuredClone(result);
+  const publishPath = path.join(root, "new.md");
+  const publication = await publishReadingArtifact(result, { publishPath });
+  const published = await fs.readFile(publishPath, "utf8");
+  assert.ok(published.startsWith(prefix + "> [!quote]- 原文\n"));
+  const quoted = published.slice((prefix + "> [!quote]- 原文\n").length).trimEnd();
+  assert.equal(quoted.split("\n").map(line => line.replace(/^> ?/u, "")).join("\n"), source);
+  assert.deepEqual(result, before);
+  const verified = verifyChapterPublication({ result, request: { material: { markdown: source } }, publication, markdown: published, sourceMarkdown: source });
+  assert.equal(verified.original_complete, true);
+  assert.throws(() => verifyChapterPublication({ result, request: { material: { markdown: source } }, publication, markdown: published.replace("Existing quotation", "Missing"), sourceMarkdown: source }), /published_original_incomplete/u);
+  const replay = await publishReadingArtifact(result, { publishPath });
+  assert.equal(replay.markdown.sha256, publication.markdown.sha256);
+  const legacyPath = path.join(root, "existing-expanded.md");
+  await fs.writeFile(legacyPath, expanded);
+  await publishReadingArtifact(result, { publishPath: legacyPath });
+  assert.equal(await fs.readFile(legacyPath, "utf8"), expanded);
+  for (const translation_state of ["not_translation", "bilingual", "unknown"]) {
+    const untouchedPath = path.join(root, `${translation_state}.md`);
+    await publishReadingArtifact({ ...result, translation_state }, { publishPath: untouchedPath });
+    assert.equal(await fs.readFile(untouchedPath, "utf8"), expanded);
+  }
+});
+
 test("publisher fails closed on a conflicting flat Markdown target", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "pr-preprocess-publish-conflict-"));
   const publishPath = path.join(root, "阅读区", "Epub", "冲突材料.md");
@@ -227,6 +263,54 @@ test("publisher removes source-layer markers while preserving intentional Local 
   assert.equal(sanitized.report.internal_links_rewritten, 1);
 });
 
+test("publisher brackets relocated image destinations with whitespace or parentheses", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "pr-image-destination-"));
+  const assetSource = path.join(root, "source-assets");
+  await fs.mkdir(assetSource, { recursive: true });
+  const imageBytes = Buffer.from("source-image-content");
+  await fs.writeFile(path.join(assetSource, "figure.png"), imageBytes);
+  const result = {
+    status: "completed", processing_state: "rendered", material_id: "image-path-fixture",
+    idempotency_key: "image-path-fixture", translation_state: "not_translation",
+    receipt: {}, errors: [],
+    artifacts: { target_zone: "local-ir-reading", reading_markdown: "# Fixture\n\n![Figure](assets/figure.png)\n" }
+  };
+  for (const title of ["Field notes", "独立例子(草稿)"]) {
+    const publication = await publishReadingArtifact(result, {
+      publishPath: path.join(root, "阅读区", title + ".md"), assetSourceDir: assetSource
+    });
+    const markdown = await fs.readFile(publication.markdown.path, "utf8");
+    assert.ok(markdown.includes(`![Figure](<_assets/${title}/figure.png>)`));
+    assert.deepEqual(await fs.readFile(publication.assets[0].published_path), imageBytes);
+    const replay = await publishReadingArtifact(result, {
+      publishPath: publication.markdown.path, assetSourceDir: assetSource
+    });
+    assert.equal(replay.markdown.sha256, publication.markdown.sha256);
+  }
+});
+
+test("publisher preserves image titles separately from balanced destinations", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "pr-image-title-"));
+  const source = path.join(root, "source");
+  await fs.mkdir(source, { recursive: true });
+  const bytes = Buffer.from("independent-image-title-fixture");
+  await fs.writeFile(path.join(source, "figure(2).png"), bytes);
+  for (const [index, syntax] of [
+    '![Figure](assets/figure(2).png "Caption (detail)")',
+    "![Figure](<assets/figure(2).png> 'Another caption')",
+    '![Figure](assets/figure(2).png (Image title))'
+  ].entries()) {
+    const result = { status: "completed", processing_state: "rendered", material_id: "title-fixture", idempotency_key: "title-fixture", translation_state: "not_translation", receipt: {}, errors: [],
+      artifacts: { target_zone: "local-ir-reading", reading_markdown: `# Images\n\n${syntax}\n\n\`\`\`markdown\n${syntax}\n\`\`\`\n` } };
+    const publication = await publishReadingArtifact(result, { publishPath: path.join(root, `Article ${index}.md`), assetSourceDir: source });
+    const markdown = await fs.readFile(publication.markdown.path, "utf8");
+    assert.ok(markdown.includes(syntax.replace(/(?:<)?assets\/figure\(2\)\.png>?/u, `<_assets/Article ${index}/figure(2).png>`)));
+    assert.ok(markdown.includes(`\`\`\`markdown\n${syntax}\n\`\`\``));
+    assert.equal(publication.assets.length, 1);
+    assert.deepEqual(await fs.readFile(publication.assets[0].published_path), bytes);
+  }
+});
+
 test("cleanliness gate rejects Pandoc and raw OOXML leakage outside code fences", () => {
   const validation = validatePublishedMarkdownCleanliness("::: note\n正文\n:::\n<w:p>leak</w:p>\n");
   assert.equal(validation.valid, false);
@@ -235,13 +319,15 @@ test("cleanliness gate rejects Pandoc and raw OOXML leakage outside code fences"
 
 test("doctor reports config provenance without exposing the API key", async () => {
   const original = {
+    provider: process.env.AI_PRODUCER_PROVIDER,
     base: process.env.AI_PRODUCER_BASE_URL,
-    key: process.env.AI_PRODUCER_API_KEY,
+    key: process.env.DEEPSEEK_READING_API_KEY,
     model: process.env.AI_PRODUCER_MODEL
   };
   const secret = "doctor-secret-must-not-appear";
+  process.env.AI_PRODUCER_PROVIDER = 'deepseek';
   process.env.AI_PRODUCER_BASE_URL = "https://api.example.invalid";
-  process.env.AI_PRODUCER_API_KEY = secret;
+  process.env.DEEPSEEK_READING_API_KEY = secret;
   process.env.AI_PRODUCER_MODEL = "fixture-model";
   try {
     const report = await getDoctorReport();
@@ -251,8 +337,9 @@ test("doctor reports config provenance without exposing the API key", async () =
     assert.equal(JSON.stringify(report).includes(secret), false);
   } finally {
     for (const [key, value] of Object.entries({
+      AI_PRODUCER_PROVIDER: original.provider,
       AI_PRODUCER_BASE_URL: original.base,
-      AI_PRODUCER_API_KEY: original.key,
+      DEEPSEEK_READING_API_KEY: original.key,
       AI_PRODUCER_MODEL: original.model
     })) {
       if (value === undefined) delete process.env[key];

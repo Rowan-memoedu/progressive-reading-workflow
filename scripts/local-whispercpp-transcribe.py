@@ -26,6 +26,8 @@ def run(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess
         text=True,
         encoding="utf-8",
         errors="ignore",
+        # Child console programs must stay silent even when Python has no console.
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip()

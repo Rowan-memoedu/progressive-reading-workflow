@@ -527,7 +527,7 @@ async function readProducerMarkdownConfig() {
 }
 
 export async function loadLearningProducerConfig() {
-  const keys = ["AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL"];
+  const keys = ["AI_PRODUCER_BASE_URL", "DEEPSEEK_READING_API_KEY", "AI_PRODUCER_MODEL"];
   const markdown = await readProducerMarkdownConfig();
   const config = {};
   for (const key of keys) config[key] = process.env[key] || await readWindowsUserEnv(key) || markdown[key] || "";
@@ -552,7 +552,7 @@ export async function callLearningProducer({ system, user }) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${config.AI_PRODUCER_API_KEY}`
+      Authorization: `Bearer ${config.DEEPSEEK_READING_API_KEY}`
     },
     body: JSON.stringify({
       model: config.AI_PRODUCER_MODEL,
