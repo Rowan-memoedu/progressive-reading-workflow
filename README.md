@@ -55,6 +55,8 @@ npm run preprocess -- --help
 
 ## 验证
 
+后续开发、分支同步与本机升级见 [开发与本机运行](docs/DEVELOPMENT.md)。
+
 ```powershell
 npm test
 npm run browser-highlight:check
