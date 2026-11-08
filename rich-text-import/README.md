@@ -69,7 +69,7 @@ node scripts/import-txt-book.mjs --request '.\imports\rich-text\<material-id>\re
 
 ```powershell
 $python = 'python'
-$env:PYTHONPATH = '<workflow-root>\rich-text-import\src'
+$env:PYTHONPATH = (Join-Path (Get-Location) 'rich-text-import/src')
 & $python -m rich_text_import <source.pdf|source.epub|source.docx|source.txt> --output '.\imports\rich-text\<material-id>' --json
 ```
 
