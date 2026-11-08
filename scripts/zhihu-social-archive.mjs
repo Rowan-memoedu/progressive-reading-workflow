@@ -407,7 +407,7 @@ export async function requestZhihuJson(url, {
   if (allowAnonymous && method !== "GET") throw new Error("zhihu_anonymous_read_only");
   const headers = {
     Accept: "application/json, text/plain, */*",
-    ...(columnRead ? { 'User-Agent': 'Mozilla/5.0' } : {}),
+    'User-Agent': columnRead ? 'Mozilla/5.0' : 'ProgressiveReading-LocalFetcher/1.0',
     ...(cookie ? { Cookie: cookie } : {})
   };
   if (/^\/api\/v3\/moments\//u.test(parsed.pathname)) headers["X-API-VERSION"] = "3.0.40";

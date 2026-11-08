@@ -242,24 +242,39 @@ export function zhihuAccess(root) {
 export async function discoverAuthor(source, options, request = requestZhihuJson) {
   const token = new URL(source.url).pathname.split('/').filter(Boolean).at(-1), items = [];
   for (const kind of ['answers','articles']) {
-    const endpoint = `/api/v4/members/${token}/${kind}`, visited = new Set();
+    const endpoint = `/api/v4/members/${token}/${kind}`, visited = new Set(), found = new Set();
+    let expectedTotal = null;
     let next = `https://www.zhihu.com${endpoint}?limit=20&offset=0&sort_by=created&include=data%5B*%5D.content,created,created_time,updated,updated_time`;
     while (next) {
-      const target = new URL(next);
-      if (target.origin !== 'https://www.zhihu.com' || target.pathname !== endpoint || target.username || target.password || visited.has(next) || visited.size >= 1000) throw new Error('知乎作者分页不完整');
+      const target = new URL(next, 'https://www.zhihu.com');
+      if (!['http:','https:'].includes(target.protocol) || target.hostname !== 'www.zhihu.com' || target.port || target.pathname !== endpoint || target.username || target.password) throw new Error('知乎作者分页不完整');
+      // Zhihu returns HTTP pagination cursors even for HTTPS API requests.
+      // Upgrade only the expected author's endpoint before matching credentials.
+      target.protocol = 'https:'; target.hash = ''; target.searchParams.sort(); next = target.href;
+      if (visited.has(next) || visited.size >= 1000) throw new Error('知乎作者分页不完整');
       visited.add(next);
       const page = await request(next, options);
       if (!Array.isArray(page.data) || typeof page.paging?.is_end !== 'boolean') throw new Error('知乎作者列表格式异常');
+      if (page.paging.totals != null) {
+        const total = Number(page.paging.totals);
+        if (!Number.isSafeInteger(total) || total < 0 || (expectedTotal != null && total !== expectedTotal)) throw new Error('知乎作者列表总数异常或已变化');
+        expectedTotal = total;
+      }
+      const before = found.size;
       for (const value of page.data) {
-        if (!/^\d+$/u.test(String(value.id)) || (kind === 'answers' && !/^\d+$/u.test(String(value.question?.id)))) throw new Error('知乎内容身份无效');
+        const validId = id => /^\d+$/u.test(String(id)) && (typeof id === 'string' || Number.isSafeInteger(id));
+        if (!validId(value.id) || (kind === 'answers' && !validId(value.question?.id))) throw new Error('知乎内容身份无效');
+        found.add(String(value.id));
         items.push({ key: `zhihu:${kind}:${value.id}`, url: kind === 'answers' ? `https://www.zhihu.com/question/${value.question.id}/answer/${value.id}` : `https://zhuanlan.zhihu.com/p/${value.id}`,
           title: kind === 'answers' ? value.question.title : value.title, author: value.author?.name || source.name,
           published_at: value.created_time || value.created ? new Date((value.created_time || value.created) * 1000).toISOString() : null,
           revision: String(value.updated_time || value.updated || ''), html: value.content || null });
       }
+      if (page.data.length && found.size === before && !page.paging.is_end) throw new Error('知乎作者分页重复内容');
       if (!page.paging.is_end && (!page.data.length || !page.paging.next)) throw new Error('知乎作者列表缺少后续页');
       next = page.paging.is_end ? null : page.paging.next;
     }
+    if (expectedTotal != null && found.size !== expectedTotal) throw new Error(`知乎作者列表总数不完整：平台 ${expectedTotal}，实际 ${found.size}`);
   }
   return [...new Map(items.map(i => [i.url,i])).values()];
 }
