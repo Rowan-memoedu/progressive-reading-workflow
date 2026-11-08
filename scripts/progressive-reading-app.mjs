@@ -9,10 +9,22 @@ import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
-import "../browser-highlight-extension/draft-core.js";
-import { isReadyResult } from "../standard-preprocessing/index.mjs";
-import { preprocessBrowserCapture } from "../standard-preprocessing/integrations/browser-capture.mjs";
+import LocalIrDocumentCore from "../document-core/index.mjs";
+import { preprocessBrowserCapture, browserCaptureProcessingOptions } from "../standard-preprocessing/integrations/browser-capture.mjs";
+import { preprocessNetworkMarkdown } from "../standard-preprocessing/integrations/network-import.mjs";
 import { PROCESSOR_VERSION as standardPreprocessProcessorVersion } from "../standard-preprocessing/lib/core.mjs";
+import { GUIDE_COVERAGE_VERSION } from '../standard-preprocessing/lib/guide-coverage.mjs';
+import { loadProducerConfig as loadUnifiedProducerConfig, requestProducerText } from '../standard-preprocessing/lib/producer.mjs';
+import { classifyStandardImportQuality, readingDocumentPathCandidates } from "./standard-import-quality.mjs";
+import { htmlArticleToMarkdown } from "./browser-page-markdown.mjs";
+import { extractUrls, urlImportDedupeKey } from "./url-import-input.mjs";
+import { IMPORT_RULES, zhihuColumnIdentity } from "./import-rule-catalog.mjs";
+import { discoverZhihuColumn } from "./zhihu-column-import.mjs";
+import { assertLocalRequest, handleSubscriptions } from '../subscription-workflow/http.mjs';
+import { startSubscriptionWorker } from '../subscription-workflow/service.mjs';
+import { processCollectionTask } from "./collection-import.mjs";
+import { fetchYoutubeSubtitleDraft, youtubeVideoIdentity } from "./youtube-subtitle-import.mjs";
+import { LiveCookieSnapshot, defaultCookieDataRoot, COOKIE_SNAPSHOT_ENDPOINT, COOKIE_STATUS_ENDPOINT, safeError as safeCookieSnapshotError } from "./live-cookie-snapshot.mjs";
 import {
   BACKGROUND_FETCH_TRANSPORT,
   BrowserImportBroker,
@@ -71,7 +83,6 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const codeWorkflowRoot = path.resolve(__dirname, "..");
-const LocalIrDocumentCore = globalThis.LocalIrDraftCore;
 
 if (!LocalIrDocumentCore?.createDocumentState) {
   throw new Error("local_ir_document_core_unavailable");
@@ -112,14 +123,23 @@ const browserStateRoot = path.join(workflowRoot, ".local-ir", "browser-document-
 const browserPreprocessRoot = path.join(workflowRoot, ".local-ir", "browser-standard-preprocess");
 const importDestinationRoutesPath = path.join(workflowRoot, "config", "import-destination-routes.json");
 const importDestinationRoutes = await loadImportDestinationRoutes(importDestinationRoutesPath);
-const browserImportBroker = new BrowserImportBroker({ stateRoot: path.join(workflowRoot, ".local-ir", "browser-import-broker") });
+const requestedUrlImportConcurrency = Number(process.env.PROGRESSIVE_READING_URL_IMPORT_CONCURRENCY || 4);
+const URL_IMPORT_CONCURRENCY = Number.isFinite(requestedUrlImportConcurrency)
+  ? Math.max(1, Math.min(8, Math.floor(requestedUrlImportConcurrency)))
+  : 4;
+const browserImportBroker = new BrowserImportBroker({
+  stateRoot: path.join(workflowRoot, ".local-ir", "browser-import-broker"),
+  concurrency: URL_IMPORT_CONCURRENCY
+});
 let urlCookieConfig = loadDomainCookieMap(process.env);
 const chromeCookieJar = new ChromeCookieJar();
 const configuredCookieSnapshotPath = String(process.env[CHROME_COOKIE_SNAPSHOT_PATH_ENV] || "").trim();
+const liveCookieSnapshot = new LiveCookieSnapshot({ jar: chromeCookieJar, workflowRoot,
+  dataRoot: defaultCookieDataRoot(workflowRoot), explicitPath: configuredCookieSnapshotPath });
 const legacyRuntimeCookieReplacementEnabled = process.env.PROGRESSIVE_READING_ENABLE_LEGACY_COOKIE_SYNC === "true";
 const defaultPort = Number(process.env.PROGRESSIVE_READING_APP_PORT || 37829);
 const producerConfigDir = path.join(process.env.USERPROFILE || process.env.HOME || "", "Documents", "New project");
-const producerConfigKeys = ["AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL"];
+const producerConfigKeys = ["AI_PRODUCER_BASE_URL", "DEEPSEEK_READING_API_KEY", "AI_PRODUCER_MODEL"];
 const jobs = new Map();
 const browserCommitLocks = new Map();
 const backgroundImportRuns = new Map();
@@ -199,6 +219,7 @@ function cookieSyncErrorStatus(error) {
 }
 
 function importFailureHttpStatus(error) {
+  if (["required_translation_missing", "required_reading_guide_missing", "standard_preprocess_not_ready"].includes(error?.code)) return 422;
   const message = String(error?.message || error || "");
   return /^(invalid_|unsupported_|empty_|no_url_found|too_many_urls|standard_preprocess_not_ready_after_)/u.test(message)
     ? 422
@@ -321,60 +342,6 @@ function stripModelFences(text) {
     .trim();
 }
 
-function trimTrailingUrlPunctuation(value) {
-  let candidate = String(value || "").trim().replace(/[.,;:!?，。；：！？、]+$/g, "");
-  for (const [opening, closing] of [["(", ")"], ["[", "]"], ["{", "}"], ["（", "）"], ["【", "】"], ["「", "」"], ["《", "》"]]) {
-    while (candidate.endsWith(closing)) {
-      const openings = candidate.split(opening).length - 1;
-      const closings = candidate.split(closing).length - 1;
-      if (closings <= openings) break;
-      candidate = candidate.slice(0, -1);
-    }
-  }
-  return candidate;
-}
-
-function normalizeHttpUrl(value) {
-  try {
-    const parsed = new URL(trimTrailingUrlPunctuation(value));
-    if (!new Set(["http:", "https:"]).has(parsed.protocol)) return null;
-    parsed.hash = "";
-    return parsed.toString();
-  } catch {
-    return null;
-  }
-}
-
-function urlImportDedupeKey(value) {
-  try {
-    const parsed = new URL(value);
-    const trackingKeys = [];
-    parsed.searchParams.forEach((_item, key) => {
-      if (/^utm_/i.test(key) || /^(fbclid|gclid|mc_cid|mc_eid)$/i.test(key)) trackingKeys.push(key);
-    });
-    for (const key of trackingKeys) parsed.searchParams.delete(key);
-    parsed.searchParams.sort();
-    if (parsed.pathname.length > 1) parsed.pathname = parsed.pathname.replace(/\/+$/, "");
-    return parsed.toString();
-  } catch {
-    return value;
-  }
-}
-
-function extractUrls(text) {
-  const matches = String(text || "").match(/https?:\/\/[^\s<>"']+/gi) || [];
-  const seen = new Set();
-  const urls = [];
-  for (const raw of matches) {
-    const url = normalizeHttpUrl(raw);
-    const dedupeKey = url ? urlImportDedupeKey(url) : "";
-    if (!url || seen.has(dedupeKey)) continue;
-    seen.add(dedupeKey);
-    urls.push(url);
-  }
-  return urls;
-}
-
 function instructionFromText(text, urls) {
   let instruction = String(text || "");
   for (const url of urls) {
@@ -409,7 +376,7 @@ function fallbackIntent(instruction, urls, reason = "") {
     urlCount: urls.length,
     urlTypes: [...new Set(urls.map(classifyUrl))],
     processing: {
-      generateReadingGuide: !wantsNoGuide,
+      generateReadingGuide: wantsNoGuide ? false : null,
       cleanMarkdown: true,
       preserveOriginal: true,
       languageMode: wantsBilingual ? "zh_main_en_appendix" : "source_body_with_chinese_guide",
@@ -487,7 +454,7 @@ async function parseImportIntent({ instruction, urls }) {
     "- 可以导入用户直接提供的 URL。",
     "- 可以生成阅读前置卡。",
     "- 可以把微信和普通网页输出为阅读区 Markdown。",
-    "- 视频工作流当前暂停，不要承诺视频转写。",
+    "- YouTube 现成字幕已恢复导入；无字幕 ASR 和其他视频仍暂停，不要承诺自动转写。",
     "- 不绕过登录、验证码、权限墙。",
     "- AI 只负责解析意图和生成导读，文件写入由本地代码完成。",
     "",
@@ -499,27 +466,13 @@ async function parseImportIntent({ instruction, urls }) {
   ].join("\n");
 
   try {
-    const config = await loadProducerConfig();
-    const response = await fetch(chatCompletionsUrl(config.AI_PRODUCER_BASE_URL), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${config.AI_PRODUCER_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: config.AI_PRODUCER_MODEL,
-        temperature: 0,
-        messages: [
-          { role: "system", content: "你是本地导入工具的意图解析器，只输出可解析 JSON。" },
-          { role: "user", content: prompt }
-        ]
-      }),
-      signal: AbortSignal.timeout(120000)
+    const config = await loadUnifiedProducerConfig({requiredProvider:'codex_exec'});
+    const data = await requestProducerText(config, {
+      system: "你是本地导入工具的意图解析器，只输出可解析 JSON。",
+      user: prompt
     });
-    if (!response.ok) throw new Error(`api_${response.status}_${(await response.text()).slice(0, 300)}`);
-    const data = await response.json();
     const parsed = JSON.parse(stripModelFences(data?.choices?.[0]?.message?.content || ""));
-    return normalizeIntent({ ...parsed, source: "deepseek" }, instruction, urls);
+    return normalizeIntent({ ...parsed, source: "codex_exec" }, instruction, urls);
   } catch (error) {
     return fallbackIntent(instruction, urls, error.message);
   }
@@ -634,7 +587,10 @@ function parseSummary(stdout) {
 }
 
 function isSuccessfulImportItem(item) {
-  return item?.status === "imported" || item?.status === "partial" || item?.status === "idempotent_replay";
+  return item?.status === "imported"
+    || item?.status === "imported_with_warnings"
+    || item?.status === "partial"
+    || item?.status === "idempotent_replay";
 }
 
 function outputDetails(item) {
@@ -748,20 +704,8 @@ function pageTextToMarkdown(pageText) {
 
 function browserPageToMarkdown({ html, pageText, sourceUrl, title }) {
   if (html) {
-    try {
-      const dom = new JSDOM(html, { url: sourceUrl });
-      cleanBrowserCaptureDocument(dom.window.document);
-      const article = new Readability(dom.window.document).parse();
-      if (article?.content && article?.textContent?.trim().length >= 80) {
-        return {
-          method: "readability_html",
-          title: article.title || title,
-          markdown: absolutizeMarkdownLinks(browserTurndown.turndown(article.content).trim(), sourceUrl)
-        };
-      }
-    } catch {
-      // Fall back to page text below.
-    }
+    // A conversion error must not silently replace formulas with flattened text.
+    return htmlArticleToMarkdown({ html, sourceUrl, title });
   }
 
   const fallbackMarkdown = pageTextToMarkdown(pageText);
@@ -1076,14 +1020,22 @@ async function browserPreprocessProducer() {
   const { SyntheticProducer } = await import("../standard-preprocessing/test-support/synthetic-producer.mjs");
   if (mode === "synthetic") return new SyntheticProducer();
   if (mode === "synthetic-invalid") return new SyntheticProducer({ invalid: true });
+  if (mode === "synthetic-uncertain") return new SyntheticProducer({ uncertain: true });
   throw new Error(`unsupported_browser_preprocess_test_producer:${mode}`);
 }
 
-async function standardizeBrowserDraft(draft, parsedUrl, converted) {
+async function standardizeBrowserDraft(draft, parsedUrl, converted, onProgress) {
   const outputDir = path.join(browserPreprocessRoot, shortHash(parsedUrl.href));
   const cacheDir = path.join(browserPreprocessRoot, ".cache");
-  const run = await preprocessBrowserCapture({
+  const youtubeTranscript = draft.sourceMetadata?.source_type === 'youtube_video_transcript';
+  const preprocess = youtubeTranscript ? preprocessNetworkMarkdown : preprocessBrowserCapture;
+  const run = await preprocess({
     markdown: converted.markdown,
+    ...(youtubeTranscript ? {
+      sourceType: 'youtube_video_transcript',
+      spoken: true
+    } : {}),
+    processingOptions: { ...(youtubeTranscript ? { require_content_headings: true } : {}), ...(draft.processingOptions || {}) },
     sourceMetadata: {
       ...draft.sourceMetadata,
       source_url: String(draft.sourceMetadata?.source_url || parsedUrl.href),
@@ -1095,14 +1047,30 @@ async function standardizeBrowserDraft(draft, parsedUrl, converted) {
     userInstruction: draft.userInstruction,
     outputDir,
     cacheDir,
-    producer: await browserPreprocessProducer()
+    producer: await browserPreprocessProducer(),
+    onProgress
   });
-  if (!isReadyResult(run.result)) {
+  const quality = classifyStandardImportQuality(run.result);
+  if (run.result.status === "needs_classification") {
+    const error = new Error(run.result.receipt.workflow_route.classification_reason);
+    error.code = "needs_classification";
+    error.details = { missing_labels: run.result.receipt.workflow_route.missing_labels, preprocess_output_dir: outputDir };
+    throw error;
+  }
+  if (!quality.admissible) {
     const status = run.result?.status || "unknown";
     const state = run.result?.processing_state || "unknown";
     const zone = run.result?.artifacts?.target_zone || "unknown";
     const attempts = Math.max(1, Number(run.workflow_attempts?.length || 1));
-    throw new Error(`standard_preprocess_not_ready_after_${attempts}_workflows:${status}:${state}:${zone}`);
+    const missing = quality.critical_failures || [];
+    const stage = missing.includes("required_translation_missing") ? "profile_translation"
+      : missing.includes("required_reading_guide_missing") ? "reading_guide" : "preprocessing";
+    const reason = stage === "profile_translation" ? "未生成所要求的译文" : stage === "reading_guide" ? "未生成所要求的导读" : "正文处理未完成";
+    const error = new Error(`${reason}，未写入阅读区；可重试失败阶段。`);
+    error.code = missing[0] || "standard_preprocess_not_ready";
+    error.details = { stage, status, processing_state: state, target_zone: zone, attempts, preprocess_output_dir: outputDir,
+      cause: run.result.errors?.map(item => item.message).join("; ") || null };
+    throw error;
   }
   const rendered = String(run.result.artifacts.reading_markdown || "");
   if (!rendered.startsWith("---\n")) throw new Error("standard_preprocess_missing_frontmatter");
@@ -1112,12 +1080,13 @@ async function standardizeBrowserDraft(draft, parsedUrl, converted) {
   const markdown = updateFrontmatterFields(rendered, {
     source_url: String(draft.sourceMetadata?.source_url || parsedUrl.href),
     source_title: converted.title || draft.title,
-    import_method: "browser_standard_preprocess",
+    import_method: draft.sourceMetadata?.source_type === 'youtube_video_transcript' ? 'youtube_subtitle_standard_preprocess' : "browser_standard_preprocess",
     highlight_mode: "virtual_metadata",
     conversion_method: conversionMethod,
     browser_draft_id: draft.id,
     browser_draft_revision: Number(draft.revision || 0),
     browser_state_schema: "local-ir.document-state/v1",
+    processing_status: quality.quality_status,
     status: "imported"
   });
   return {
@@ -1131,7 +1100,13 @@ async function standardizeBrowserDraft(draft, parsedUrl, converted) {
     status: run.result.status,
     processingState: run.result.processing_state,
     targetZone: run.result.artifacts.target_zone,
-    workflowAttempts: run.workflow_attempts || []
+    qualityStatus: quality.quality_status,
+    readableWithWarnings: quality.readable_with_warnings,
+    warningCodes: quality.warning_codes,
+    workflowAttempts: run.workflow_attempts || [],
+    processingPlan: run.result.receipt.workflow_route?.plan,
+    readingGuide: run.result.receipt.reading_guide,
+    modelCalls: run.result.receipt.model.calls
   };
 }
 
@@ -1212,18 +1187,20 @@ async function migrateLegacyBrowserCompletedArtifacts() {
 
 async function writeBrowserDraftCommitUnlocked(rawBody, destination = "reading", options = {}) {
   const rawDraft = rawBody?.draft || {};
+  if (String(rawDraft.html || "").length > 4000000) throw new Error("page_snapshot_too_large:页面超过完整捕获上限，已停止导入以免截断内容。");
   const draft = {
     ...rawDraft,
     url: String(rawDraft.url || "").trim(),
     title: String(rawDraft.title || "").trim(),
     pageText: normalizeMarkdownText(rawDraft.pageText || "", 300000),
-    html: normalizeMarkdownText(rawDraft.html || "", 1000000),
+    html: normalizeMarkdownText(rawDraft.html || "", 4000000),
     annotations: Array.isArray(rawDraft.annotations) ? rawDraft.annotations : [],
     qaCards: Array.isArray(rawDraft.qaCards) ? rawDraft.qaCards : [],
     articleMusing: rawDraft.articleMusing || null,
     sourceType: String(rawDraft.sourceType || "browser_page"),
     sourceMetadata: rawDraft.sourceMetadata && typeof rawDraft.sourceMetadata === "object" ? rawDraft.sourceMetadata : {},
     userInstruction: String(rawDraft.userInstruction || ""),
+    processingOptions: { ...(rawBody?.processing_options || rawDraft.processingOptions || {}), ...(options.processingOptions || {}) },
     destinationFolder: normalizeRelativeDestinationFolder(rawDraft.destinationFolder || "")
   };
   let parsed;
@@ -1233,21 +1210,24 @@ async function writeBrowserDraftCommitUnlocked(rawBody, destination = "reading",
     throw new Error("invalid_url");
   }
   if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("unsupported_url_protocol");
-  if (!draft.html && !draft.pageText) throw new Error("empty_page_content");
+  const cachedRssMarkdown = options.cachedRssMarkdown;
+  if (!draft.html && !draft.pageText && !cachedRssMarkdown) throw new Error("empty_page_content");
 
-  const converted = browserPageToMarkdown({
+  const converted = cachedRssMarkdown
+    ? { markdown: cachedRssMarkdown, title: draft.title, method: "retained_rss_fulltext" }
+    : browserPageToMarkdown({
     html: draft.html,
     pageText: draft.pageText,
     sourceUrl: parsed.href,
     title: draft.title
   });
-  assertUrlImportBodyIntegrity(draft, converted);
-  const standardize = Boolean(options.standardize);
-  const resolvedDestination = standardize ? "reading" : destination;
+  if (!cachedRssMarkdown) assertUrlImportBodyIntegrity(draft, converted);
+  const standardize = options.standardize !== false;
+  const resolvedDestination = destination;
   const completed = resolvedDestination === "completed";
   const root = completed
     ? browserCompletedHighlightRoot
-    : standardize && draft.destinationFolder
+    : (standardize || draft.sourceType === 'url_import') && draft.destinationFolder
       ? readingDestinationRoot(draft.destinationFolder)
       : browserHighlightRoot;
   const documentStatus = completed ? "done" : "inbox";
@@ -1255,14 +1235,29 @@ async function writeBrowserDraftCommitUnlocked(rawBody, destination = "reading",
   await fs.mkdir(browserStateRoot, { recursive: true });
   const target = await browserDraftTarget(root, parsed.href, converted.title || draft.title);
   const metadataTarget = path.join(browserStateRoot, `${path.basename(target)}.browser-ir.json`);
+  if (standardize && draft.sourceType !== "url_import" && await pathExists(target)) {
+    const previous = await fs.readFile(metadataTarget, "utf8").then(JSON.parse).catch(() => null);
+    const contents = await fs.readFile(target);
+    if (!previous?.content?.markdownSha256 || createHash("sha256").update(contents).digest("hex") !== previous.content.markdownSha256) {
+      throw new Error("existing_article_changed_preserved:本地文章已有后续修改，已保留文章与批注，未覆盖。");
+    }
+  }
+  if (draft.sourceType === "url_import"
+    && (await pathExists(target) || await pathExists(metadataTarget))) {
+    throw new Error("existing_article_preserved_review_required");
+  }
   const preprocessing = standardize
-    ? await standardizeBrowserDraft(draft, parsed, converted)
+    ? await standardizeBrowserDraft(draft, parsed, converted, options.onProgress)
     : null;
-  const markdown = preprocessing?.markdown || browserDraftDocument({
+  const originalImport = !standardize && draft.sourceType === 'url_import';
+  const originalMarkdown = browserDraftDocument({
     draft: { ...draft, url: parsed.href },
     converted,
     documentStatus
   });
+  const markdown = preprocessing ? updateFrontmatterFields(preprocessing.markdown, { status: completed ? 'done' : 'imported' }) : (originalImport ? updateFrontmatterFields(originalMarkdown, {
+    import_method:'url_original_text',processing_mode:'original_text',processing_status:'original',llm_used:false
+  }) : originalMarkdown);
   const rawMarkdownSha256 = createHash("sha256").update(converted.markdown).digest("hex");
   const finalMarkdownSha256 = createHash("sha256").update(markdown).digest("hex");
   const documentPath = path.relative(path.resolve(workflowRoot, "..", ".."), target).replaceAll("\\", "/");
@@ -1277,9 +1272,18 @@ async function writeBrowserDraftCommitUnlocked(rawBody, destination = "reading",
         processor_version: preprocessing.processorVersion,
         prompt_version: preprocessing.promptVersion,
         output_dir: preprocessing.outputDir,
-        workflow_attempts: preprocessing.workflowAttempts
+        workflow_attempts: preprocessing.workflowAttempts,
+        processing_plan: preprocessing.processingPlan,
+        reading_guide: preprocessing.readingGuide,
+        model_calls: preprocessing.modelCalls,
+        quality_status: preprocessing.qualityStatus,
+        readable_with_warnings: preprocessing.readableWithWarnings,
+        warning_codes: preprocessing.warningCodes
       }
     }
+  } : originalImport ? {
+    ...draft, sourceMetadata:{...draft.sourceMetadata,destination_folder:draft.destinationFolder || '浏览器高亮',
+      original_import:{processing_mode:'original_text',llm_used:false,conversion_method:converted.method}}
   } : draft;
   const metadata = LocalIrDocumentCore.createDocumentState(stateDraft, {
     path: documentPath,
@@ -1308,6 +1312,7 @@ async function writeBrowserDraftCommitUnlocked(rawBody, destination = "reading",
       revision: Number(draft.revision || 0),
       destination: resolvedDestination,
       committed_at: nowIso(),
+      conversion_fidelity: converted.fidelity || null,
       ...(preprocessing ? {
         processing_mode: "standard_preprocess",
         preprocess_status: preprocessing.status,
@@ -1315,17 +1320,29 @@ async function writeBrowserDraftCommitUnlocked(rawBody, destination = "reading",
         idempotency_key: preprocessing.idempotencyKey,
         processor_version: preprocessing.processorVersion,
         prompt_version: preprocessing.promptVersion,
-        workflow_attempts: preprocessing.workflowAttempts
-      } : {}),
+        workflow_attempts: preprocessing.workflowAttempts,
+        processing_plan: preprocessing.processingPlan,
+        reading_guide: preprocessing.readingGuide,
+        model_calls: preprocessing.modelCalls,
+        quality_status: preprocessing.qualityStatus,
+        readable_with_warnings: preprocessing.readableWithWarnings,
+        warning_codes: preprocessing.warningCodes
+      } : originalImport ? {processing_mode:'original_text',llm_used:false,quality_status:'ready'} : {}),
       raw_markdown_sha256: rawMarkdownSha256,
       final_markdown_sha256: finalMarkdownSha256
     },
+    warnings: [...(preprocessing?.warningCodes || []), ...(converted.fidelity?.warnings || [])],
     errors: []
   };
 }
 
 function runtimeCookieHeaderForUrl(value) {
-  return chromeCookieJar.headerForUrl(value);
+  if (legacyRuntimeCookieReplacementEnabled && chromeCookieJar.health.source === "runtime_payload") return chromeCookieJar.headerForUrl(value);
+  try { return liveCookieSnapshot.headerForUrl(value); }
+  catch (error) {
+    if (error.message === "cookie_sync_stale_refresh_chrome") throw new UrlImportDegradedError("requires_browser_auth", error.message);
+    throw error;
+  }
 }
 
 function authenticatedCookieHealth() {
@@ -1347,6 +1364,9 @@ function authenticatedCookieHealth() {
 }
 
 async function fetchUrlImportDraft(requestedUrl) {
+  if (youtubeVideoIdentity(requestedUrl)) {
+    return fetchYoutubeSubtitleDraft(requestedUrl, { liveSnapshot: liveCookieSnapshot });
+  }
   const fetched = await fetchUrlWithoutBrowser(requestedUrl, { cookieHeaderForUrl: runtimeCookieHeaderForUrl });
   const capturedAt = nowIso();
   return {
@@ -1384,18 +1404,44 @@ async function writeBrowserDraftCommit(rawBody, destination = "reading", options
   return withBrowserCommitLock(lockKey, () => writeBrowserDraftCommitUnlocked(rawBody, destination, options));
 }
 
-async function importUrlThroughStandardWorkflow(url, { userInstruction = "", destinationFolder = "" } = {}) {
-  const fetched = await fetchUrlImportDraft(url);
+async function importUrlThroughStandardWorkflow(url, { userInstruction = "", destinationFolder = "", processingMode = 'standard_preprocess', processingOptions = {}, pendingInputPath = null, cachedRssDraft = null, onProgress } = {}) {
+  if (!['standard_preprocess','original_text'].includes(processingMode)) throw new Error('unsupported_url_processing_mode');
+  let fetched;
+  if (pendingInputPath) {
+    const savedPath = path.resolve(pendingInputPath);
+    if (!savedPath.startsWith(path.resolve(browserPreprocessRoot) + path.sep) || path.basename(savedPath) !== "pending-source.json") throw new Error("invalid_pending_source_path");
+    fetched = JSON.parse(await fs.readFile(savedPath, "utf8"));
+    if (urlImportDedupeKey(fetched.requestedUrl) !== urlImportDedupeKey(url)) throw new Error("pending_source_identity_mismatch");
+  } else if (cachedRssDraft) {
+    fetched = { requestedUrl:url, finalUrl:url, redirectChain:[],
+      draft:cachedRssDraft, fetchReceipt:{ source_reused:"retained_rss_fulltext", browser_tab_created:false } };
+  } else fetched = await fetchUrlImportDraft(url);
   fetched.draft.userInstruction = String(userInstruction || "");
   fetched.draft.destinationFolder = normalizeRelativeDestinationFolder(destinationFolder);
-  const result = await writeBrowserDraftCommit({ draft: fetched.draft }, "reading", { standardize: true });
+  fetched.draft.processingOptions = structuredClone(processingOptions);
+  let result;
+  try {
+    result = await writeBrowserDraftCommit({ draft: fetched.draft }, "reading", {
+      standardize: processingMode==='standard_preprocess', onProgress, cachedRssMarkdown:fetched.draft.cachedRssMarkdown
+    });
+  } catch (error) {
+    if (error.code === "needs_classification") {
+      const frozenPath = path.join(error.details.preprocess_output_dir, "pending-source.json");
+      await writeFileAtomic(frozenPath, JSON.stringify(fetched));
+      error.details.pending_input_path = frozenPath;
+    }
+    throw error;
+  }
   return {
     requested_url: fetched.requestedUrl,
     final_url: fetched.finalUrl,
     redirect_chain: fetched.redirectChain,
-    status: result.receipt?.preprocess_status === "idempotent_replay" ? "idempotent_replay" : "imported",
+    status: result.receipt?.preprocess_status === "idempotent_replay"
+      ? "idempotent_replay"
+      : result.receipt?.quality_status === "warning" ? "imported_with_warnings" : "imported",
     artifacts: result.artifacts,
     source_metadata: result.source_metadata,
+    warnings: result.warnings || [],
     receipt: {
       ...result.receipt,
       destination_folder: fetched.draft.destinationFolder || "浏览器高亮",
@@ -1404,15 +1450,28 @@ async function importUrlThroughStandardWorkflow(url, { userInstruction = "", des
   };
 }
 
-async function replayExistingUrlImport(existing, requestedUrl) {
+async function replayExistingUrlImport(existing, requestedUrl, { processingMode = "standard_preprocess", processingOptions = {} } = {}) {
   if (!existing || !Array.isArray(existing.artifacts)) return null;
+  const previous = existing.source_metadata?.standard_preprocess || {};
+  const mode = existing.receipt?.processing_mode || (existing.source_metadata?.original_import ? "original_text" : "standard_preprocess");
+  const plan = existing.receipt?.processing_plan || previous.processing_plan;
+  if (mode !== processingMode || Object.entries(processingOptions).some(([key, value]) => typeof value === "boolean" && plan?.choices?.[key] && plan.choices[key].enabled !== value)) {
+    throw new Error("既有文章的处理选项不同，已保留原文件；请通过当前页“重新导入”执行新选项。");
+  }
+  if (mode === "standard_preprocess") {
+    const auditDir = previous.output_dir || existing.artifacts.find(item => item.kind === "standard_preprocess_audit")?.path;
+    if (auditDir) {
+      const audit = await fs.readFile(path.join(auditDir, "result.json"), "utf8").then(JSON.parse).catch(() => null);
+      if (audit && !classifyStandardImportQuality(audit).admissible) throw new Error("既有导入缺少必需的译文或导读，不能复用为成功结果；请重新导入。");
+    }
+  }
   const markdownArtifact = existing.artifacts.find((item) => item?.kind === "markdown" && item?.path);
   if (!markdownArtifact) return null;
   const markdown = await fs.readFile(markdownArtifact.path, "utf8").catch(() => null);
   if (markdown === null || !markdown.trim()) return null;
   const currentSha256 = createHash("sha256").update(markdown).digest("hex");
   const recordedSha256 = String(markdownArtifact.sha256 || existing.receipt?.final_markdown_sha256 || "");
-  if (recordedSha256 && recordedSha256 !== currentSha256) return null;
+  if (recordedSha256 && recordedSha256 !== currentSha256) throw new Error("existing_article_changed_preserved");
   return {
     ...existing,
     requested_url: requestedUrl,
@@ -1426,8 +1485,10 @@ async function replayExistingUrlImport(existing, requestedUrl) {
       final_markdown_sha256: currentSha256,
       browser_tab_created: false,
       cookie_policy: "versioned_snapshot_cookie_matching_no_store",
-      idempotent_replay_basis: "normalized_requested_url"
+      idempotent_replay_basis: "normalized_requested_url",
+      existing_article_preserved: true
     },
+    warnings: Array.isArray(existing.warnings) ? existing.warnings : existing.receipt?.warning_codes || [],
     errors: []
   };
 }
@@ -1448,28 +1509,44 @@ async function findReadyDocumentStateImportForUrl(requestedUrl) {
     }
     const sourceMetadata = state?.browser?.sourceMetadata || {};
     const preprocess = sourceMetadata.standard_preprocess || {};
+    const originalReady = sourceMetadata.original_import?.processing_mode === 'original_text' && sourceMetadata.original_import?.llm_used === false;
     const matchingUrl = [state?.document?.sourceUrl, sourceMetadata.source_url, sourceMetadata.canonical_url]
       .find((value) => value && urlImportDedupeKey(value) === requestedKey);
     const finalAttempt = Array.isArray(preprocess.workflow_attempts) ? preprocess.workflow_attempts.at(-1) : null;
+    const fullyReady = new Set(["completed", "idempotent_replay"]).has(finalAttempt?.status)
+      && finalAttempt?.processing_state === "rendered"
+      && finalAttempt?.target_zone === "local-ir-reading";
+    const warningReady = preprocess.quality_status === "warning"
+      && finalAttempt?.status === "completed_with_warnings"
+      && finalAttempt?.processing_state === "degraded"
+      && finalAttempt?.target_zone === "preprocess-review";
     if (!matchingUrl
       || state?.document?.handoff?.state !== "ready"
-      || !preprocess.material_id
-      || !preprocess.idempotency_key
-      || !new Set(["completed", "idempotent_replay"]).has(finalAttempt?.status)
-      || finalAttempt?.processing_state !== "rendered"
-      || finalAttempt?.target_zone !== "local-ir-reading") continue;
+      || (!originalReady && (!preprocess.material_id || !preprocess.idempotency_key || (!fullyReady && !warningReady)))) continue;
 
-    const markdownPath = path.resolve(workspaceRoot, String(state.document.path || ""));
-    if (!markdownPath.startsWith(readingPrefix)) continue;
-    const markdown = await fs.readFile(markdownPath, "utf8").catch(() => null);
+    const pathCandidates = readingDocumentPathCandidates({
+      workflowRoot,
+      readingRoot,
+      storedDocumentPath: state.document.path
+    });
+    let markdownPath = null;
+    let markdown = null;
+    for (const candidate of [...new Set(pathCandidates)]) {
+      if (!candidate.startsWith(readingPrefix)) continue;
+      const contents = await fs.readFile(candidate, "utf8").catch(() => null);
+      if (!contents?.trim()) continue;
+      markdownPath = candidate;
+      markdown = contents;
+      break;
+    }
     if (!markdown?.trim()) continue;
     const markdownSha256 = createHash("sha256").update(markdown).digest("hex");
-    if (state.content?.markdownSha256 && state.content.markdownSha256 !== markdownSha256) continue;
+    if (state.content?.markdownSha256 && state.content.markdownSha256 !== markdownSha256) throw new Error("existing_article_changed_preserved");
     return {
       requested_url: requestedUrl,
       final_url: String(sourceMetadata.canonical_url || matchingUrl),
       redirect_chain: [],
-      status: "imported",
+      status: warningReady ? "imported_with_warnings" : "imported",
       artifacts: [
         { kind: "markdown", path: markdownPath, sha256: markdownSha256 },
         { kind: "browser_ir_metadata", path: metadataPath },
@@ -1477,13 +1554,17 @@ async function findReadyDocumentStateImportForUrl(requestedUrl) {
       ],
       source_metadata: sourceMetadata,
       receipt: {
-        processing_mode: "standard_preprocess",
+        processing_mode: originalReady ? 'original_text' : 'standard_preprocess',
+        ...(originalReady ? {llm_used:false} : {}),
         preprocess_status: "completed",
         material_id: preprocess.material_id,
         idempotency_key: preprocess.idempotency_key,
         processor_version: preprocess.processor_version,
         prompt_version: preprocess.prompt_version,
         workflow_attempts: preprocess.workflow_attempts,
+        quality_status: warningReady ? "warning" : "ready",
+        readable_with_warnings: warningReady,
+        warning_codes: Array.isArray(preprocess.warning_codes) ? preprocess.warning_codes : [],
         destination_folder: sourceMetadata.destination_folder || "浏览器高亮",
         final_markdown_sha256: markdownSha256,
         browser_tab_created: false,
@@ -1495,10 +1576,10 @@ async function findReadyDocumentStateImportForUrl(requestedUrl) {
   return null;
 }
 
-async function processBackgroundImportRequestUnlocked(requestId) {
+async function processBackgroundImportWorker(requestId, workerIndex) {
   while (true) {
     const task = await browserImportBroker.claimTask(
-      "local-background-url-fetcher",
+      `local-background-url-fetcher-${workerIndex + 1}`,
       `background-${requestId}-${randomUUID()}`,
       { transport: BACKGROUND_FETCH_TRANSPORT, requestId }
     );
@@ -1508,8 +1589,32 @@ async function processBackgroundImportRequestUnlocked(requestId) {
       await browserImportBroker.waitForTask(25000, { transport: BACKGROUND_FETCH_TRANSPORT });
       continue;
     }
+    let currentStage = task.capture_mode === "page_snapshot" ? "capture_conversion" : "source_fetch";
+    const onProgress = async ({ stage }) => {
+      currentStage = stage;
+      await browserImportBroker.updateTaskProgress(task.id, { status: "processing", stage }, task.lease_token);
+    };
+    const videoHeartbeat = setInterval(() => {
+      onProgress({ stage: currentStage }).catch(() => {});
+    }, 45000);
     try {
       await withBrowserCommitLock(`url-import:${urlImportDedupeKey(task.requested_url)}`, async () => {
+        const retainedRss = task.capture_mode === "page_snapshot" && task.source === "rss_auto_import";
+        if (task.capture_mode === "page_snapshot" && !retainedRss) {
+          await onProgress({ stage: "capture_conversion" });
+          const snapshot = await browserImportBroker.getTaskSnapshot(task.id);
+          const result = await writeBrowserDraftCommit(snapshot, "reading", { standardize: true, onProgress });
+          await browserImportBroker.completeTask(task.id, { ok: true, result, leaseToken: task.lease_token });
+          return;
+        }
+        if (zhihuColumnIdentity(task.requested_url) && task.processing_mode !== 'original_text') {
+          await processCollectionTask(task, {
+            broker: browserImportBroker,
+            discover: (value, onProgress) => discoverZhihuColumn(value, { cookieHeaderForUrl: runtimeCookieHeaderForUrl, onProgress }),
+            runRequest: processBackgroundImportRequest
+          });
+          return;
+        }
         const existing = await browserImportBroker.findSuccessfulResultForUrl(task.requested_url, {
           excludeTaskId: task.id
         }) || await findReadyDocumentStateImportForUrl(task.requested_url);
@@ -1519,17 +1624,21 @@ async function processBackgroundImportRequestUnlocked(requestId) {
           destinationFolder: task.destination_folder,
           sourceUrl: task.requested_url
         });
-        const existingDestination = String(existing?.receipt?.destination_folder || "浏览器高亮");
         const existingSourceUrl = String(existing?.source_metadata?.source_url || "");
         const sourceIdentityMatches = existingSourceUrl
           && urlImportDedupeKey(existingSourceUrl) === urlImportDedupeKey(task.requested_url);
-        const globallyCommitted = existing?.receipt?.global_content_identity === "normalized_source_url";
-        const replay = (globallyCommitted || existingDestination === destinationFolder) && sourceIdentityMatches
-          ? await replayExistingUrlImport(existing, task.requested_url)
+        // Source identity is global; a different entry route must not create another body.
+        const replay = sourceIdentityMatches
+          ? await replayExistingUrlImport(existing, task.requested_url, { processingMode: task.processing_mode, processingOptions: task.processing_options })
           : null;
         const result = replay || await importUrlThroughStandardWorkflow(task.requested_url, {
             userInstruction: task.user_instruction,
-            destinationFolder
+            destinationFolder,
+            processingMode: task.processing_mode || 'standard_preprocess',
+            processingOptions: task.processing_options || {},
+            pendingInputPath: task.pending_input_path || null,
+            cachedRssDraft: retainedRss ? (await browserImportBroker.getTaskSnapshot(task.id)).draft : null,
+            onProgress
           });
         await browserImportBroker.completeTask(task.id, {
           ok: true,
@@ -1538,7 +1647,15 @@ async function processBackgroundImportRequestUnlocked(requestId) {
         });
       });
     } catch (error) {
-      if (error instanceof UrlImportDegradedError) {
+      if (error.code === "needs_classification") {
+        await browserImportBroker.completeTask(task.id, {
+          ok: false, degradedStatus: "needs_classification", error: error.message,
+          result: { status: "needs_classification", requested_url: task.requested_url,
+            receipt: { ...error.details, classification_reason: error.message, browser_tab_created: false },
+            errors: [{ code: "needs_classification", message: error.message }] },
+          leaseToken: task.lease_token
+        });
+      } else if (error instanceof UrlImportDegradedError) {
         await browserImportBroker.completeTask(task.id, {
           ok: false,
           degradedStatus: error.status,
@@ -1577,13 +1694,24 @@ async function processBackgroundImportRequestUnlocked(requestId) {
               browser_tab_created: false,
               cookie_policy: "versioned_snapshot_cookie_matching_no_store"
             },
-            errors: [{ code: "background_url_import_failed", message: error instanceof Error ? error.message : String(error) }]
+            stage: error.details?.stage || currentStage,
+            errors: [{ code: error.code || "background_url_import_failed", message: error instanceof Error ? error.message : String(error), details: error.details || null }]
           },
           leaseToken: task.lease_token
         });
       }
+    } finally {
+      if (videoHeartbeat) clearInterval(videoHeartbeat);
     }
   }
+}
+
+async function processBackgroundImportRequestUnlocked(requestId) {
+  const request = await browserImportBroker.getRequest(requestId);
+  const workerCount = Math.min(URL_IMPORT_CONCURRENCY, Math.max(1, Number(request?.requested || 1)));
+  await Promise.all(Array.from({ length: workerCount }, (_unused, workerIndex) => (
+    processBackgroundImportWorker(requestId, workerIndex)
+  )));
   return browserImportBroker.getRequest(requestId);
 }
 
@@ -1604,6 +1732,7 @@ async function submitSharedUrlImport(urls, {
   userInstruction = "",
   entryRoute = "",
   destinationFolder = "",
+  processingOptions = {},
   wait = false
 } = {}) {
   const request = await browserImportBroker.createRequest(urls, {
@@ -1611,6 +1740,7 @@ async function submitSharedUrlImport(urls, {
     clientRequestId,
     transport: BACKGROUND_FETCH_TRANSPORT,
     userInstruction,
+    processingOptions,
     entryRoute: inferImportEntryRoute(source, entryRoute),
     destinationFolder: normalizeRelativeDestinationFolder(destinationFolder)
   });
@@ -1638,6 +1768,7 @@ async function importUrlsThroughStandardWorkflow(rawBody) {
     userInstruction: String(rawBody?.user_instruction || rawBody?.userInstruction || ""),
     entryRoute: String(rawBody?.entry_route || rawBody?.entryRoute || "obsidian"),
     destinationFolder: String(rawBody?.destination_folder || rawBody?.destinationFolder || ""),
+    processingOptions: rawBody?.processing_options || {},
     wait: true
   });
 }
@@ -1657,6 +1788,10 @@ async function importWechat(job, urls, runName) {
   ];
   const instruction = importerInstruction(job);
   if (instruction) args.push("--instruction", instruction);
+  await fs.mkdir(stagingDir, { recursive: true });
+  const optionsPath = path.join(stagingDir, "processing-options.json");
+  await fs.writeFile(optionsPath, JSON.stringify(job.processingOptions || {}), "utf8");
+  args.push("--processing-options", optionsPath);
   const result = await runProcess(process.execPath, args);
   await fs.writeFile(path.join(stagingDir, "command.stdout.txt"), result.stdout, "utf8").catch(() => {});
   await fs.writeFile(path.join(stagingDir, "command.stderr.txt"), result.stderr, "utf8").catch(() => {});
@@ -1677,6 +1812,7 @@ async function importWeb(job, urls, runName) {
     source: "production_interaction",
     clientRequestId: `app-job-${job.id}`,
     userInstruction: importerInstruction(job),
+    processingOptions: job.processingOptions || {},
     wait: true
   });
   await fs.mkdir(path.join(job.runDir, "web"), { recursive: true });
@@ -1782,7 +1918,7 @@ async function callDeepSeekForVideoGuide({ info, url, transcript, instruction = 
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${config.AI_PRODUCER_API_KEY}`
+      "Authorization": `Bearer ${config.DEEPSEEK_READING_API_KEY}`
     },
     body: JSON.stringify({
       model: config.AI_PRODUCER_MODEL,
@@ -2178,9 +2314,23 @@ async function importBilibili(job, url, runName, doctor) {
 }
 
 async function importVideos(job, urls, runName) {
-  await log(job, `视频链接已暂停处理：${urls.length} 个链接`);
-  for (const url of urls) {
-    const reason = "视频工作流暂停：本地 tiny ASR 产物未通过阅读质量验收。当前只保留文字导入；视频需等待高质量转写/现成工具调研后恢复。";
+  const youtubeUrls = urls.filter(url => youtubeVideoIdentity(url));
+  if (youtubeUrls.length) {
+    await log(job, `YouTube 字幕导入：${youtubeUrls.length} 个链接`);
+    const request = await browserImportBroker.createRequest(youtubeUrls, {
+      source: 'local-app-video', entryRoute: 'ai', destinationFolder: 'YouTube',
+      userInstruction: importerInstruction(job), processingOptions: job.processingOptions || {}, transport: BACKGROUND_FETCH_TRANSPORT
+    });
+    await processBackgroundImportRequest(request.request_id);
+    const summary = await browserImportBroker.getRequest(request.request_id);
+    for (const result of summary.results) {
+      const target = result.artifacts?.find(item => item.kind === 'markdown')?.path;
+      if (target) job.outputs.push({ url: result.requested_url, status: result.status, method: 'youtube_subtitle_standard_preprocess', target, request_id: request.request_id });
+      else job.failures.push({ url: result.requested_url, status: result.status, stage: 'youtube_subtitles', reason: result.error, request_id: request.request_id });
+    }
+  }
+  for (const url of urls.filter(url => !youtubeVideoIdentity(url))) {
+    const reason = "当前仅恢复 YouTube 现成字幕导入；其他视频与无字幕 ASR 仍暂停。";
     const target = await writeFailureReport({
       dir: path.join(job.runDir, "video-suspended"),
       url,
@@ -2190,7 +2340,7 @@ async function importVideos(job, urls, runName) {
     });
     job.failures.push({ url, status: "suspended", stage: "video_suspended", reason, target });
   }
-  await log(job, "视频链接暂停报告已生成");
+  await log(job, "视频链接处理完成");
 }
 
 async function runJob(job) {
@@ -2201,7 +2351,9 @@ async function runJob(job) {
 
   try {
     const runName = `${today()}-app-import`;
-    job.intent = await parseImportIntent({ instruction: job.instruction, urls: job.urls });
+    // The standard workflow resolves only missing classifications. Intake itself needs no model call.
+    job.intent = fallbackIntent(job.instruction, job.urls);
+    job.processingOptions = { ...(job.intent.processing.generateReadingGuide === false ? { include_reading_guide: false } : {}), ...job.processingOptions };
     await fs.writeFile(path.join(job.runDir, "intent.json"), `${JSON.stringify(job.intent, null, 2)}\n`, "utf8");
     await log(job, `意图解析完成：${job.intent.source} / ${job.intent.processing?.languageMode || ""} / ${job.intent.processing?.linkPolicy || ""}`);
 
@@ -2219,7 +2371,7 @@ async function runJob(job) {
     if (web.length) await importWeb(job, web, runName);
     if (video.length) await importVideos(job, video, runName);
 
-    job.status = job.failures.length ? "completed_with_failures" : "completed";
+    job.status = job.failures.some(item => item.status === "needs_classification") ? "needs_classification" : job.failures.length ? "completed_with_failures" : "completed";
     job.updatedAt = nowIso();
     await writeJob(job);
   } catch (error) {
@@ -2465,7 +2617,8 @@ https://example.com/article
         <div class="paths" id="learningProjects"></div>
         <pre id="learningOutput"></pre>
       </section>
-      <section class="rss-panel">
+      ${existsSync(path.join(workflowRoot, 'imports', 'subscriptions', 'active.json')) ? '<section class="rss-panel"><label>订阅管理</label><p><a href="/subscriptions">管理 RSS、B 站与知乎订阅</a></p><p class="hint">来源配置、队列和运行安排统一在订阅页；在 Markdown 日报、周报中勾选材料。</p></section>' : ''}
+      <section class="rss-panel" ${existsSync(path.join(workflowRoot, 'imports', 'subscriptions', 'active.json')) ? 'hidden' : ''}>
         <label>RSS 运行状态</label>
         <p class="hint">本页只查看运行状态和生成摘要，不提供审批。长文唯一审批入口是摘要区中的最新 RSS 长文周报；短文周报直接进入阅读区。</p>
         <div class="actions">
@@ -2533,7 +2686,7 @@ https://example.com/article
       const rows = [
         '<strong>理解来源：</strong>' + escapeHtml(intent.source || ''),
         '<strong>输出位置：</strong>' + escapeHtml(intent.outputTarget || ''),
-        '<strong>导读卡：</strong>' + (processing.generateReadingGuide === false ? '关闭' : '开启'),
+        '<strong>导读卡：</strong>' + (processing.generateReadingGuide === false ? '关闭' : processing.generateReadingGuide === true ? '开启' : '按材料类型'),
         '<strong>语言模式：</strong>' + escapeHtml(processing.languageMode || ''),
         '<strong>外链策略：</strong>' + escapeHtml(processing.linkPolicy || '')
       ];
@@ -2724,7 +2877,7 @@ https://example.com/article
       fetchReading: document.getElementById('learningReading').checked
     }).then(() => learningCall('/api/learning/projects')));
     renderInputPreview();
-    rssCall('/api/rss-reading/queue');
+    if (!${existsSync(path.join(workflowRoot, 'imports', 'subscriptions', 'active.json'))}) rssCall('/api/rss-reading/queue');
     learningCall('/api/learning/projects');
   </script>
 </body>
@@ -2733,6 +2886,37 @@ https://example.com/article
 
 async function handle(req, res) {
   const url = new URL(req.url || "/", "http://127.0.0.1");
+  if (await handleSubscriptions(req, res, workflowRoot)) return;
+  if (req.method === 'POST' && url.pathname.startsWith('/api/rss-reading/') && existsSync(path.join(workflowRoot, 'imports', 'subscriptions', 'active.json'))) {
+    return sendJson(res, 409, { error: '已切换统一订阅流程，请在 /subscriptions 管理订阅，并在 Markdown 报告中勾选材料。' });
+  }
+  if (url.pathname === COOKIE_STATUS_ENDPOINT && req.method === "GET") {
+    liveCookieSnapshot.refresh();
+    return sendJson(res, 200, { service: "local-ir-browser-highlight", schema: "local-ir.chrome-live-sync/v1",
+      receiver_enabled: !configuredCookieSnapshotPath, ...liveCookieSnapshot.health() });
+  }
+  if (url.pathname === COOKIE_SNAPSHOT_ENDPOINT) {
+    let origin = null;
+    try {
+      origin = cookieSyncOrigin(req);
+      liveCookieSnapshot.validateOrigin(origin);
+      if (req.method === "OPTIONS") {
+        if (String(req.headers["access-control-request-method"] || "").toUpperCase() !== "POST") throw new Error("cookie_sync_preflight_method_not_allowed");
+        if (String(req.headers["access-control-request-headers"] || "").split(",").some(value => value.trim() && value.trim().toLowerCase() !== "content-type")) throw new Error("cookie_sync_preflight_headers_not_allowed");
+        res.writeHead(204, cookieSyncCorsHeaders(origin)); res.end(); return;
+      }
+      if (req.method !== "POST") return sendCookieSyncJson(res, 405, { error: "method_not_allowed" }, origin);
+      validateCookieSyncContentType(req.headers["content-type"]);
+      const raw = await readCookieSyncRequest(req, CHROME_COOKIE_JAR_MAX_SYNC_BYTES);
+      let payload;
+      try { payload = JSON.parse(raw); } catch { throw new Error("cookie_sync_invalid_json"); }
+      return sendCookieSyncJson(res, 200, await liveCookieSnapshot.accept(payload, origin), origin);
+    } catch (error) {
+      const message = safeCookieSnapshotError(error);
+      console.warn("cookie_snapshot_rejected", message);
+      return sendCookieSyncJson(res, cookieSyncErrorStatus(error), { error: message }, origin);
+    }
+  }
   if (url.pathname === cookieSyncEndpoint && req.method === "OPTIONS") {
     let origin = null;
     try {
@@ -2768,6 +2952,27 @@ async function handle(req, res) {
     res.end(html());
     return;
   }
+  const importWebAssets = {
+    "/import": ["browser-import-web/index.html", "text/html"],
+    "/import/": ["browser-import-web/index.html", "text/html"],
+    "/import/app.mjs": ["browser-import-web/app.mjs", "text/javascript"],
+    "/import/client.mjs": ["browser-import-web/client.mjs", "text/javascript"],
+    "/url-import-input.mjs": ["url-import-input.mjs", "text/javascript"],
+    "/import/style.css": ["browser-import-web/style.css", "text/css"]
+  };
+  if (req.method === "GET" && Object.hasOwn(importWebAssets, url.pathname)) {
+    const [asset, type] = importWebAssets[url.pathname];
+    const content = await fs.readFile(path.join(__dirname, asset));
+    res.writeHead(200, {
+      "Content-Type": `${type}; charset=utf-8`,
+      "Cache-Control": "no-store, max-age=0",
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    });
+    res.end(content);
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/browser-highlight-test") {
     res.writeHead(200, {
       ...corsHeaders(),
@@ -2790,6 +2995,7 @@ async function handle(req, res) {
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/highlights/health") {
+    if (!(legacyRuntimeCookieReplacementEnabled && chromeCookieJar.health.source === "runtime_payload")) liveCookieSnapshot.refresh();
     return sendJson(res, 200, {
       status: "ok",
       service: "local-ir-browser-highlight",
@@ -2805,17 +3011,26 @@ async function handle(req, res) {
         routes: importDestinationRoutes.routes
       },
       standardImport: {
+        processingModes: ['standard_preprocess','original_text'],
         draftEndpoint: "/api/highlights/import-local",
+        draftAsyncSupported: true,
+        requiredArtifactsBeforePublication: true,
         urlBatchEndpoint: "/api/highlights/import-local-urls",
         sharedRequestEndpoint: "/api/browser-import/requests",
         defaultTransport: BACKGROUND_FETCH_TRANSPORT,
         browserTabCreatedOnNormalPath: false,
         cookiePolicy: "versioned_local_snapshot_domain_hostonly_path_secure_expiry_matching",
         authenticatedFetch: authenticatedCookieHealth(),
-        maxWorkflowAttempts: 3,
+        maxWorkflowAttempts: 1,
+        processingOptionsSupported: true,
+        classificationResumeEndpoint: "/api/browser-import/requests/:requestId/classification",
         processorVersion: standardPreprocessProcessorVersion,
+        guideCoverageVersion: GUIDE_COVERAGE_VERSION,
         transportMaxAttempts: 3,
-        serializedBySourceUrl: true
+        serializedBySourceUrl: true,
+        batchConcurrency: URL_IMPORT_CONCURRENCY,
+        qualityStatuses: ["ready", "warning", "failed"],
+        readableWarningCreatesMarkdown: true
       },
       cookieSync: {
         endpoint: cookieSyncEndpoint,
@@ -2840,8 +3055,7 @@ async function handle(req, res) {
         pathEnvironmentVariable: CHROME_COOKIE_SNAPSHOT_PATH_ENV,
         schema: CHROME_COOKIE_SNAPSHOT_SCHEMA,
         schemaVersion: CHROME_COOKIE_SNAPSHOT_SCHEMA_VERSION,
-        configured: Boolean(configuredCookieSnapshotPath),
-        loaded: chromeCookieJar.health.source === "versioned_local_snapshot",
+        ...liveCookieSnapshot.health(),
         state: authenticatedCookieHealth(),
         snapshotPathExposed: false,
         cookieValuesExposed: false
@@ -2856,12 +3070,16 @@ async function handle(req, res) {
         extensionClaimEnabled: false,
         maxTaskAttempts: DEFAULT_MAX_ATTEMPTS,
         claimLeaseMs: DEFAULT_LEASE_MS,
+        batchConcurrency: URL_IMPORT_CONCURRENCY,
         idempotentRequestCreation: true,
         idempotentTaskClaim: true,
         executionContract: URL_IMPORT_EXECUTION_CONTRACT
       },
       now: nowIso()
     });
+  }
+  if (req.method === "GET" && url.pathname === "/api/browser-import/rules") {
+    return sendJson(res, 200, IMPORT_RULES);
   }
   if (req.method === "POST" && url.pathname === cookieSyncEndpoint) {
     let origin = null;
@@ -2891,7 +3109,9 @@ async function handle(req, res) {
   if (req.method === "POST" && url.pathname === "/api/highlights/commit") {
     try {
       const body = JSON.parse(await readRequest(req, { maxBytes: 8 * 1024 * 1024 }) || "{}");
-      return sendJson(res, 200, await writeBrowserDraftCommit(body, "reading"));
+      return sendJson(res, 200, await writeBrowserDraftCommit(body, "reading", {
+        processingOptions: browserCaptureProcessingOptions('save', body.processing_options || body.draft?.processingOptions)
+      }));
     } catch (error) {
       return sendJson(res, importFailureHttpStatus(error), { error: error.message });
     }
@@ -2899,7 +3119,9 @@ async function handle(req, res) {
   if (req.method === "POST" && url.pathname === "/api/highlights/complete") {
     try {
       const body = JSON.parse(await readRequest(req, { maxBytes: 8 * 1024 * 1024 }) || "{}");
-      return sendJson(res, 200, await writeBrowserDraftCommit(body, "completed"));
+      return sendJson(res, 200, await writeBrowserDraftCommit(body, "completed", {
+        processingOptions: browserCaptureProcessingOptions('save', body.processing_options || body.draft?.processingOptions)
+      }));
     } catch (error) {
       return sendJson(res, importFailureHttpStatus(error), { error: error.message });
     }
@@ -2910,13 +3132,29 @@ async function handle(req, res) {
       const urls = Array.isArray(body.urls) ? extractUrls(body.urls.join("\n")) : extractUrls(body.text || "");
       if (!urls.length) throw new Error("no_url_found");
       if (urls.length > 50) throw new Error("too_many_urls_max_50");
+      let browserSnapshot = null;
+      if (body.cached_rss_article != null) {
+        assertLocalRequest(req);
+        const cached = body.cached_rss_article;
+        if (body.source !== "rss_auto_import" || urls.length !== 1 || typeof cached.markdown !== "string"
+          || !cached.markdown.trim() || cached.markdown.length > 300000 || Buffer.byteLength(cached.markdown) > 700000) {
+          throw new Error("invalid_retained_rss_article");
+        }
+        const url = urls[0];
+        browserSnapshot = { draft: { url, title: String(cached.title || ""), sourceType:"url_import",
+          cachedRssMarkdown:cached.markdown, sourceMetadata:{ source_url:url, canonical_url:url,
+            published_at:typeof cached.published_at === "string" ? cached.published_at : null, source_is_original:true } } };
+      }
       const request = await browserImportBroker.createRequest(urls, {
         source: String(body.source || "unknown"),
         clientRequestId: body.client_request_id || null,
         transport: BACKGROUND_FETCH_TRANSPORT,
+        browserSnapshot,
         userInstruction: String(body.user_instruction || body.userInstruction || ""),
         entryRoute: inferImportEntryRoute(body.source, body.entry_route || body.entryRoute),
-        destinationFolder: normalizeRelativeDestinationFolder(body.destination_folder || body.destinationFolder || "")
+        destinationFolder: normalizeRelativeDestinationFolder(body.destination_folder || body.destinationFolder || ""),
+        processingMode: body.processing_mode ?? 'standard_preprocess',
+        processingOptions: body.processing_options || {}
       });
       if (request.transport === BACKGROUND_FETCH_TRANSPORT) processBackgroundImportRequest(request.request_id).catch((error) => console.error(error));
       return sendJson(res, 202, request);
@@ -2987,6 +3225,15 @@ async function handle(req, res) {
       return sendJson(res, 400, { error: error.message });
     }
   }
+  const classificationResumeMatch = url.pathname.match(/^\/api\/browser-import\/requests\/([^/]+)\/classification$/u);
+  if (req.method === "POST" && classificationResumeMatch) {
+    try {
+      const body = JSON.parse(await readRequest(req, { maxBytes: 64 * 1024 }) || "{}");
+      const resumed = await browserImportBroker.resumeClassification(decodeURIComponent(classificationResumeMatch[1]), { processingOptions: body.processing_options || {}, urls: body.urls || null });
+      processBackgroundImportRequest(resumed.request_id).catch(error => console.error(error));
+      return sendJson(res, 202, resumed);
+    } catch (error) { return sendJson(res, 400, { error: error.message }); }
+  }
   const browserImportRequestMatch = url.pathname.match(/^\/api\/browser-import\/requests\/([^/]+)$/u);
   if (req.method === "GET" && browserImportRequestMatch) {
     const request = await browserImportBroker.getRequest(decodeURIComponent(browserImportRequestMatch[1]));
@@ -3022,10 +3269,23 @@ async function handle(req, res) {
   }
   if (req.method === "POST" && url.pathname === "/api/highlights/import-local") {
     try {
-      const body = JSON.parse(await readRequest(req, { maxBytes: 8 * 1024 * 1024 }) || "{}");
+      const body = JSON.parse(await readRequest(req, { maxBytes: 16 * 1024 * 1024 }) || "{}");
+      body.processing_options = browserCaptureProcessingOptions('import', body.processing_options || body.draft?.processingOptions);
+      if (body.async === true) {
+        const parsed = new URL(String(body.draft?.url || ""));
+        if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("unsupported_url_protocol");
+        if (!body.draft?.html && !body.draft?.pageText) throw new Error("empty_page_content");
+        const request = await browserImportBroker.createRequest([parsed.href], {
+          source: "browser_page_snapshot", clientRequestId: body.client_request_id,
+          processingOptions: body.processing_options || body.draft.processingOptions || {},
+          browserSnapshot: { draft: body.draft, processing_options: body.processing_options || body.draft.processingOptions || {} }
+        });
+        processBackgroundImportRequest(request.request_id).catch(error => console.error(error));
+        return sendJson(res, 202, request);
+      }
       return sendJson(res, 200, await writeBrowserDraftCommit(body, "reading", { standardize: true }));
     } catch (error) {
-      return sendJson(res, importFailureHttpStatus(error), { error: error.message });
+      return sendJson(res, importFailureHttpStatus(error), { error: error.message, code: error.code, details: error.details });
     }
   }
   if (req.method === "POST" && url.pathname === "/api/highlights/import-local-urls") {
@@ -3153,6 +3413,7 @@ async function handle(req, res) {
         createdAt: nowIso(),
         updatedAt: nowIso(),
         instruction: instructionFromText(text, urls),
+        processingOptions: body.processing_options || {},
         intent: null,
         urls,
         runDir: "",
@@ -3183,7 +3444,8 @@ async function listen(port) {
       reject(error);
     });
     server.listen(port, "127.0.0.1", async () => {
-      const info = { url: `http://127.0.0.1:${port}`, port, startedAt: nowIso(), pid: process.pid };
+      const boundPort = server.address().port;
+      const info = { url: `http://127.0.0.1:${boundPort}`, port: boundPort, startedAt: nowIso(), pid: process.pid };
       await fs.mkdir(importsRoot, { recursive: true });
       if (process.env.PROGRESSIVE_READING_WRITE_SERVER_INFO !== "false") {
         await fs.writeFile(path.join(importsRoot, "app-server.json"), `${JSON.stringify(info, null, 2)}\n`, "utf8");
@@ -3195,10 +3457,11 @@ async function listen(port) {
 }
 
 async function start() {
-  if (configuredCookieSnapshotPath) await chromeCookieJar.loadSnapshotFile(configuredCookieSnapshotPath);
+  liveCookieSnapshot.refresh({ force: true });
   await migrateLegacyBrowserCompletedArtifacts();
   await listen(defaultPort);
   await resumePendingBackgroundImports();
+  startSubscriptionWorker(workflowRoot);
 }
 
 start().catch((error) => {

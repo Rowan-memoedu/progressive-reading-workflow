@@ -1,4 +1,4 @@
-(function installLocalIrDraftCore(root) {
+(function installLocalIrDocumentCore(root) {
   "use strict";
 
   const SCHEMA_VERSION = 1;
@@ -49,7 +49,7 @@
   function normalizeRanges(ranges) {
     const sorted = (Array.isArray(ranges) ? ranges : [])
       .map((range) => ({ start: Number(range?.start), end: Number(range?.end) }))
-      .filter((range) => Number.isInteger(range.start) && Number.isInteger(range.end) && range.end > range.start)
+      .filter((range) => Number.isInteger(range.start) && Number.isInteger(range.end) && range.start >= 0 && range.end > range.start)
       .sort((a, b) => a.start - b.start || a.end - b.end);
     const merged = [];
     for (const range of sorted) {
@@ -68,8 +68,10 @@
     const selectedText = String(raw.selectedText || raw.originalText || "");
     const currentText = String(raw.currentText || selectedText);
     const type = ANNOTATION_TYPES.includes(raw.type) ? raw.type : "highlight";
-    const ranges = normalizeRanges(Array.isArray(raw.ranges) ? raw.ranges : raw.virtualRanges);
-    const range = raw.range && Number.isInteger(Number(raw.range.start)) && Number.isInteger(Number(raw.range.end))
+    const ranges = normalizeRanges(Array.isArray(raw.virtualRanges) ? raw.virtualRanges
+      : Array.isArray(raw.ranges) ? raw.ranges : raw.range ? [raw.range] : []);
+    const cleared = Array.isArray(raw.virtualRanges) && ranges.length === 0;
+    const range = !cleared && raw.range && Number.isInteger(Number(raw.range.start)) && Number.isInteger(Number(raw.range.end))
       ? { start: Number(raw.range.start), end: Number(raw.range.end) }
       : ranges.length > 0
         ? { start: ranges[0].start, end: ranges[ranges.length - 1].end }
@@ -77,6 +79,7 @@
     const contextBefore = String(raw.contextBefore || raw.anchor?.contextBefore || "");
     const contextAfter = String(raw.contextAfter || raw.anchor?.contextAfter || "");
     return {
+      ...raw,
       id: String(raw.id || createId("annotation")),
       path: String(raw.path || ""),
       selectedText,
@@ -93,7 +96,7 @@
       markKind: raw.markKind === "cloze" ? "cloze" : "highlight",
       orphaned: Boolean(raw.orphaned),
       lastKnownPath: String(raw.lastKnownPath || raw.path || ""),
-      sourceOffset: raw.sourceOffset !== null && raw.sourceOffset !== undefined && Number.isInteger(Number(raw.sourceOffset))
+      sourceOffset: cleared ? null : raw.sourceOffset !== null && raw.sourceOffset !== undefined && Number.isInteger(Number(raw.sourceOffset))
         ? Number(raw.sourceOffset)
         : range?.start ?? null,
       range,
@@ -111,7 +114,7 @@
         crossedBlankLines: false
       } : null),
       fragments: Array.isArray(raw.fragments) && raw.fragments.length > 0
-        ? raw.fragments.map((fragment, index) => ({ index: Number(fragment?.index ?? index), text: String(fragment?.text || "") }))
+        ? raw.fragments.map((fragment, index) => ({ ...fragment, index: Number(fragment?.index ?? index), text: String(fragment?.text || "") }))
         : [{ index: 0, text: currentText }],
       scope: ["heading_subtree", "list_subtree"].includes(raw.scope) ? raw.scope : "selection",
       headingPath: Array.isArray(raw.headingPath) ? raw.headingPath.map(String).filter(Boolean) : [],
@@ -183,8 +186,21 @@
   function anchorAnnotationsToMarkdown(rawAnnotations, markdown, path = "") {
     return (Array.isArray(rawAnnotations) ? rawAnnotations : []).map((raw) => {
       const annotation = normalizeAnnotation({ ...raw, path, lastKnownPath: path });
-      const located = findTextRange(markdown, annotation.originalText || annotation.selectedText, annotation.contextBefore, annotation.contextAfter)
-        || findTextRange(markdown, annotation.selectedText, annotation.contextBefore, annotation.contextAfter);
+      const fragmentTexts = annotation.fragments.length > 1 ? annotation.fragments.map(fragment => fragment.text) : [];
+      const locatedRanges = [];
+      let cursor = 0;
+      for (const [index, fragmentText] of fragmentTexts.entries()) {
+        const fragment = annotation.fragments[index];
+        const match = locateFragment(String(markdown), fragmentText, annotation.virtualRanges[index] || fragment.sourceRange,
+          fragment.contextBefore, fragment.contextAfter, cursor);
+        if (!match) break;
+        locatedRanges.push(match);
+        cursor = match.end;
+      }
+      const located = fragmentTexts.length
+        ? locatedRanges.length === fragmentTexts.length ? locatedRanges[0] : null
+        : findTextRange(markdown, annotation.originalText || annotation.selectedText, annotation.contextBefore, annotation.contextAfter)
+          || findTextRange(markdown, annotation.selectedText, annotation.contextBefore, annotation.contextAfter);
       if (!located) {
         return normalizeAnnotation({
           ...annotation,
@@ -202,8 +218,8 @@
         path,
         lastKnownPath: path,
         range: located,
-        ranges: [located],
-        virtualRanges: [located],
+        ranges: fragmentTexts.length ? locatedRanges : [located],
+        virtualRanges: fragmentTexts.length ? locatedRanges : [located],
         sourceOffset: located.start,
         orphaned: false,
         anchor: {
@@ -219,6 +235,26 @@
         }
       });
     });
+  }
+
+  function locateFragment(source, text, previous, contextBefore = "", contextAfter = "", cursor = 0) {
+    const needle = String(text || "").trim();
+    if (!needle) return null;
+    if (previous && previous.start >= cursor && source.slice(previous.start, previous.end) === needle) return { start: previous.start, end: previous.end };
+    const before = String(contextBefore || "").slice(-80);
+    const after = String(contextAfter || "").slice(0, 80);
+    const candidates = [];
+    for (let start = source.indexOf(needle, cursor); start >= 0; start = source.indexOf(needle, start + 1)) {
+      const end = start + needle.length;
+      const score = Number(Boolean(before) && source.slice(Math.max(0, start - before.length), start) === before)
+        + Number(Boolean(after) && source.slice(end, end + after.length) === after);
+      candidates.push({ start, end, score });
+    }
+    candidates.sort((a, b) => b.score - a.score || a.start - b.start);
+    if (candidates.length === 1 || (candidates[0]?.score > 0 && candidates[0].score > candidates[1]?.score)) {
+      return { start: candidates[0].start, end: candidates[0].end };
+    }
+    return null;
   }
 
   function normalizeDocumentState(raw = {}, options = {}) {
@@ -401,6 +437,8 @@
       submittedAt: source.submittedAt ? String(source.submittedAt) : null,
       lastError: source.lastError ? String(source.lastError) : null,
       receipt: source.receipt || null,
+      importJob: source.importJob && typeof source.importJob === "object" ? { ...source.importJob } : null,
+      processingOptions: source.processingOptions && typeof source.processingOptions === "object" ? { ...source.processingOptions } : {},
       submitDestination: ["reading", "completed"].includes(source.submitDestination)
         ? source.submitDestination
         : null,
@@ -445,32 +483,118 @@
     return left.start < right.end && right.start < left.end;
   }
 
+  // Pure record operations. Hosts own coordinates, persistence and lifecycle.
+  function recordRanges(record) {
+    return normalizeRanges(Array.isArray(record.virtualRanges) ? record.virtualRanges
+      : Array.isArray(record.ranges) ? record.ranges : record.range ? [record.range] : []);
+  }
+
+  function checkRecords(records, options = {}) {
+    if (options.frozen || options.locked) throw new Error("document_frozen");
+    if (records.some(record => record.archived || record.frozen)) throw new Error("annotation_frozen");
+    const paths = new Set(records.map(record => String(record.path || "")));
+    if (paths.size > 1 || (options.path !== undefined && records.some(record => String(record.path || "") !== options.path))) {
+      throw new Error("cross_document_operation");
+    }
+  }
+
+  function stableValue(value) {
+    if (Array.isArray(value)) return value.map(stableValue);
+    if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map(key => [key, stableValue(value[key])]));
+    return value;
+  }
+
+  function createChange(beforeRecords, afterRecords, kind = "annotations") {
+    const before = Object.fromEntries(beforeRecords.map(record => [record.id, record]));
+    const after = Object.fromEntries(afterRecords.map(record => [record.id, record]));
+    const ids = [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(id =>
+      JSON.stringify(stableValue(before[id] || null)) !== JSON.stringify(stableValue(after[id] || null))).sort();
+    return { version: 1, kind, ids, before: Object.fromEntries(ids.map(id => [id, clone(before[id] || null)])),
+      after: Object.fromEntries(ids.map(id => [id, clone(after[id] || null)])) };
+  }
+
+  function applyChange(records, change, direction = "forward", options = {}) {
+    if (!change || change.version !== 1) throw new Error("invalid_annotation_change");
+    const expected = direction === "backward" ? change.after : change.before;
+    const desired = direction === "backward" ? change.before : change.after;
+    const current = new Map(records.map(record => [record.id, record]));
+    checkRecords(change.ids.flatMap(id => [current.get(id), desired[id]].filter(Boolean)), options);
+    for (const id of change.ids) {
+      if (JSON.stringify(stableValue(current.get(id) || null)) !== JSON.stringify(stableValue(expected[id]))) {
+        throw new Error("stale_annotation_snapshot:" + id);
+      }
+    }
+    const result = records.filter(record => !change.ids.includes(record.id));
+    return [...result, ...change.ids.filter(id => desired[id]).map(id => clone(desired[id]))];
+  }
+
+  function mergeRecords(records, ids, options = {}) {
+    const uniqueIds = [...new Set(ids)];
+    const selected = uniqueIds.map(id => records.find(record => record.id === id));
+    if (selected.some(record => !record)) throw new Error("annotation_not_found");
+    if (selected.length < 2) throw new Error("merge_requires_two_annotations");
+    checkRecords(selected, options);
+    if (new Set(selected.map(record => record.markKind || "highlight")).size !== 1) throw new Error("merge_mark_kind_mismatch");
+    selected.sort((a, b) => (recordRanges(a)[0]?.start ?? a.sourceOffset ?? Infinity) - (recordRanges(b)[0]?.start ?? b.sourceOffset ?? Infinity)
+      || String(a.id).localeCompare(String(b.id)));
+    const primary = selected[0];
+    const ranges = normalizeRanges(selected.flatMap(recordRanges));
+    const fragments = options.textForRange
+      ? ranges.map((range, index) => {
+        const first = selected.find(record => recordRanges(record).some(item => item.start === range.start));
+        const last = selected.find(record => recordRanges(record).some(item => item.end === range.end));
+        const firstFragment = first?.fragments?.find(fragment => fragment.sourceRange?.start === range.start);
+        const lastFragment = last?.fragments?.find(fragment => fragment.sourceRange?.end === range.end);
+        return { index, text: String(options.textForRange(range)), sourceRange: { ...range },
+          contextBefore: firstFragment?.contextBefore || first?.contextBefore || first?.anchor?.contextBefore || "",
+          contextAfter: lastFragment?.contextAfter || last?.contextAfter || last?.anchor?.contextAfter || "" };
+      })
+      : selected.flatMap(record => record.fragments?.length ? clone(record.fragments) : [{ text: record.currentText || record.selectedText || "" }]).map((fragment, index) => ({ ...fragment, index }));
+    const text = fragments.map(fragment => fragment.text).join("\n\n");
+    const annotation = { ...clone(primary), ranges, virtualRanges: ranges, range: ranges[0] || null,
+      sourceOffset: ranges[0]?.start ?? primary.sourceOffset ?? null,
+      selectedText: text, currentText: text, fragments,
+      commentMarkdown: selected.map(record => record.commentMarkdown || "").filter(Boolean).join("\n\n"),
+      rewriteMarkdown: selected.map(record => record.rewriteMarkdown || "").filter(Boolean).join("\n\n"),
+      hasRewrite: selected.some(record => record.hasRewrite || record.rewriteMarkdown),
+      mergedSources: selected.flatMap(record => record.mergedSources?.length ? clone(record.mergedSources) : [clone(record)]),
+      updatedAt: options.at || nowIso() };
+    const after = [...records.filter(record => !uniqueIds.includes(record.id)), annotation];
+    return { records: after, annotation, change: createChange(records, after, "merge") };
+  }
+
+  function deleteRecords(records, ids, options = {}) {
+    const selected = records.filter(record => ids.includes(record.id));
+    if (selected.length) checkRecords(selected, options);
+    const after = records.filter(record => !ids.includes(record.id));
+    return { records: after, change: createChange(records, after, "delete") };
+  }
+
+  function addRecord(records, annotation, options = {}) {
+    checkRecords([annotation], options);
+    if (records.some(record => record.id === annotation.id)) throw new Error("duplicate_annotation_id");
+    const selected = records.filter(record => record.path === annotation.path &&
+      (record.markKind || "highlight") === (annotation.markKind || "highlight") &&
+      (options.mergeIds?.includes(record.id) || recordRanges(record).some(left => recordRanges(annotation).some(right => rangesTouch(left, right)))));
+    const result = selected.length ? mergeRecords([...records, annotation], [...selected.map(record => record.id), annotation.id], options)
+      : { records: [...records, clone(annotation)], annotation: clone(annotation) };
+    return { ...result, change: createChange(records, result.records, "add") };
+  }
+
+  function acceptDraftChange(draft, result, kind) {
+    draft.annotations = result.records;
+    draft.undoStack.push({ kind, change: result.change });
+    draft.undoStack = draft.undoStack.slice(-30);
+    touch(draft);
+  }
+
   function addAnnotation(rawDraft, rawAnnotation) {
     const draft = normalizeDraft(rawDraft);
     editableDraft(draft);
-    pushUndo(draft, "add_annotation");
     const annotation = normalizeAnnotation(rawAnnotation);
-    const overlapping = draft.annotations.filter((candidate) =>
-      candidate.markKind === annotation.markKind &&
-      candidate.ranges.some((left) => annotation.ranges.some((right) => rangesTouch(left, right)))
-    );
-    if (overlapping.length) {
-      const ids = new Set(overlapping.map((item) => item.id));
-      const primary = overlapping[0];
-      annotation.id = primary.id;
-      annotation.createdAt = primary.createdAt;
-      annotation.commentMarkdown = primary.commentMarkdown;
-      annotation.rewriteMarkdown = primary.rewriteMarkdown;
-      annotation.type = primary.type;
-      annotation.ranges = normalizeRanges([
-        ...annotation.ranges,
-        ...overlapping.flatMap((item) => item.ranges)
-      ]);
-      draft.annotations = draft.annotations.filter((item) => !ids.has(item.id));
-    }
-    draft.annotations.push(annotation);
-    touch(draft);
-    return { draft, annotation };
+    const result = addRecord(draft.annotations, annotation, { textForRange: range => draft.sourceText.slice(range.start, range.end) });
+    acceptDraftChange(draft, result, "add_annotation");
+    return { draft, annotation: result.annotation };
   }
 
   function updateAnnotation(rawDraft, id, patch = {}) {
@@ -493,31 +617,16 @@
     const draft = normalizeDraft(rawDraft);
     editableDraft(draft);
     if (!draft.annotations.some((item) => item.id === id)) return draft;
-    pushUndo(draft, "delete_annotation");
-    draft.annotations = draft.annotations.filter((item) => item.id !== id);
-    touch(draft);
+    acceptDraftChange(draft, deleteRecords(draft.annotations, [id]), "delete_annotation");
     return draft;
   }
 
   function mergeAnnotations(rawDraft, ids) {
     const draft = normalizeDraft(rawDraft);
     editableDraft(draft);
-    const selected = draft.annotations.filter((item) => ids.includes(item.id));
-    if (selected.length < 2) throw new Error("merge_requires_two_annotations");
-    if (new Set(selected.map((item) => item.markKind)).size !== 1) throw new Error("merge_mark_kind_mismatch");
-    pushUndo(draft, "merge_annotations");
-    const primary = normalizeAnnotation({
-      ...selected[0],
-      ranges: normalizeRanges(selected.flatMap((item) => item.ranges)),
-      selectedText: selected.map((item) => item.selectedText).join(" … "),
-      currentText: selected.map((item) => item.currentText).join(" … "),
-      updatedAt: nowIso()
-    });
-    const selectedIds = new Set(selected.map((item) => item.id));
-    draft.annotations = draft.annotations.filter((item) => !selectedIds.has(item.id));
-    draft.annotations.push(primary);
-    touch(draft);
-    return { draft, annotation: primary };
+    const result = mergeRecords(draft.annotations, ids, { textForRange: range => draft.sourceText.slice(range.start, range.end) });
+    acceptDraftChange(draft, result, "merge_annotations");
+    return { draft, annotation: result.annotation };
   }
 
   function undo(rawDraft) {
@@ -525,6 +634,11 @@
     editableDraft(draft);
     const action = draft.undoStack.pop();
     if (!action) return { draft, restored: false };
+    if (action.change) {
+      draft.annotations = applyChange(draft.annotations, action.change, "backward");
+      touch(draft);
+      return { draft, restored: true, kind: action.kind };
+    }
     draft.annotations = (action.annotations || []).map(normalizeAnnotation);
     draft.articleMusing = action.articleMusing || null;
     draft.qaCards = (action.qaCards || []).map(normalizeQaCard);
@@ -635,6 +749,12 @@
   }
 
   root.LocalIrDraftCore = {
+    recordRanges,
+    mergeRecords,
+    deleteRecords,
+    addRecord,
+    createChange,
+    applyChange,
     SCHEMA_VERSION,
     DOCUMENT_STATE_SCHEMA,
     DOCUMENT_STATE_VERSION,

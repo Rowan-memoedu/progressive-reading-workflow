@@ -16,7 +16,15 @@ from reportlab.platypus import Table, TableStyle
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
-from rich_text_import.pdf import _looks_like_layout_table, extract_pdf  # noqa: E402
+from rich_text_import.pdf import (  # noqa: E402
+    _merge_dingbat_bullets,
+    _MONO_FONT_RE,
+    _looks_like_layout_table,
+    _looks_like_code,
+    _looks_like_formula,
+    _status_from_warnings,
+    extract_pdf,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -94,6 +102,25 @@ def make_image_only_pdf(path: Path) -> Path:
     return path
 
 
+def make_repeated_image_pdf(path: Path) -> Path:
+    image_path = path.with_suffix(".png")
+    image = Image.new("RGB", (120, 60), "white")
+    drawing = ImageDraw.Draw(image)
+    drawing.rectangle((4, 4, 115, 55), outline="black", width=2)
+    drawing.text((18, 22), "Repeated", fill="black")
+    image.save(image_path)
+
+    pdf = canvas.Canvas(str(path), pagesize=A4)
+    _, height = A4
+    pdf.setFont("Helvetica", 12)
+    pdf.drawString(54, height - 64, "The same PDF image object is drawn twice.")
+    pdf.drawImage(str(image_path), 54, height - 180, width=120, height=60)
+    pdf.drawImage(str(image_path), 240, height - 300, width=120, height=60)
+    pdf.showPage()
+    pdf.save()
+    return path
+
+
 class PdfExtractionTests(unittest.TestCase):
     def test_page_layout_box_is_not_treated_as_a_data_table(self) -> None:
         lines = [
@@ -107,6 +134,100 @@ class PdfExtractionTests(unittest.TestCase):
         self.assertFalse(
             _looks_like_layout_table((40, 130, 300, 190), lines, page_height=700)
         )
+
+    def test_lossless_layout_table_recovery_is_informational(self) -> None:
+        self.assertEqual(
+            _status_from_warnings(
+                ["page_1:layout_table_rejected_to_preserve_reading_order"]
+            ),
+            "completed",
+        )
+        self.assertEqual(
+            _status_from_warnings(["page_1:missing_text_layer"]),
+            "partial",
+        )
+
+    def test_unicode_font_name_is_not_mistaken_for_code_font(self) -> None:
+        self.assertIsNone(_MONO_FONT_RE.search("AAAAAB+LucidaSansUnicode"))
+        self.assertIsNotNone(_MONO_FONT_RE.search("AAAADE+Consolas"))
+
+    def test_prose_arrow_is_not_mistaken_for_formula(self) -> None:
+        self.assertFalse(
+            _looks_like_formula(
+                "Integral types: byte, short, int, long => whole numbers"
+            )
+        )
+        self.assertTrue(_looks_like_formula("E = mc^2"))
+        self.assertFalse(_looks_like_formula("The assignment operator = assigns the value"))
+        self.assertTrue(_looks_like_code("int number1 = 1;"))
+        self.assertTrue(_looks_like_code("sum = number1 + number2;"))
+
+    def test_list_labels_and_condition_prose_are_not_display_formulas(self) -> None:
+        self.assertFalse(_looks_like_formula("- In short, JRE = JVM + Library classes"))
+        self.assertFalse(_looks_like_formula("- Equality operators: == and !="))
+        self.assertFalse(_looks_like_formula("Condition: score >= 90"))
+        self.assertFalse(_looks_like_formula("1 Condition: score >= 90"))
+        self.assertFalse(_looks_like_formula("and score >= 80"))
+        self.assertFalse(
+            _looks_like_formula('regardless of the condition “radius >= 0”.')
+        )
+
+    def test_commented_and_fullwidth_terminated_assignments_are_code(self) -> None:
+        self.assertTrue(
+            _looks_like_code(
+                "gradeCounter = gradeCounter + 1; // increment counter"
+            )
+        )
+        self.assertTrue(
+            _looks_like_code("b = a + 4; must be declared before assigned a value")
+        )
+        self.assertTrue(_looks_like_code("gradeCounter += 1；"))
+        self.assertFalse(_looks_like_code("E = mc^2"))
+
+    def test_dingbat_bullet_is_merged_without_deleting_code_brace(self) -> None:
+        lines = [
+            {
+                "top": 100.0,
+                "bottom": 120.0,
+                "x0": 72.0,
+                "text": "List item",
+                "size": 12.0,
+                "fonts": ["ArialMT"],
+            },
+            {
+                "top": 104.0,
+                "bottom": 118.0,
+                "x0": 48.0,
+                "text": "}",
+                "size": 10.0,
+                "fonts": ["Subset+Wingdings3"],
+            },
+            {
+                "top": 140.0,
+                "bottom": 154.0,
+                "x0": 72.0,
+                "text": "}",
+                "size": 10.0,
+                "fonts": ["Subset+Consolas"],
+            },
+        ]
+
+        merged = _merge_dingbat_bullets(lines)
+
+        self.assertEqual([line["text"] for line in merged], ["- List item", "}"])
+
+    def test_repeated_image_occurrences_are_not_missing_unique_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            source = make_repeated_image_pdf(tmp_path / "repeated-image.pdf")
+
+            result = extract_pdf(source, tmp_path / "assets")
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["quality"]["image_count"], 2)
+            self.assertEqual(result["quality"]["image_asset_count"], 1)
+            self.assertEqual(result["assets"][0]["occurrence_count"], 2)
+            self.assertNotIn("image_export_incomplete", "\n".join(result["warnings"]))
 
     def test_text_pdf_preserves_source_and_extracts_traceable_structure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

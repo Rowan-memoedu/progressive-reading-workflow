@@ -15,9 +15,11 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
 const appScript = path.join(__dirname, "progressive-reading-app.mjs");
-const localIrSource = path.resolve(projectRoot, "..", "Obsidian Local Incremental Reading Plugin", "main.ts");
+const localIrSource = path.resolve(process.env.OBSIDIAN_LOCAL_IR_SOURCE || path.join(projectRoot, '..', 'ObsidianLocalIR', 'main.ts'));
 const browserBackground = path.join(projectRoot, "browser-highlight-extension", "background.js");
-const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), "local-ir-shared-url-snapshot-e2e-"));
+const testBase = "D:/Artifacts/ProgressiveReading/auth-tests";
+await fs.mkdir(testBase, { recursive: true });
+const testRoot = await fs.mkdtemp(path.join(testBase, "shared-snapshot-"));
 const workflowRoot = path.join(testRoot, "workflow");
 const snapshotPath = path.join(testRoot, "synthetic-cookie-snapshot-v1.json");
 const secretPattern = /fixture_(?:root|path|secure|expired|cross|domain|hostonly|partitioned)_secret/u;
@@ -148,6 +150,8 @@ async function allTextFiles(root) {
 }
 
 await fs.mkdir(workflowRoot, { recursive: true });
+await fs.mkdir(path.join(workflowRoot, "config"), { recursive: true });
+await fs.copyFile(path.join(projectRoot, "config/import-destination-routes.json"), path.join(workflowRoot, "config/import-destination-routes.json"));
 await fs.writeFile(snapshotPath, `${JSON.stringify(buildSnapshot(), null, 2)}\n`, "utf8");
 
 const unitJar = new ChromeCookieJar();
@@ -326,5 +330,5 @@ try {
   await stopChild(app).catch(() => undefined);
   await close(sourceServer);
   await close(crossServer);
-  await fs.rm(testRoot, { recursive: true, force: true });
+  await fs.writeFile(path.join(testRoot, "service.log"), stdout + stderr);
 }

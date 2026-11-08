@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import http from "node:http";
-import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -12,11 +11,17 @@ import {
   validateChromeCookieSyncOrigin
 } from "./chrome-cookie-jar.mjs";
 import { URL_COOKIE_ENV, fetchUrlWithoutBrowser } from "./url-background-fetch.mjs";
+import { COOKIE_SYNC_EXTENSION_ID, COOKIE_SNAPSHOT_ENDPOINT } from "./live-cookie-snapshot.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appScript = path.join(__dirname, "progressive-reading-app.mjs");
-const workflowRoot = await fs.mkdtemp(path.join(os.tmpdir(), "local-ir-chrome-cookie-jar-"));
-const extensionOrigin = `chrome-extension://${"a".repeat(32)}`;
+const evidenceRoot = "D:/Artifacts/ProgressiveReading/auth-tests";
+await fs.mkdir(evidenceRoot, { recursive: true });
+const testRoot = await fs.mkdtemp(path.join(evidenceRoot, "cookie-contract-"));
+const workflowRoot = path.join(testRoot, "workflow");
+await fs.mkdir(path.join(workflowRoot, "config"), { recursive: true });
+await fs.copyFile(path.join(__dirname, "../config/import-destination-routes.json"), path.join(workflowRoot, "config/import-destination-routes.json"));
+const extensionOrigin = `chrome-extension://${COOKIE_SYNC_EXTENSION_ID}`;
 const nowSeconds = 2_000_000_000;
 const secretPattern = /synthetic_secret_[0-9]+|synthetic_root_value|synthetic_secure_value|synthetic_other_value|synthetic_runtime_auth/u;
 
@@ -35,6 +40,15 @@ function syntheticCookie(overrides = {}) {
     storeId: "0",
     partitionKey: null,
     ...overrides
+  };
+}
+
+function snapshot(cookies) {
+  return {
+    schema: "local.chrome-cookie-snapshot", schemaVersion: 1, sensitivity: "local_sensitive_credential",
+    snapshotId: crypto.randomUUID(), generatedAt: new Date().toISOString(),
+    producer: { name: "chrome-cookie-sync-extension", version: "1.1.0", api: "chrome.cookies.getAll", partitionQuery: "all_partition_keys" },
+    profile: { browser: "Google Chrome", scope: "current_regular_profile", storeIds: ["0"] }, cookies
   };
 }
 
@@ -109,10 +123,14 @@ function startApp(port) {
     env: {
       ...process.env,
       [URL_COOKIE_ENV]: "",
+      PROGRESSIVE_READING_COOKIE_SNAPSHOT_PATH: "",
+      PROGRESSIVE_READING_COOKIE_DATA_ROOT: path.join(testRoot, "credentials"),
+      PROGRESSIVE_READING_ENABLE_LEGACY_COOKIE_SYNC: "false",
       NODE_ENV: "test",
       PROGRESSIVE_READING_WORKFLOW_ROOT: workflowRoot,
       PROGRESSIVE_READING_APP_PORT: String(port),
       PROGRESSIVE_READING_WRITE_SERVER_INFO: "false",
+      LEARNING_PROJECT_ROOT: path.join(testRoot, "learning"),
       PROGRESSIVE_READING_BROWSER_PREPROCESS_TEST_PRODUCER: "synthetic"
     }
   });
@@ -131,8 +149,9 @@ async function stopApp(child) {
 async function waitForHealth(baseUrl, predicate = () => true) {
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
+    if (app.child.exitCode !== null) throw new Error("chrome_cookie_jar_fixture_service_exited");
     try {
-      const response = await fetch(`${baseUrl}/api/highlights/health`);
+      const response = await fetch(`${baseUrl}/api/highlights/health`, { signal: AbortSignal.timeout(3000) });
       const health = await response.json();
       if (response.ok && predicate(health)) return health;
     } catch {
@@ -143,11 +162,11 @@ async function waitForHealth(baseUrl, predicate = () => true) {
   throw new Error("chrome_cookie_jar_health_timeout");
 }
 
-async function postSync(baseUrl, payload, { origin = extensionOrigin, contentType = "application/json" } = {}) {
+async function postSync(baseUrl, payload, { origin = extensionOrigin, contentType = "application/json", endpoint = COOKIE_SNAPSHOT_ENDPOINT } = {}) {
   const headers = {};
   if (origin !== null) headers.Origin = origin;
   if (contentType !== null) headers["Content-Type"] = contentType;
-  const response = await fetch(`${baseUrl}/api/browser-import/cookies/sync`, {
+  const response = await fetch(`${baseUrl}${endpoint}`, {
     method: "POST",
     headers,
     body: JSON.stringify(payload)
@@ -201,11 +220,16 @@ const sourcePort = sourceServer.address().port;
 const port = await freePort();
 const baseUrl = `http://127.0.0.1:${port}`;
 let app = startApp(port);
+const report = { status: "running", production_credentials_read: false, checks: [] };
 try {
   const initial = await waitForHealth(baseUrl);
   assert.equal(initial.cookieSync.schema, CHROME_COOKIE_JAR_SYNC_SCHEMA);
   assert.equal(initial.cookieSync.atomicReplace, true);
   assert.equal(initial.cookieSync.state.cookie_count, 0);
+  assert.equal(initial.cookieSync.runtimeReplacementEnabled, false);
+  const retired = await postSync(baseUrl, { schema: CHROME_COOKIE_JAR_SYNC_SCHEMA, cookies: [] }, { endpoint: "/api/browser-import/cookies/sync" });
+  assert.equal(retired.response.status, 422);
+  assert.equal(retired.data.error, "cookie_sync_runtime_replacement_retired_use_snapshot");
 
   const largeCookies = Array.from({ length: 5_000 }, (_, index) => syntheticCookie({
     name: `synthetic_cookie_${index}`,
@@ -221,42 +245,43 @@ try {
     hostOnly: false,
     partitionKey: { topLevelSite: "https://top.test" }
   }));
-  const accepted = await postSync(baseUrl, { schema: CHROME_COOKIE_JAR_SYNC_SCHEMA, cookies: largeCookies });
+  const accepted = await postSync(baseUrl, snapshot(largeCookies));
   assert.equal(accepted.response.status, 200);
   assert.equal(accepted.data.cookie_count, 5_000);
   assert.equal(accepted.data.domain_count, 1);
-  assert.equal(accepted.data.skipped_partitioned_count, 1);
-  assert.match(accepted.data.fingerprint, /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(accepted.data.persistence, "local_credential_file");
+  assert.equal(accepted.data.resync_required_after_restart, false);
   assert.doesNotMatch(accepted.text, secretPattern);
   assert.doesNotMatch(accepted.text, /synthetic_cookie_/u);
 
   const configured = await waitForHealth(baseUrl, (health) => health.cookieSync.state.cookie_count === 5_000);
   assert.equal(configured.cookieSync.state.domain_count, 1);
   assert.equal(configured.cookieSync.state.skipped_count, 1);
+  assert.equal(configured.cookieSync.state.skipped_partitioned_count, 1);
+  assert.match(configured.cookieSync.state.fingerprint, /^sha256:[a-f0-9]{64}$/u);
   assert.doesNotMatch(JSON.stringify(configured), secretPattern);
   assert.doesNotMatch(JSON.stringify(configured), /synthetic_cookie_/u);
 
-  const missingOrigin = await postSync(baseUrl, { schema: CHROME_COOKIE_JAR_SYNC_SCHEMA, cookies: [] }, { origin: null });
+  const missingOrigin = await postSync(baseUrl, snapshot([]), { origin: null });
   assert.equal(missingOrigin.response.status, 403);
-  const webOrigin = await postSync(baseUrl, { schema: CHROME_COOKIE_JAR_SYNC_SCHEMA, cookies: [] }, { origin: "https://example.com" });
+  const webOrigin = await postSync(baseUrl, snapshot([]), { origin: "https://example.com" });
   assert.equal(webOrigin.response.status, 403);
-  const wrongType = await postSync(baseUrl, { schema: CHROME_COOKIE_JAR_SYNC_SCHEMA, cookies: [] }, { contentType: "text/plain" });
+  const wrongExtension = await postSync(baseUrl, snapshot([]), { origin: `chrome-extension://${"a".repeat(32)}` });
+  assert.equal(wrongExtension.response.status, 403);
+  const wrongType = await postSync(baseUrl, snapshot([]), { contentType: "text/plain" });
   assert.equal(wrongType.response.status, 415);
   const invalidSchema = await postSync(baseUrl, { schema: "invalid", cookies: [] });
-  assert.equal(invalidSchema.response.status, 422);
+  assert.equal(invalidSchema.response.status, 400);
 
   const afterRejected = await waitForHealth(baseUrl);
   assert.equal(afterRejected.cookieSync.state.cookie_count, 5_000, "rejected sync must preserve the previous jar atomically");
 
-  const runtimeSync = await postSync(baseUrl, {
-    schema: CHROME_COOKIE_JAR_SYNC_SCHEMA,
-    cookies: [syntheticCookie({
+  const runtimeSync = await postSync(baseUrl, snapshot([syntheticCookie({
       name: "runtime_auth",
       value: "synthetic_runtime_auth",
       domain: "127.0.0.1",
       hostOnly: true
-    })]
-  });
+    })]));
   assert.equal(runtimeSync.response.status, 200);
   assert.equal(runtimeSync.data.cookie_count, 1);
   const importResponse = await fetch(`${baseUrl}/api/browser-import/requests`, {
@@ -265,6 +290,7 @@ try {
     body: JSON.stringify({
       urls: [`http://127.0.0.1:${sourcePort}/protected-article`],
       source: "synthetic_chrome_cookie_jar_e2e",
+      entry_route: "obsidian",
       client_request_id: "synthetic-chrome-cookie-jar-e2e"
     })
   });
@@ -280,14 +306,17 @@ try {
   await stopApp(app.child);
   app = startApp(port);
   const restarted = await waitForHealth(baseUrl);
-  assert.equal(restarted.cookieSync.state.configured, false);
-  assert.equal(restarted.cookieSync.state.cookie_count, 0);
+  assert.equal(restarted.cookieSnapshot.loaded, true);
+  assert.equal(restarted.cookieSync.state.cookie_count, 1);
+  const signedOut = await postSync(baseUrl, snapshot([]));
+  assert.equal(signedOut.response.status, 200);
+  assert.equal(signedOut.data.cookie_count, 0);
 
   const oversizedStatus = await new Promise((resolve, reject) => {
     const request = http.request({
       hostname: "127.0.0.1",
       port,
-      path: "/api/browser-import/cookies/sync",
+      path: COOKIE_SNAPSHOT_ENDPOINT,
       method: "POST",
       headers: {
         Origin: extensionOrigin,
@@ -303,9 +332,9 @@ try {
   });
   assert.equal(oversizedStatus, 413);
 
-  console.log(JSON.stringify({
-    status: "passed",
-    checks: [
+  report.status = "passed";
+  report.checks = [
+      "legacy_runtime_replacement_remains_retired",
       "strict_chrome_extension_origin",
       "full_cookie_attribute_validation",
       "host_only_and_domain_matching",
@@ -315,15 +344,18 @@ try {
       "partitioned_cookie_skip_count",
       "large_atomic_replace_5000",
       "rejected_sync_preserves_active_jar",
-      "normal_broker_import_uses_process_memory_jar",
-      "response_health_logs_and_disk_redaction",
-      "restart_clears_process_memory_jar",
+      "normal_broker_import_uses_live_snapshot_jar",
+      "response_health_logs_and_workflow_redaction",
+      "restart_restores_versioned_snapshot",
+      "empty_snapshot_clears_login",
       "legacy_env_not_required",
       "normal_url_import_fetch_contract_unchanged"
-    ]
-  }, null, 2));
-} finally {
+    ];
+  console.log(JSON.stringify({ ...report, receipt: path.join(testRoot, "acceptance.json") }, null, 2));
+} catch (error) { report.status = "failed"; report.error = error.message; throw error; }
+finally {
   await stopApp(app.child).catch(() => undefined);
   await new Promise((resolve) => sourceServer.close(resolve));
-  await fs.rm(workflowRoot, { recursive: true, force: true });
+  await fs.writeFile(path.join(testRoot, "service.log"), app.output.stdout + app.output.stderr);
+  await fs.writeFile(path.join(testRoot, "acceptance.json"), JSON.stringify(report, null, 2));
 }

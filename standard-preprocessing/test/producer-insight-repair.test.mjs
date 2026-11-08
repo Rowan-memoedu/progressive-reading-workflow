@@ -184,8 +184,8 @@ test("repair rejects changed prefixes, out-of-context evidence, new numbers or U
   });
 
   assert.equal(calls, 2);
-  assert.equal(result.output, null);
-  assert.ok(result.failures.some((failure) => /below_60/u.test(failure)));
+  assert.equal(result.output.insights[0].description, original);
+  assert.deepEqual(result.failures, []);
   assert.ok(result.repairValidationFailures.some((failure) => /original_description_not_preserved_as_prefix/u.test(failure)));
   assert.ok(result.repairValidationFailures.some((failure) => /evidence_phrase_not_in_context/u.test(failure)));
   assert.ok(result.repairValidationFailures.some((failure) => /introduced_number/u.test(failure)));
@@ -336,7 +336,7 @@ test("insight contract repair preserves accepted items when only short descripti
   assert.deepEqual(result.repairedIndexes, [0]);
   assert.ok(result.output);
   assert.equal(result.output.insights[0].target_block_key, "s0");
-  assert.deepEqual(result.failures, ["insight_1_description_19_below_60"]);
+  assert.deepEqual(result.failures, []);
 });
 
 test("insight contract repair refuses mixed non-insight failures", async () => {

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>链接导入 · 渐进阅读</title>
+  <link rel="stylesheet" href="/import/style.css">
+  <script type="module" src="/import/app.mjs"></script>
+</head>
+<body>
+  <main>
+    <header><div><p class="eyebrow">渐进阅读 / 导入</p><h1>把想读的内容，放进阅读区。</h1><p class="intro">粘贴文字或 Markdown 中的链接，自动识别、去重并批量导入。</p></div><nav><a class="legacy" href="/subscriptions">订阅管理</a> · <a class="legacy" href="/">原导入台 ↗</a></nav></header>
+    <p id="health" class="health" role="status">正在连接本地服务…</p>
+    <section class="rules-panel" aria-labelledby="rules-title">
+      <details open><summary id="rules-title">导入规则清单</summary><p class="hint">允许高级与复杂导入。命中规则后自动展开，进度和失败原因仍逐项可查。</p><div id="rules-list" role="status">正在读取规则…</div></details>
+    </section>
+    <div class="workspace">
+      <section class="panel input-panel" aria-labelledby="input-title">
+        <div class="section-title"><h2 id="input-title">添加链接</h2><span class="muted">每批最多 50 个</span></div>
+        <label for="input">链接、文字或 Markdown</label>
+        <textarea id="input" rows="8" spellcheck="false" placeholder="把链接粘贴到这里，例如：&#10;https://example.com/article&#10;[另一篇文章](https://example.org/post)"></textarea>
+        <label for="instruction">加工要求 <span class="muted">（可选）</span></label>
+        <textarea id="instruction" rows="2" placeholder="例如：保留专业术语和代码块。"></textarea>
+        <details class="processing-panel"><summary>分类与处理选择（可选）</summary><p class="hint">明确选择优先；自动项按材料类型决定。强结构化整理仅在开启时执行，适用于字幕和文字资料；关闭时，字幕只做全文口语转书面。文学、数理讲义默认不生成导读。</p><div id="processing-options" class="processing-options"></div></details>
+        <p class="hint">按网站域名存入阅读区。知乎专栏默认导入全部文章，自动分批；已有内容由后端识别并复用。</p>
+        <div class="actions"><button id="start" type="button" disabled>导入到阅读区</button><button id="clear" class="secondary" type="button">清空输入</button></div>
+        <p id="input-message" role="status" class="hint"></p>
+        <details id="preview"><summary id="preview-count">尚未识别到链接</summary><ol id="preview-list"></ol></details>
+      </section>
+      <section class="panel results-panel" aria-labelledby="results-title">
+        <div class="section-title"><h2 id="results-title">导入进度</h2><button id="retry-all" class="secondary small" type="button" hidden>重试失败项</button></div>
+        <p id="summary" role="status" aria-live="polite">添加链接后，这里会逐条显示进度与结果。</p>
+        <progress id="progress" value="0" max="1" hidden aria-label="导入完成进度"></progress>
+        <div id="connection" role="status" hidden><p id="connection-message"></p><button id="resume" class="secondary small" type="button">继续提交 / 查询</button></div>
+        <p id="storage-message" class="error" role="status"></p>
+        <ol id="results"></ol>
+        <details id="history" hidden><summary>请求与重试记录</summary><div id="history-list"></div></details>
+      </section>
+    </div>
+    <footer>进度保存在本标签页，刷新后可继续查询。显示“已导入”表示后端已返回正式文件回执。</footer>
+    <noscript>请启用 JavaScript 以识别链接和查询导入进度。</noscript>
+  </main>
+</body>
+</html>

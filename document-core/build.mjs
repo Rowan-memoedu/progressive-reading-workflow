@@ -1,0 +1,15 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+const source = fileURLToPath(new URL("../browser-highlight-extension/", import.meta.url));
+const output = path.resolve(process.env.LOCAL_IR_CORE_BUILD_DIR || "D:/Artifacts/local-ir-document-core/browser-extension");
+if (output === path.resolve(source) || output.startsWith(path.resolve(source) + path.sep)) throw new Error("Build output must be isolated from the active extension.");
+await fs.mkdir(path.join(output, "lib"), { recursive: true });
+const files = (await fs.readdir(source)).filter(name => /\.(js|css|html|json)$/.test(name));
+for (const name of files) await fs.copyFile(name === "draft-core.js" ? new URL("core.js", import.meta.url) : path.join(source, name), path.join(output, name));
+await fs.copyFile(path.join(source, "lib/web-highlighter.min.js"), path.join(output, "lib/web-highlighter.min.js"));
+const hashes = {};
+for (const name of [...files, "lib/web-highlighter.min.js"]) hashes[name] = createHash("sha256").update(await fs.readFile(path.join(output, name))).digest("hex");
+await fs.writeFile(path.join(output, "build-receipt.json"), JSON.stringify({ moduleVersion: "0.1.0", source: "document-core/core.js", hashes }, null, 2));
+console.log("Isolated classic-script extension: " + output);

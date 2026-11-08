@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { JSDOM } from "jsdom";
@@ -8,6 +8,9 @@ import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
 import sanitize from "sanitize-filename";
+import { preprocessNetworkMarkdown } from "../standard-preprocessing/integrations/network-import.mjs";
+import { publishReadingArtifact } from "../standard-preprocessing/index.mjs";
+import { sha256 } from "../standard-preprocessing/lib/core.mjs";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -17,8 +20,6 @@ const defaultOutDir = path.join(workflowRoot, "imports", "Web Markdown Import Ex
 const guidedRunName = `${new Date().toISOString().slice(0, 10)}-guided-wechat`;
 const defaultGuidedOutDir = path.join(workflowRoot, "阅读区", "微信", guidedRunName);
 const defaultGuidedStagingDir = path.join(workflowRoot, "imports", "wechat", guidedRunName);
-const producerConfigDir = path.join(process.env.USERPROFILE || process.env.HOME || "", "Documents", "New project");
-const producerConfigKeys = ["AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL"];
 const csdiyRepoUrl = "https://github.com/PKUFlyingPig/cs-self-learning.git";
 const csdiyRawBase = "https://raw.githubusercontent.com/PKUFlyingPig/cs-self-learning/master/";
 const csPlanRepoUrl = "https://github.com/MingLLuo/CS-Plan.git";
@@ -49,6 +50,7 @@ let guidedWechat = false;
 let importInstruction = "";
 let browserContentPath = "";
 let receiptPath = "";
+let processingOptions = {};
 
 for (let i = 0; i < args.length; i += 1) {
   if (args[i] === "--out" && args[i + 1]) {
@@ -60,6 +62,8 @@ for (let i = 0; i < args.length; i += 1) {
   } else if (args[i] === "--instruction" && args[i + 1]) {
     importInstruction = args[i + 1];
     i += 1;
+  } else if (args[i] === "--processing-options" && args[i + 1]) {
+    processingOptions = JSON.parse(await fs.readFile(path.resolve(args[++i]), "utf8"));
   } else if (args[i] === "--browser-content" && args[i + 1]) {
     browserContentPath = path.resolve(args[i + 1]);
     i += 1;
@@ -435,7 +439,7 @@ function wechatHtmlToMarkdown(html, url) {
   };
 }
 
-async function writeMarkdown(url, result) {
+async function writeMarkdown(url, result, options = processingOptions) {
   await fs.mkdir(outDir, { recursive: true });
   const parsed = new URL(url);
   const title = result.title || result.markdown.match(/^#\s+(.+)$/m)?.[1] || parsed.hostname;
@@ -450,433 +454,30 @@ async function writeMarkdown(url, result) {
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
-  const now = new Date().toISOString();
-  const sourceLine = result.rawUrl ? `source_markdown_url: ${yamlString(result.rawUrl)}\n` : "";
-  const outline = await ensureMarkdownOutline({
-    markdown: result.markdown,
-    title,
-    url,
-    method: result.method
+  const outputDir = path.join(stagingDir, "standard-preprocessing", sha256(url).slice(0, 16));
+  const run = await preprocessNetworkMarkdown({
+    markdown: result.markdown, sourceType: result.method || "network_markdown",
+    sourceMetadata: {
+      source_url: url, title, input_form: "written", source_is_original: true,
+      author: result.author || "", published_at: result.publishedAt || "",
+      ...(result.rawUrl ? { source_markdown_url: result.rawUrl } : {}),
+      ...(result.sourceColumns ? { source_columns: result.sourceColumns } : {}),
+      ...(result.sourceColumnUrls ? { source_column_urls: result.sourceColumnUrls } : {})
+    },
+    userInstruction: importInstruction, processingOptions: options, outputDir,
+    cacheDir: path.join(workflowRoot, ".local-ir", "browser-standard-preprocess", ".cache")
   });
-  const guide = await generateReadingGuideForImport({
-    markdown: result.markdown,
-    title,
-    url,
-    author: result.author || "",
-    publishedAt: result.publishedAt || ""
-  });
-  const body = [
-    "---",
-    `source_url: ${yamlString(url)}`,
-    sourceLine.trim() || null,
-    `source_title: ${yamlString(title)}`,
-    `imported_at: ${yamlString(now)}`,
-    `import_method: ${yamlString(result.method)}`,
-    `outline_method: ${yamlString(outline.method)}`,
-    `reading_guide_method: ${yamlString(guide.method)}`,
-    result.sourceColumn ? `source_column: ${yamlString(result.sourceColumn)}` : null,
-    result.sourceColumnUrl ? `source_column_url: ${yamlString(result.sourceColumnUrl)}` : null,
-    result.sourceColumns?.length ? `source_columns: ${yamlString(JSON.stringify(result.sourceColumns))}` : null,
-    result.sourceColumnUrls?.length ? `source_column_urls: ${yamlString(JSON.stringify(result.sourceColumnUrls))}` : null,
-    result.sourceItemId ? `source_item_id: ${yamlString(result.sourceItemId)}` : null,
-    "status: imported",
-    "reading_guide: true",
-    "---",
-    "",
-    "<!-- reading-guide:start -->",
-    "",
-    guide.markdown.trim(),
-    "",
-    "<!-- reading-guide:end -->",
-    "",
-    "---",
-    "",
-    "## 原文",
-    "",
-    outline.markdown.trim(),
-    ""
-  ].filter((line) => line !== null).join("\n");
-  await fs.writeFile(target, body, "utf8");
-  return target;
-}
-
-async function loadProducerConfig() {
-  const config = {};
-  for (const key of producerConfigKeys) {
-    config[key] = process.env[key] || readWindowsUserEnv(key) || "";
-  }
-
-  const markdownConfig = await readMarkdownProducerConfig();
-  for (const key of producerConfigKeys) {
-    if (!config[key] && markdownConfig[key]) config[key] = markdownConfig[key];
-  }
-
-  const missing = producerConfigKeys.filter((key) => !config[key]);
-  if (missing.length) throw new Error(`missing_api_config_${missing.join("_")}`);
-  return config;
-}
-
-function readWindowsUserEnv(key) {
-  if (process.platform !== "win32") return "";
-  try {
-    return execFileSync("powershell.exe", [
-      "-NoProfile",
-      "-Command",
-      `[Environment]::GetEnvironmentVariable('${key}', 'User')`
-    ], { encoding: "utf8", windowsHide: true }).trim();
-  } catch {
-    return "";
-  }
-}
-
-async function readMarkdownProducerConfig() {
-  try {
-    const entries = await fs.readdir(producerConfigDir, { withFileTypes: true });
-    const configFile = entries.find((entry) => entry.isFile() && /^DeepSeek API.*\.md$/i.test(entry.name));
-    if (!configFile) return {};
-    const text = await fs.readFile(path.join(producerConfigDir, configFile.name), "utf8");
-    const config = {};
-    for (const line of text.split(/\r?\n/)) {
-      const match = /^(AI_PRODUCER_[A-Z_]+)\s*=\s*(.+?)\s*$/.exec(line.trim());
-      if (match) config[match[1]] = match[2];
-    }
-    return config;
-  } catch {
-    return {};
-  }
-}
-
-function chatCompletionsUrl(baseUrl) {
-  const trimmed = String(baseUrl || "").replace(/\/+$/, "");
-  if (/\/chat\/completions$/i.test(trimmed)) return trimmed;
-  return `${trimmed}/chat/completions`;
-}
-
-function stripModelFences(text) {
-  return String(text || "")
-    .trim()
-    .replace(/^```(?:markdown|md)?\s*/i, "")
-    .replace(/\s*```$/i, "")
-    .trim();
-}
-
-function textForGuide(markdown, maxChars = 60000) {
-  return markdown
-    .replace(/^---[\s\S]*?---\s*/g, "")
-    .replace(/!\[[^\]]*?\]\([^)]+?\)/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .slice(0, maxChars);
-}
-
-async function callDeepSeekForGuide(config, { title, url, author, publishedAt, markdown, instruction = "" }) {
-  const prompt = [
-    "你要为一篇即将进入渐进阅读流程的文章生成“阅读前置卡”。",
-    "它不是传统摘要，不要复述全文，不要写成读后感，不要补充外部事实。",
-    "这张卡的目标是先用极高密度判断这篇文章的核心、洞见、个人价值、信息密度、能解决的痛点、具体用处，以及是否急需阅读。",
-    "",
-    "必须输出 Markdown，且严格使用这些标题：",
-    "## 阅读前置卡",
-    "### 一句话核心",
-    "### 核心洞见",
-    "### 对我的价值判断",
-    "### 信息密度判断",
-    "### 能解决我的什么痛点",
-    "### 具体用处",
-    "### 是否急需阅读",
-    "",
-    "具体要求：",
-    "- “一句话核心”只写 1 句话，直接概括这篇文章最核心的东西是什么。",
-    "- “核心洞见”列 3-6 条，用高度凝练的转述表达最重要的观点、判断、模型、案例或概念，不要大段引用原文。",
-    "- “对我的价值判断”必须给 高 / 中 / 低 / 跳过 之一，并用 1-3 句话说明对这个读者的价值性，不要泛泛夸奖。",
-    "- “信息密度判断”必须给 高 / 中 / 低 之一，并说明密度来自新事实、新框架、真实案例、方法论、经验判断，还是只是观点重复。",
-    "- “能解决我的什么痛点”列 2-5 条，必须结合读者背景，指出它能缓解或推进的具体问题。",
-    "- “具体用处”列 2-5 条，说明它可用于 RemNote 卡片、渐进阅读高亮、AI 工作流、教育产品、课程/讲义、创业判断、研究选题或写作中的哪类沉淀。",
-    "- “是否急需阅读”必须给 急需 / 近期 / 可延后 / 可跳过 之一，并给一句理由。",
-    "- 不要写阅读路径，不要写带着哪些问题读，不要写传统摘要，不要写鸡汤式评价。",
-    "- 不要输出 YAML，不要输出代码块。",
-    "",
-    "用户本次导入补充要求：",
-    instruction.trim() || "无",
-    "",
-    "读者背景，只用于判断个人相关性，不要捏造额外事实：",
-    "- 读者正在搭建以 RemNote、Codex、AI Agent、渐进阅读和卡片化沉淀为核心的个人知识与生产系统。",
-    "- 读者关注 AI 工作流、Agent 编排、教育科技、学习科学、间隔重复、增量阅读、课程/讲义生产、创业与产品判断。",
-    "- 读者偏好高密度、可操作、能沉淀为卡片或工作流的材料；反感空泛总结、营销式判断和低信息密度内容。",
-    "",
-    `标题：${title || ""}`,
-    `链接：${url}`,
-    `作者/账号：${author || ""}`,
-    `发布时间：${publishedAt || ""}`,
-    "",
-    "原文 Markdown：",
-    textForGuide(markdown)
-  ].join("\n");
-
-  const payload = {
-    model: config.AI_PRODUCER_MODEL,
-    temperature: 0.2,
-    messages: [
-      {
-        role: "system",
-        content: "你是面向渐进阅读的导读编辑。你只生成读前价值判断卡，不生成传统摘要，不新增外部事实。"
-      },
-      { role: "user", content: prompt }
-    ]
+  const receipt = {
+    processing_mode: "standard_preprocess", preprocess_status: run.result.status,
+    processor_version: run.result.receipt.processor_version, processing_plan: run.result.receipt.workflow_route?.plan,
+    reading_guide: run.result.receipt.reading_guide, model_calls: run.result.receipt.model.calls,
+    missing_labels: run.result.receipt.workflow_route?.missing_labels || [], preprocess_output_dir: outputDir
   };
-
-  let lastError = null;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      const response = await fetch(chatCompletionsUrl(config.AI_PRODUCER_BASE_URL), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${config.AI_PRODUCER_API_KEY}`
-        },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(180000)
-      });
-      if (!response.ok) throw new Error(`api_${response.status}_${(await response.text()).slice(0, 500)}`);
-      const data = await response.json();
-      const guide = stripModelFences(data?.choices?.[0]?.message?.content || "");
-      validateGuide(guide);
-      return guide;
-    } catch (error) {
-      lastError = error;
-      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
-    }
-  }
-  throw lastError;
-}
-
-function validateGuide(guide) {
-  const required = [
-    "## 阅读前置卡",
-    "### 一句话核心",
-    "### 核心洞见",
-    "### 对我的价值判断",
-    "### 信息密度判断",
-    "### 能解决我的什么痛点",
-    "### 具体用处",
-    "### 是否急需阅读"
-  ];
-  const missing = required.filter((heading) => !guide.includes(heading));
-  if (missing.length) throw new Error(`guide_missing_sections_${missing.join("_")}`);
-  if (guide.length < 350) throw new Error("guide_too_short");
-}
-
-async function generateReadingGuideForImport({ markdown, title, url, author = "", publishedAt = "" }) {
-  try {
-    const config = await loadProducerConfig();
-    const guide = await callDeepSeekForGuide(config, {
-      title,
-      url,
-      author,
-      publishedAt,
-      markdown,
-      instruction: importInstruction
-    });
-    return { markdown: guide, method: "deepseek_reading_guide" };
-  } catch (error) {
-    return {
-      markdown: [
-        "## 阅读前置卡",
-        "",
-        "### 一句话核心",
-        "",
-        "- AI 前置卡生成失败，保留原文进入阅读流程。",
-        "",
-        "### 核心洞见",
-        "",
-        "- 待阅读时人工判断。",
-        "",
-        "### 对我的价值判断",
-        "",
-        "- 待判断。",
-        "",
-        "### 信息密度判断",
-        "",
-        "- 待判断。",
-        "",
-        "### 能解决我的什么痛点",
-        "",
-        "- 待判断。",
-        "",
-        "### 具体用处",
-        "",
-        "- 待判断。",
-        "",
-        "### 是否急需阅读",
-        "",
-        `- 待判断。生成失败原因：${error.message}`
-      ].join("\n"),
-      method: "fallback_after_ai_error"
-    };
-  }
-}
-
-async function ensureMarkdownOutline({ markdown, title, url, method }) {
-  const normalized = String(markdown || "").trim();
-  if (hasUsableOutline(normalized)) {
-    return { markdown: normalized, method: "existing_headings" };
-  }
-
-  try {
-    const config = await loadProducerConfig();
-    const structured = await callDeepSeekForOutline(config, {
-      title,
-      url,
-      method,
-      markdown: normalized
-    });
-    if (hasUsableOutline(structured)) {
-      return { markdown: structured, method: "deepseek_outline" };
-    }
-    return {
-      markdown: fallbackOutlineMarkdown(normalized, title),
-      method: "fallback_body_heading_after_ai_validation_failed"
-    };
-  } catch (error) {
-    console.error(`outline generation failed for ${url}: ${error.message}`);
-    return {
-      markdown: fallbackOutlineMarkdown(normalized, title),
-      method: "fallback_body_heading_after_ai_error"
-    };
-  }
-}
-
-async function callDeepSeekForOutline(config, { title, url, method, markdown }) {
-  const prompt = [
-    "你要把一篇即将进入 Obsidian 渐进阅读流程的 Markdown 文章补出简洁层级标题。",
-    "目标：让 Obsidian 右侧 Outline 能看到文章结构，方便逐层阅读。",
-    "",
-    "严格要求：",
-    "- 只在合适位置插入 Markdown 标题，不写目录，不写摘要，不写阅读建议。",
-    "- 尽量保留原文全部段落、列表、引用、链接和顺序。",
-    "- 不要改写原文句子，不要删除原文内容，不要新增外部事实。",
-    "- 如果已有一级标题，可以保留；正文中补 3-10 个二级/三级标题。",
-    "- 标题要短，像真实文章小标题，不要写“第一部分/第二部分”这种空标题。",
-    "- 输出完整 Markdown 正文，不要输出 YAML，不要输出代码块。",
-    "",
-    `标题：${title || ""}`,
-    `链接：${url}`,
-    `导入方法：${method || ""}`,
-    "",
-    "原文 Markdown：",
-    textForGuide(markdown, 90000)
-  ].join("\n");
-
-  const payload = {
-    model: config.AI_PRODUCER_MODEL,
-    temperature: 0.1,
-    messages: [
-      {
-        role: "system",
-        content: "你是 Markdown 结构化编辑。你只能插入标题来组织原文，不做摘要和改写。"
-      },
-      { role: "user", content: prompt }
-    ]
-  };
-
-  let lastError = null;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      const response = await fetch(chatCompletionsUrl(config.AI_PRODUCER_BASE_URL), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${config.AI_PRODUCER_API_KEY}`
-        },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(180000)
-      });
-      if (!response.ok) throw new Error(`api_${response.status}_${(await response.text()).slice(0, 500)}`);
-      const data = await response.json();
-      return stripModelFences(data?.choices?.[0]?.message?.content || "");
-    } catch (error) {
-      lastError = error;
-      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
-    }
-  }
-  throw lastError;
-}
-
-function hasUsableOutline(markdown) {
-  const lines = stripFrontmatter(String(markdown || "")).split(/\r?\n/);
-  const headings = lines
-    .map((line) => /^(#{1,6})\s+\S/.exec(line))
-    .filter(Boolean)
-    .map((match) => match[1].length);
-  return headings.some((level) => level >= 2);
-}
-
-function fallbackOutlineMarkdown(markdown, title) {
-  const body = String(markdown || "").trim();
-  if (!body) return `# ${title || "Untitled"}\n\n## 正文\n`;
-  if (/^#\s+\S/m.test(body)) {
-    return body.replace(/^#\s+(.+)$/m, (match) => `${match}\n\n## 正文`);
-  }
-  return `# ${title || "Untitled"}\n\n## 正文\n\n${body}\n`;
-}
-
-function keepsEnoughSourceText(source, structured) {
-  const sourceText = normalizeOutlineComparable(source);
-  const structuredText = normalizeOutlineComparable(structured);
-  if (sourceText.length < 1000) return structuredText.length >= Math.floor(sourceText.length * 0.75);
-  const sample = sourceText.slice(Math.floor(sourceText.length * 0.2), Math.floor(sourceText.length * 0.2) + 500);
-  return structuredText.length >= Math.floor(sourceText.length * 0.75) && structuredText.includes(sample.slice(0, 120));
-}
-
-function normalizeOutlineComparable(value) {
-  return stripFrontmatter(String(value || ""))
-    .replace(/^#{1,6}\s+.+$/gm, "")
-    .replace(/\s+/g, "");
-}
-
-function stripFrontmatter(value) {
-  return String(value || "").replace(/^---\s*[\s\S]*?\n---\s*/, "");
-}
-
-async function writeGuidedMarkdown(url, result, guide) {
-  await fs.mkdir(outDir, { recursive: true });
-  const parsed = new URL(url);
-  const title = result.title || result.markdown.match(/^#\s+(.+)$/m)?.[1] || parsed.hostname;
-  const filename = `${slugFromTitle(title, parsed.hostname)}.md`;
-  const target = path.join(outDir, filename);
-  const now = new Date().toISOString();
-  const outline = await ensureMarkdownOutline({
-    markdown: result.markdown,
-    title,
-    url,
-    method: result.method
-  });
-  const body = [
-    "---",
-    `source_url: ${yamlString(url)}`,
-    `source_title: ${yamlString(title)}`,
-    `imported_at: ${yamlString(now)}`,
-    `import_method: ${yamlString(`${result.method}+deepseek_reading_guide`)}`,
-    `outline_method: ${yamlString(outline.method)}`,
-    importInstruction.trim() ? `import_instruction: ${yamlString(importInstruction.trim())}` : null,
-    "status: imported",
-    "reading_guide: true",
-    "---",
-    "",
-    "<!-- reading-guide:start -->",
-    "",
-    guide.trim(),
-    "",
-    "<!-- reading-guide:end -->",
-    "",
-    "---",
-    "",
-    "## 原文",
-    "",
-    outline.markdown.trim(),
-    ""
-  ].join("\n");
-  await fs.writeFile(target, body, "utf8");
-  return target;
+  if (run.result.status === "needs_classification") return { status: "needs_classification", target: null, receipt };
+  const publication = await publishReadingArtifact(run.result, { publishPath: target, runDir: outputDir });
+  return { target, status: publication.quality_status === "warning" ? "imported_with_warnings" : "imported",
+    artifacts: [{ kind: "markdown", ...publication.markdown }],
+    receipt: { ...receipt, quality_status: publication.quality_status, final_markdown_sha256: publication.markdown.sha256 } };
 }
 
 async function writeGuidedFailure(url, stage, reason, detail = "") {
@@ -977,38 +578,15 @@ async function finishGuidedWechatImport(url, converted, { rawMarkdownPath = "", 
     await fs.writeFile(resolvedRawMarkdownPath, `${converted.markdown.trim()}\n`, "utf8");
   }
 
-  let guide = "";
-  try {
-    const config = await loadProducerConfig();
-    guide = await callDeepSeekForGuide(config, {
-      title: converted.title,
-      url,
-      author: converted.author,
-      publishedAt: converted.publishedAt,
-      markdown: converted.markdown,
-      instruction: importInstruction
-    });
-  } catch (error) {
-    const target = await writeGuidedFailure(url, "guide", error.message, `Raw Markdown: ${resolvedRawMarkdownPath}`);
-    return { url, status: "failed", stage: "guide", reason: error.message, target, raw: resolvedRawMarkdownPath };
-  }
-
-  const guidePath = path.join(stagingDir, `${slug}.guide.md`);
-  await fs.writeFile(guidePath, `${guide.trim()}\n`, "utf8");
-  const target = await writeGuidedMarkdown(url, converted, guide);
+  const processed = await writeMarkdown(url, converted);
   const metaPath = path.join(stagingDir, `${slug}.meta.json`);
   await fs.writeFile(metaPath, `${JSON.stringify({
-    url,
-    title: converted.title,
-    method: converted.method,
-    output: target,
-    rawMarkdown: resolvedRawMarkdownPath,
-    guide: guidePath,
-    cachedRaw,
-    instruction: importInstruction.trim() || undefined,
+    url, title: converted.title, method: converted.method, output: processed.target,
+    rawMarkdown: resolvedRawMarkdownPath, cachedRaw, status: processed.status,
+    preprocess: processed.receipt, instruction: importInstruction.trim() || undefined,
     importedAt: new Date().toISOString()
   }, null, 2)}\n`, "utf8");
-  return { url, status: "imported", method: cachedRaw ? "guided_wechat_cached_raw" : "guided_wechat", target, raw: resolvedRawMarkdownPath, guide: guidePath };
+  return { url, ...processed, method: cachedRaw ? "guided_wechat_cached_raw" : "guided_wechat", raw: resolvedRawMarkdownPath };
 }
 
 async function importGuidedWechatUrl(url) {
@@ -1429,7 +1007,7 @@ async function generateGithubRepoBrief({ repo, url, branch, imported, failures }
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${config.AI_PRODUCER_API_KEY}`
+        "Authorization": `Bearer ${config.DEEPSEEK_READING_API_KEY}`
       },
       body: JSON.stringify({
         model: config.AI_PRODUCER_MODEL,
@@ -2228,14 +1806,13 @@ if (browserContentPath) {
     console.error(`[browser-content ${index + 1}/${capture.items.length}] ${sourceUrl}`);
     try {
       const converted = browserExtractedHtmlToMarkdown(item);
-      const target = await writeMarkdown(sourceUrl, converted);
+      const processed = await writeMarkdown(sourceUrl, converted, { ...processingOptions, ...item.processing_options });
       summary.push({
         index: itemIndex,
         url: sourceUrl,
-        status: "imported",
+        ...processed,
         method: converted.method,
-        column: converted.sourceColumn || "",
-        target
+        column: converted.sourceColumn || ""
       });
     } catch (error) {
       const target = await writeFailure(sourceUrl, error.message);
@@ -2272,8 +1849,8 @@ for (const url of urls) {
 
     const sourceMarkdown = await trySourceMarkdown(url);
     if (sourceMarkdown) {
-      const target = await writeMarkdown(url, sourceMarkdown);
-      summary.push({ url, status: "imported", method: sourceMarkdown.method, target });
+      const processed = await writeMarkdown(url, sourceMarkdown);
+      summary.push({ url, ...processed, method: sourceMarkdown.method });
       continue;
     }
 
@@ -2296,8 +1873,8 @@ for (const url of urls) {
     }
 
     const converted = isWechatMpUrl(url) ? wechatHtmlToMarkdown(text, url) : htmlToMarkdown(text, url);
-    const target = await writeMarkdown(url, converted);
-    summary.push({ url, status: "imported", method: converted.method, target });
+    const processed = await writeMarkdown(url, converted);
+    summary.push({ url, ...processed, method: converted.method });
   } catch (error) {
     const target = await writeFailure(url, error.message);
     summary.push({ url, status: "failed", reason: error.message, target });

@@ -10,8 +10,11 @@ import {
   PROMPT_VERSION,
   REQUEST_SCHEMA_VERSION,
   RESULT_SCHEMA_VERSION,
+  materialIdentityForRequest,
   processMaterial,
+  renderReadingMarkdown,
   sha256,
+  stableJson,
   validateRequest
 } from "./lib/core.mjs";
 import {
@@ -21,10 +24,16 @@ import {
   WORKFLOW_ROUTER_VERSION
 } from "./lib/producer.mjs";
 import { buildSplitManifest, buildSplitRequest, SPLIT_MANIFEST_VERSION, SPLIT_POLICY_VERSION } from "./lib/splitter.mjs";
+import { requiredRouteLabels, resolveProcessingPlan, ROUTE_VALUES, WORKFLOW_PLAN_VERSION } from "./lib/workflow-plan.mjs";
+import { requiredArtifactFailures } from "./lib/required-artifacts.mjs";
+import { foldPublishedOriginal } from "./lib/original-section.mjs";
+import { simplifyPublishedChinese } from "./lib/chinese-script.mjs";
+import { normalizeReaderMath } from "./lib/reader-math.mjs";
+import { GUIDE_COVERAGE_VERSION } from './lib/guide-coverage.mjs';
 
 export { buildSplitManifest, buildSplitRequest, SPLIT_MANIFEST_VERSION, SPLIT_POLICY_VERSION };
 
-export const CALLABLE_INTERFACE_VERSION = "1.2.0";
+export const CALLABLE_INTERFACE_VERSION = "1.3.0";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const schemaDir = path.join(moduleDir, "contracts");
@@ -190,7 +199,7 @@ function normalizeInputForm(value) {
 }
 
 function normalizeContentProfile(value) {
-  return new Set(["natural_language", "math_lecture"]).has(value) ? value : null;
+  return ROUTE_VALUES.content_profile.includes(value) ? value : null;
 }
 
 function normalizeSourceLanguage(value) {
@@ -228,9 +237,10 @@ function fixedWorkflowLabels(request) {
   };
 }
 
-export async function classifyPreprocessWorkflow(request, { producer = null, markdown = requestMarkdown(request) } = {}) {
+export async function classifyPreprocessWorkflow(request, { producer = null, markdown = requestMarkdown(request), cacheDir = false } = {}) {
   const fixed = fixedWorkflowLabels(request);
-  const missing = Object.entries(fixed.values).filter(([, value]) => !value).map(([key]) => key);
+  const options = request.processing_options || {};
+  const missing = requiredRouteLabels(options, fixed.values);
   let classified = null;
   if (missing.length) {
     if (!producer?.classifyWorkflow) {
@@ -241,7 +251,14 @@ export async function classifyPreprocessWorkflow(request, { producer = null, mar
       );
     }
     try {
-      classified = await producer.classifyWorkflow({ markdown, fixed_labels: fixed.values });
+      const routeCache = cacheDir ? path.join(cacheDir, "routing", `${sha256(stableJson({ markdown, fixed: fixed.values, missing, version: WORKFLOW_ROUTER_PROMPT_VERSION }))}.json`) : null;
+      const cached = routeCache ? await fs.readFile(routeCache, "utf8").then(JSON.parse).catch(() => null) : null;
+      if (cached && Number(cached.output?.confidence) >= 0.6 && missing.every(key => ROUTE_VALUES[key].includes(cached.output?.[key]))) {
+        classified = { ...cached, api_calls: 0, attempts: [], call_ledger: [], cache_hit: true };
+      } else {
+        classified = await producer.classifyWorkflow({ markdown, fixed_labels: fixed.values, required_labels: missing });
+        if (routeCache && !classified.needs_classification && Number(classified.output?.confidence) >= 0.6 && missing.every(key => ROUTE_VALUES[key].includes(classified.output?.[key]))) await writeJsonArtifact(routeCache, classified);
+      }
     } catch (error) {
       throw new PreprocessInterfaceError(
         "workflow_routing_failed",
@@ -251,22 +268,31 @@ export async function classifyPreprocessWorkflow(request, { producer = null, mar
     }
   }
   const output = classified?.output || fixed.values;
+  const insufficient = classified?.needs_classification || (classified && Number(output.confidence) < 0.6);
+  const unresolved = missing.filter(key => insufficient || !ROUTE_VALUES[key].includes(output[key]));
   const decision = (key) => fixed.values[key]
     ? { value: fixed.values[key], method: fixed.methods[key], evidence: {} }
+    : !missing.includes(key) ? { value: "not_needed", method: "not_needed", evidence: {} }
     : {
-        value: output[key],
+        value: unresolved.includes(key) ? "unresolved" : output[key],
         method: WORKFLOW_ROUTER_VERSION,
         evidence: { confidence: output.confidence, reason: output.reason }
       };
   const inputForm = decision("input_form");
   const contentProfile = decision("content_profile");
   const sourceLanguage = decision("source_language");
+  const labels = { input_form: inputForm.value, content_profile: contentProfile.value, source_language: sourceLanguage.value };
+  const plan = unresolved.length ? null : resolveProcessingPlan(options, labels);
   return {
     version: "progressive-reading.workflow-route/v1",
     input_form: inputForm,
     content_profile: contentProfile,
     source_language: sourceLanguage,
-    translation_required: sourceLanguage.value === "en",
+    translation_required: plan?.choices.translate.enabled ?? false,
+    plan,
+    needs_classification: unresolved.length > 0,
+    missing_labels: unresolved,
+    classification_reason: unresolved.length ? String(output.reason || "无法根据现有信息确定处理方案，请补充分类或直接指定处理选择。") : null,
     original_placement: "after_translation",
     classifier: classified
       ? {
@@ -283,7 +309,7 @@ export async function classifyPreprocessWorkflow(request, { producer = null, mar
           version: WORKFLOW_ROUTER_VERSION,
           prompt_version: WORKFLOW_ROUTER_PROMPT_VERSION,
           skipped: true,
-          reason: "all_route_labels_supplied_by_request_or_source_metadata",
+          reason: "all_required_choices_or_labels_supplied",
           calls: 0,
           attempts: [],
           call_ledger: []
@@ -376,8 +402,9 @@ async function writeRunArtifacts(request, result, outputDir) {
   if (result.artifacts?.reading_markdown) contents.set("reading.md", result.artifacts.reading_markdown);
   if (result.artifacts?.quarantine_markdown) contents.set("quarantine.md", result.artifacts.quarantine_markdown);
 
-  const staleArtifact = result.artifacts?.reading_markdown ? "quarantine.md" : "reading.md";
-  await fs.rm(path.join(resolvedOutput, staleArtifact), { force: true });
+  for (const name of ["reading.md", "quarantine.md"]) {
+    if (!contents.has(name)) await fs.rm(path.join(resolvedOutput, name), { force: true });
+  }
 
   for (const [name, content] of contents) {
     if (name === "result.json") continue;
@@ -418,6 +445,50 @@ function localAssetReference(rawDestination) {
   const normalized = path.posix.normalize(decoded);
   if (!normalized.startsWith("assets/") || normalized.split("/").includes("..")) return null;
   return { relative: normalized.slice("assets/".length), wrapped };
+}
+
+function rewriteInlineImageDestinations(markdown, replace) {
+  const pattern = /!\[(?:\\.|[^\]\\\n])*\]\(/gu;
+  let output = "", copied = 0, match;
+  while ((match = pattern.exec(markdown))) {
+    const start = pattern.lastIndex;
+    let cursor = start, depth = 0;
+    if (markdown[cursor] === "<") {
+      cursor += 1;
+      while (cursor < markdown.length && markdown[cursor] !== ">" && markdown[cursor] !== "\n") cursor += markdown[cursor] === "\\" ? 2 : 1;
+      if (markdown[cursor] !== ">") continue;
+      cursor += 1;
+    } else {
+      while (cursor < markdown.length) {
+        const ch = markdown[cursor];
+        if (ch === "\\") { cursor += 2; continue; }
+        if (/\s/u.test(ch) || (ch === ")" && depth === 0)) break;
+        if (ch === "(") depth += 1;
+        if (ch === ")") depth -= 1;
+        cursor += 1;
+      }
+      if (depth !== 0) continue;
+    }
+    const destinationEnd = cursor;
+    while (/[ \t]/u.test(markdown[cursor] || "")) cursor += 1;
+    if (cursor > destinationEnd && ['"', "'", "("].includes(markdown[cursor])) {
+      const close = markdown[cursor] === "(" ? ")" : markdown[cursor];
+      cursor += 1;
+      while (cursor < markdown.length && markdown[cursor] !== close && markdown[cursor] !== "\n") cursor += markdown[cursor] === "\\" ? 2 : 1;
+      if (markdown[cursor] !== close) continue;
+      cursor += 1;
+      while (/[ \t]/u.test(markdown[cursor] || "")) cursor += 1;
+    }
+    if (markdown[cursor] !== ")") continue;
+    const destination = markdown.slice(start, destinationEnd);
+    const replacement = replace(destination);
+    if (replacement !== null) {
+      output += markdown.slice(copied, start) + replacement;
+      copied = destinationEnd;
+    }
+    pattern.lastIndex = cursor + 1;
+  }
+  return output + markdown.slice(copied);
 }
 
 function transformOutsideFencedCode(markdown, transform) {
@@ -554,33 +625,53 @@ export async function publishReadingArtifact(result, {
   publishPath,
   assetSourceDir = null,
   runDir = null,
-  now = null
+  now = null,
+  expectedExistingSha256 = null
 } = {}) {
-  if (!isReadyResult(result)) {
+  const { classifyStandardImportQuality } = await import("../scripts/standard-import-quality.mjs");
+  const quality = classifyStandardImportQuality(result);
+  if (!quality.admissible) {
     throw new PreprocessInterfaceError(
       "publish_result_not_ready",
-      "only completed local-ir-reading results may be published"
+      "result has no admissible readable artifact"
     );
   }
   const resolvedPublish = path.resolve(String(publishPath || ""));
   if (!publishPath || path.extname(resolvedPublish).toLowerCase() !== ".md") {
     throw new PreprocessInterfaceError("invalid_publish_path", "--publish must name one final .md file");
   }
-  const originalMarkdown = String(result.artifacts?.reading_markdown || "");
+  let originalMarkdown = String(result.artifacts?.reading_markdown || "");
   if (!originalMarkdown) {
     throw new PreprocessInterfaceError("missing_reading_markdown", "ready result has no reading Markdown to publish");
   }
 
+  let duplicateOriginalRemoved = false;
+  if (quality.readable_with_warnings) {
+    // Quality details remain in the audit log, never in the reading body.
+    originalMarkdown = originalMarkdown.replace(/^processing_status:.*$/mu, 'processing_status: imported');
+    const bodyStart = originalMarkdown.indexOf('\n## 正文\n');
+    const originalStart = originalMarkdown.indexOf('\n---\n\n## 原文\n', bodyStart);
+    if (bodyStart >= 0 && originalStart > bodyStart) {
+      const body = originalMarkdown.slice(bodyStart + '\n## 正文\n'.length, originalStart).trim();
+      const original = originalMarkdown.slice(originalStart + '\n---\n\n## 原文\n'.length).trim();
+      if (body === original) {
+        originalMarkdown = originalMarkdown.slice(0, originalStart).trimEnd() + '\n';
+        originalMarkdown = originalMarkdown.replace(/^translation_state:.*$/mu, 'translation_state: not_translation');
+        duplicateOriginalRemoved = true;
+      }
+    }
+  }
   const sanitized = sanitizePublishedMarkdown(originalMarkdown);
+  const readerMath = normalizeReaderMath(sanitized.markdown);
+  const simplified = simplifyPublishedChinese(readerMath.markdown);
 
   const publishDir = path.dirname(resolvedPublish);
   const materialSlug = path.basename(resolvedPublish, path.extname(resolvedPublish));
   const assetSource = assetSourceDir ? path.resolve(assetSourceDir) : null;
   const assetRecords = new Map();
-  const imagePattern = /(!\[[^\]\n]*\]\()(<[^>\n]+>|[^)\n]+)(\))/gu;
-  const publishedMarkdown = sanitized.markdown.replace(imagePattern, (match, prefix, destination, suffix) => {
+  let publishedMarkdown = transformOutsideFencedCode(simplified.markdown, segment => rewriteInlineImageDestinations(segment, destination => {
     const local = localAssetReference(destination);
-    if (!local) return match;
+    if (!local) return null;
     if (!assetSource) {
       throw new PreprocessInterfaceError(
         "missing_publish_asset_source",
@@ -589,9 +680,9 @@ export async function publishReadingArtifact(result, {
     }
     const publishRelative = path.posix.join("_assets", materialSlug, local.relative);
     assetRecords.set(local.relative, publishRelative);
-    const rendered = local.wrapped ? `<${publishRelative}>` : publishRelative;
-    return `${prefix}${rendered}${suffix}`;
-  });
+    const rendered = local.wrapped || /[\s()]/u.test(publishRelative) ? `<${publishRelative}>` : publishRelative;
+    return rendered;
+  }));
   const cleanliness = validatePublishedMarkdownCleanliness(publishedMarkdown);
   if (!cleanliness.valid) {
     throw new PreprocessInterfaceError(
@@ -601,9 +692,22 @@ export async function publishReadingArtifact(result, {
     );
   }
 
+  const expandedMarkdown = publishedMarkdown;
+  if (result.translation_state === "generated_translation") {
+    publishedMarkdown = foldPublishedOriginal(publishedMarkdown);
+  }
   const existingMarkdownHash = await existingFileHash(resolvedPublish);
+  // Replaying a previously published expanded note must neither rewrite it nor conflict.
+  if (existingMarkdownHash === sha256(Buffer.from(expandedMarkdown, "utf8"))) {
+    publishedMarkdown = expandedMarkdown;
+  }
   const publishedMarkdownHash = sha256(Buffer.from(publishedMarkdown, "utf8"));
-  if (existingMarkdownHash && existingMarkdownHash !== publishedMarkdownHash) {
+  const guardedReplacement = typeof expectedExistingSha256 === "string"
+    && /^[a-f0-9]{64}$/u.test(expectedExistingSha256) && existingMarkdownHash === expectedExistingSha256;
+  if (expectedExistingSha256 !== null && !guardedReplacement) {
+    throw new PreprocessInterfaceError("publish_source_changed", `source changed before replacement: ${resolvedPublish}`);
+  }
+  if (existingMarkdownHash && existingMarkdownHash !== publishedMarkdownHash && !guardedReplacement) {
     throw new PreprocessInterfaceError(
       "publish_target_conflict",
       `final Markdown already exists with different content: ${resolvedPublish}`
@@ -636,11 +740,21 @@ export async function publishReadingArtifact(result, {
     });
   }
 
-  if (!existingMarkdownHash) await replaceFileAtomic(resolvedPublish, publishedMarkdown);
+  if (!existingMarkdownHash || (guardedReplacement && existingMarkdownHash !== publishedMarkdownHash)) {
+    if (await existingFileHash(resolvedPublish) !== existingMarkdownHash) {
+      throw new PreprocessInterfaceError("publish_source_changed", `source changed before replacement: ${resolvedPublish}`);
+    }
+    await replaceFileAtomic(resolvedPublish, publishedMarkdown);
+  }
   const publication = {
     interface_version: CALLABLE_INTERFACE_VERSION,
     published_at: now || new Date().toISOString(),
     status: "published",
+    quality_status: quality.quality_status,
+    warning_codes: quality.warning_codes,
+    failed_validations: (result.receipt?.validations || []).filter(item => item.status === 'failed'),
+    source_errors: result.errors || [],
+    duplicate_original_removed: duplicateOriginalRemoved,
     material_id: result.material_id,
     idempotency_key: result.idempotency_key,
     markdown: {
@@ -649,6 +763,8 @@ export async function publishReadingArtifact(result, {
       sha256: publishedMarkdownHash
     },
     cleanliness: { ...sanitized.report, valid: true, failures: [] },
+    chinese_script: simplified.report,
+    math_delimiters: readerMath.report,
     assets: publishedAssets
   };
   if (runDir) await writeJsonArtifact(path.join(path.resolve(runDir), "publication.json"), publication);
@@ -679,7 +795,8 @@ async function runPreprocessingStage(request, options = {}) {
     producer: options.producer,
     cacheDir,
     now: options.now,
-    skipCacheRead: options.skipCacheRead === true
+    skipCacheRead: options.skipCacheRead === true,
+    preparedBodyBlocks: options.preparedBodyBlocks
   });
   const resultValidation = await validateResultContract(result);
   if (!resultValidation.valid) {
@@ -727,125 +844,180 @@ function workflowStageRecord(id, result) {
 
 export async function runStandardPreprocessingWorkflow(request, options = {}) {
   const requestValidation = await validateRequestContract(request);
-  if (!requestValidation.valid) {
-    return runPreprocessingStage(request, options);
+  if (!requestValidation.valid) return runPreprocessingStage(request, options);
+  const producer = options.producer || new ExternalProducer();
+  const cacheDir = options.cacheDir === false ? false : path.resolve(options.cacheDir || path.join(defaultPreprocessHome(), "cache"));
+  await options.onProgress?.({ stage: "workflow_routing" });
+  const route = await classifyPreprocessWorkflow(request, { producer, cacheDir });
+  const materialId = materialIdentityForRequest(request);
+  const stageRuns = [];
+  if (route.needs_classification) {
+    const result = {
+      schema_version: RESULT_SCHEMA_VERSION, contract_version: CONTRACT_VERSION,
+      status: "needs_classification", processing_state: "needs_classification",
+      material_id: materialId, idempotency_key: request.idempotency_key || null,
+      translation_state: "unknown", artifacts: {}, source_metadata: request.source_metadata,
+      receipt: {
+        processor_version: PROCESSOR_VERSION, prompt_version: PROMPT_VERSION,
+        created_at: options.now || new Date().toISOString(),
+        model: { provider: route.classifier.provider || null, model: route.classifier.model || null, calls: route.classifier.calls, attempts: route.classifier.attempts, call_ledger: route.classifier.call_ledger, metadata_policy: "allowlist-no-credentials-cookies-or-headers" },
+        workflow_route: { ...route, stages: [] }, validations: []
+      },
+      errors: [{ code: "needs_classification", stage: "workflow_routing", message: route.classification_reason, retryable: false, severity: "warning" }]
+    };
+    const resultValidation = await validateResultContract(result);
+    if (!resultValidation.valid) throw new PreprocessInterfaceError("result_contract_violation", "invalid pending classification result", resultValidation);
+    const written = options.outputDir ? await writeRunArtifacts(request, result, options.outputDir) : { output_dir: null, files: {} };
+    return { interface_version: CALLABLE_INTERFACE_VERSION, request_validation: requestValidation, result_validation: resultValidation, result, ...written, publication: null };
   }
-  const workflowProducer = options.producer || new ExternalProducer();
-  const stageOptions = { ...options, producer: workflowProducer };
-  const workflowOptions = request.processing_options || {};
-  const stages = [];
+
+  const choices = route.plan.choices;
+  const supplied = request.processing_options || {};
+  const common = {};
+  for (const key of ["preserve_source_voice", "attribute_unverified_claims", "normalize_semantic_containers", "insight_soft_min", "insight_soft_max", "insight_safety_cap"]) {
+    if (supplied[key] !== undefined) common[key] = supplied[key];
+  }
+  const sourceMetadata = { ...request.source_metadata };
+  for (const [key, destination] of [["input_form", "input_form"], ["content_profile", "content_profile"], ["source_language", "language"]]) {
+    if (route[key].value !== "not_needed") sourceMetadata[destination] = route[key].value;
+  }
   let workingMarkdown = requestMarkdown(request);
-  const route = await classifyPreprocessWorkflow(request, { producer: workflowProducer, markdown: workingMarkdown });
-  let preliminary = null;
-
-  if (route.input_form.value === "spoken_transcript") {
-    const spokenRequest = stageRequest(request, workingMarkdown, {
-      sourceMetadata: { ...request.source_metadata, input_form: "spoken_transcript", language: route.source_language.value },
-      processingOptions: spokenMarkdownOptions(Object.fromEntries([
-        ["insight_soft_min", workflowOptions.insight_soft_min],
-        ["insight_soft_max", workflowOptions.insight_soft_max],
-        ["insight_safety_cap", workflowOptions.insight_safety_cap]
-      ].filter(([, value]) => Number.isInteger(value)))),
-      idempotencyKey: stageIdempotencyKey(request.idempotency_key, "spoken")
+  let bodyRefinement = null;
+  let translated = null;
+  let guideRun = null;
+  async function stage(id, stageOptions, metadata = sourceMetadata, preparedBodyBlocks = undefined) {
+    const stageInput = stageRequest(request, workingMarkdown, {
+      sourceMetadata: metadata, processingOptions: stageOptions, idempotencyKey: undefined
     });
-    preliminary = await runPreprocessingStage(spokenRequest, { ...stageOptions, outputDir: undefined });
-    stages.push(workflowStageRecord("spoken_to_written", preliminary.result));
-    if (!isReadyResult(preliminary.result)) {
-      const written = options.outputDir ? await writeRunArtifacts(request, preliminary.result, options.outputDir) : { output_dir: null, files: {} };
-      return { ...preliminary, ...written };
+    stageInput.material_id = materialId;
+    // Explicit caller ids identify the request, but never bypass stage content/options hashing.
+    delete stageInput.idempotency_key;
+    if (!stageRuns.length && request.material?.original_markdown) stageInput.material.original_markdown = request.material.original_markdown;
+    stageInput.idempotency_key = "stage-" + sha256(stableJson({
+      version: WORKFLOW_PLAN_VERSION, processor: PROCESSOR_VERSION, id,
+      ...(id === 'reading_guide' ? { guide_coverage:GUIDE_COVERAGE_VERSION } : {}),
+      input: stageInput, caller_id: request.idempotency_key || null, prepared_body: preparedBodyBlocks || null
+    })).slice(0, 40);
+    await options.onProgress?.({ stage: id });
+    // The outer guide stage runs once; its source-point coverage engine owns
+    // bounded local repairs and reuses completed stages without replaying the body.
+    const stageProducer = bodyRefinement && id === "reading_guide" ? {
+      maxAttempts: 1,
+      generate: (payload, settings) => producer.generate(payload, { ...settings, singleAttempt: true })
+    } : producer;
+    const run = await runPreprocessingStage(stageInput, {
+      ...options, cacheDir, producer: stageProducer, preparedBodyBlocks, publishPath: undefined,
+      outputDir: options.outputDir ? path.join(options.outputDir, "stages", id) : undefined
+    });
+    stageRuns.push({ id, run });
+    if (run.result.artifacts?.cleaning_manifest?.body_text) workingMarkdown = run.result.artifacts.cleaning_manifest.body_text;
+    return run;
+  }
+
+  let bodyRun;
+  if (route.plan.body_mode !== "preserve") {
+    if (typeof producer.refineFullText !== "function") throw new Error("full_text_body_producer_required");
+    await options.onProgress?.({ stage: route.plan.body_mode });
+    const refined = await producer.refineFullText({markdown: workingMarkdown, mode: route.plan.body_mode,
+      cacheDir, outputDir: options.outputDir ? path.join(options.outputDir, "body-refinement") : undefined});
+    if (!refined?.markdown?.trim() || refined.receipt?.status !== "completed") throw new Error("full_text_body_incomplete");
+    bodyRefinement = refined.receipt;
+    workingMarkdown = refined.markdown;
+  }
+  if ((!bodyRun || isReadyResult(bodyRun.result)) && choices.translate.enabled) {
+    const preset = route.content_profile.value === "math_lecture" ? mathLectureTranslationOptions : sourceTranslationOptions;
+    bodyRun = await stage("profile_translation", preset({
+      ...common,
+      ...(supplied.forbid_visible_timestamps !== undefined ? {forbid_visible_timestamps:supplied.forbid_visible_timestamps} : {}),
+      include_reading_guide: false,
+      translation_target_language: route.plan.translation_target_language
+    }));
+    if (isReadyResult(bodyRun.result)) translated = bodyRun.result;
+  }
+  if (!bodyRun) {
+    bodyRun = await stage("profile_standardization", standardMarkdownOptions({
+      ...common, cleaning_mode: "semantic_only", include_reading_guide: false
+    }));
+  }
+  if (isReadyResult(bodyRun.result) && choices.include_reading_guide.enabled) {
+    guideRun = await stage("reading_guide", standardMarkdownOptions({
+      ...common, cleaning_mode: "semantic_only", include_reading_guide: true
+    }), {
+      ...sourceMetadata,
+      ...(translated ? { language: route.plan.translation_target_language, translation: { is_translation: false, is_bilingual: false } } : {})
+    }, bodyRun.result.artifacts.body_blocks);
+  }
+  const result = structuredClone((guideRun || bodyRun).result);
+  const bodyResult = bodyRun.result;
+  const hasGuide = Boolean(guideRun?.result.artifacts?.semantic?.judgments);
+  const guideStatus = !choices.include_reading_guide.enabled ? "skipped" : hasGuide ? "generated" : "failed";
+  result.material_id = materialId;
+  result.idempotency_key = "workflow-" + sha256(stableJson({ version: WORKFLOW_PLAN_VERSION, processor: PROCESSOR_VERSION, request, plan: route.plan })).slice(0, 40);
+  result.receipt.material_id = materialId;
+  result.receipt.idempotency_key = result.idempotency_key;
+  result.receipt.reading_guide = {
+    status: guideStatus,
+    decision: choices.include_reading_guide,
+    calls: guideRun?.result.receipt?.model?.calls || 0,
+    reason: guideStatus === "failed" ? (guideRun ? "guide_generation_failed" : "body_not_ready") : choices.include_reading_guide.source
+  };
+  if (bodyRefinement) result.receipt.body_refinement = structuredClone(bodyRefinement);
+  if (guideRun && result.artifacts.reading_markdown) {
+    result.artifacts.body_blocks = structuredClone(bodyResult.artifacts.body_blocks);
+    result.artifacts.cleaning_manifest = structuredClone(bodyResult.artifacts.cleaning_manifest);
+    result.artifacts.artifact_hashes.body_blocks = bodyResult.artifacts.artifact_hashes.body_blocks;
+    result.artifacts.artifact_hashes.cleaning_manifest = bodyResult.artifacts.artifact_hashes.cleaning_manifest;
+    result.receipt.hashes = structuredClone(stageRuns[0].run.result.receipt.hashes);
+    if (translated) {
+      result.translation_state = translated.translation_state;
+      result.source_metadata = { ...result.source_metadata, original_url: translated.source_metadata.original_url };
+      if (translated.receipt.processing_profile) result.receipt.processing_profile = structuredClone(translated.receipt.processing_profile);
     }
-    workingMarkdown = preliminary.result.artifacts.cleaning_manifest.body_text;
-  }
-
-  const profile = route.content_profile.value;
-  const commonOverrides = Object.fromEntries([
-    ["insight_soft_min", workflowOptions.insight_soft_min],
-    ["insight_soft_max", workflowOptions.insight_soft_max],
-    ["insight_safety_cap", workflowOptions.insight_safety_cap]
-  ].filter(([, value]) => Number.isInteger(value)));
-  const finalProcessingOptions = route.translation_required
-    ? profile === "math_lecture"
-      ? mathLectureTranslationOptions(commonOverrides)
-      : sourceTranslationOptions(commonOverrides)
-    : profile === "math_lecture"
-      ? mathLectureStandardizationOptions(commonOverrides)
-      : standardMarkdownOptions(commonOverrides);
-  const finalRequest = stageRequest(request, workingMarkdown, {
-    sourceMetadata: {
-      ...request.source_metadata,
-      input_form: "written",
-      content_profile: profile,
-      language: route.source_language.value
-    },
-    processingOptions: finalProcessingOptions,
-    idempotencyKey: request.idempotency_key
-  });
-  const finalRun = await runPreprocessingStage(finalRequest, { ...stageOptions, outputDir: undefined });
-  const result = structuredClone(finalRun.result);
-  if (route.translation_required) {
-    stages.push({ ...workflowStageRecord("profile_translation", result), execution: "dedicated_api_calls_within_profile_pipeline" });
-    stages.push({
-      id: "profile_standardization",
-      status: result.status,
-      processing_state: result.processing_state,
-      processor_version: result.receipt?.processor_version || null,
-      prompt_version: result.receipt?.prompt_version || null,
-      execution: "dedicated_semantic_api_call_after_translation"
+    result.artifacts.reading_markdown = renderReadingMarkdown({
+      materialId, metadata: result.source_metadata, sourceType: request.source_type,
+      hashes: result.receipt.hashes, semantic: result.artifacts.semantic,
+      bodyBlocks: result.artifacts.body_blocks,
+      originalBlocks: translated ? translated.artifacts.cleaning_manifest.source_nodes.map(node => ({ markdown: node.text })) : [],
+      translationState: result.translation_state, includeReadingGuide: hasGuide
     });
-  } else {
-    stages.push({ ...workflowStageRecord("profile_standardization", result), execution: "profile_producer_pipeline" });
+    result.artifacts.artifact_hashes.reading_markdown = sha256(result.artifacts.reading_markdown);
   }
-  result.receipt.model.calls += Number(route.classifier?.calls || 0) + (preliminary?.result.receipt?.model?.calls || 0);
+  const bodyCalls = bodyRefinement?.api_calls_this_run || 0;
+  result.receipt.model.calls = bodyCalls + route.classifier.calls + stageRuns.reduce((sum, item) => sum + item.run.result.receipt.model.calls, 0);
   result.receipt.model.attempts = [
-    ...(route.classifier?.attempts || []).map((attempt) => ({ ...attempt, workflow_stage: "workflow_routing" })),
-    ...(preliminary?.result.receipt?.model?.attempts || []).map((attempt) => ({ ...attempt, workflow_stage: "spoken_to_written" })),
-    ...(result.receipt.model.attempts || []).map((attempt) => ({ ...attempt, workflow_stage: "final" }))
+    ...(bodyCalls ? [{attempt:1,status:"accepted",validation_errors:[],usage:bodyRefinement.usage || null,workflow_stage:route.plan.body_mode}] : []),
+    ...route.classifier.attempts.map(item => ({ ...item, workflow_stage: "workflow_routing" })),
+    ...stageRuns.flatMap(({ id, run }) => run.result.receipt.model.attempts.map(item => ({ ...item, workflow_stage: id })))
   ];
   result.receipt.model.call_ledger = [
-    ...(route.classifier?.call_ledger || []).map((entry) => ({ ...entry, workflow_stage: "workflow_routing" })),
-    ...(preliminary?.result.receipt?.model?.call_ledger || []).map((entry) => ({ ...entry, workflow_stage: "spoken_to_written" })),
-    ...(result.receipt.model.call_ledger || []).map((entry) => ({ ...entry, workflow_stage: "final" }))
+    ...(bodyCalls ? [{sequence:1,workflow_stage:route.plan.body_mode,thinking:"disabled",model:bodyRefinement.model}] : []),
+    ...route.classifier.call_ledger.map(item => ({ ...item, workflow_stage: "workflow_routing" })),
+    ...stageRuns.flatMap(({ id, run }) => (run.result.receipt.model.call_ledger || []).map(item => ({ ...item, workflow_stage: id })))
   ];
-  result.receipt.workflow_route = { ...route, stages };
+  result.receipt.workflow_route = {
+    ...route,
+    stages: [...(bodyRefinement ? [{id:route.plan.body_mode,status:"completed",processing_state:"rendered",
+      model_calls:bodyCalls,audit_dir:bodyRefinement.audit_dir || null,
+      input_hash:bodyRefinement.input_sha256,body_hash:bodyRefinement.body_sha256,cache_hit:bodyCalls === 0}] : []),
+    ...stageRuns.map(({ id, run }) => ({
+      ...workflowStageRecord(id, run.result),
+      audit_dir: run.output_dir || null,
+      input_hash: run.result.receipt.hashes?.input || null,
+      body_hash: run.result.artifacts?.artifact_hashes?.body_blocks || null,
+      cache_hit: run.result.status === "idempotent_replay"
+    }))]
+  };
   result.receipt.validations = [
-    {
-      name: "workflow_ai_routing",
-      status: route.classifier.skipped ? "not_needed" : "passed",
-      details: {
-        version: route.classifier.version,
-        prompt_version: route.classifier.prompt_version,
-        calls: route.classifier.calls,
-        skipped: route.classifier.skipped
-      }
-    },
-    { name: "workflow_input_form_classification", status: "passed", details: route.input_form },
-    { name: "workflow_content_profile_classification", status: "passed", details: route.content_profile },
-    { name: "workflow_source_language_classification", status: "passed", details: route.source_language },
-    {
-      name: "workflow_bilingual_translation_skip",
-      status: route.source_language.value === "bilingual" ? (route.translation_required ? "failed" : "passed") : "not_applicable"
-    },
-    {
-      name: "translation_original_appended",
-      status: route.translation_required
-        ? result.artifacts?.reading_markdown?.includes("\n## 原文\n") ? "passed" : "failed"
-        : "not_applicable"
-    },
+    { name: "workflow_ai_routing", status: route.classifier.skipped ? "not_needed" : "passed", details: route.classifier },
+    { name: "workflow_bilingual_translation_skip", status: route.source_language.value === "bilingual" && !choices.translate.enabled ? "passed" : "not_applicable" },
+    { name: "reading_guide_plan", status: guideStatus === "failed" ? "failed" : "passed", details: result.receipt.reading_guide },
+    { name: "translation_original_appended", status: translated ? result.artifacts.reading_markdown?.includes("\n## 原文\n") ? "passed" : "failed" : "not_applicable" },
     ...result.receipt.validations
   ];
-  result.source_metadata = { ...result.source_metadata, input_form: "written", content_profile: profile, language: route.source_language.value };
   const resultValidation = await validateResultContract(result);
-  if (!resultValidation.valid) {
-    throw new PreprocessInterfaceError("result_contract_violation", "standard workflow returned a result outside the published result schema", resultValidation);
-  }
+  if (!resultValidation.valid) throw new PreprocessInterfaceError("result_contract_violation", "standard workflow returned an invalid result", resultValidation);
   const written = await writeAndPublishRun(request, result, options);
-  return {
-    interface_version: CALLABLE_INTERFACE_VERSION,
-    request_validation: requestValidation,
-    result_validation: resultValidation,
-    result,
-    ...written
-  };
+  return { interface_version: CALLABLE_INTERFACE_VERSION, request_validation: requestValidation, result_validation: resultValidation, result, ...written };
 }
 
 export async function runPreprocessingRequest(request, options = {}) {
@@ -860,6 +1032,7 @@ export function isReadyResult(result) {
     && new Set(["completed", "idempotent_replay"]).has(result.status)
     && result.processing_state === "rendered"
     && result.artifacts?.target_zone === "local-ir-reading"
+    && requiredArtifactFailures(result).length === 0
   );
 }
 
@@ -887,6 +1060,7 @@ export async function getDoctorReport() {
     versions: {
       contract: CONTRACT_VERSION,
       processor: PROCESSOR_VERSION,
+      guide_coverage: GUIDE_COVERAGE_VERSION,
       prompt: PROMPT_VERSION
     }
   };

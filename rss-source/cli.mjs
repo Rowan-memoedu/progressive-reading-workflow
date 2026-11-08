@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { configPath as subscriptionDocumentPath } from '../rss-import/config.mjs';
 import { fileURLToPath } from "node:url";
 
 import {
@@ -23,7 +24,6 @@ import {
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const workflowRoot = path.resolve(moduleDir, "..");
 const defaultOutputRoot = path.join(workflowRoot, "imports", "rss", "source-v1");
-const defaultSubscriptionsPath = path.join(workflowRoot, "config", "rss-subscriptions.v1.json");
 const userAgent = "progressive-reading-rss-source/1.0";
 
 function parseArgs(argv) {
@@ -52,10 +52,9 @@ function assertOutputWithinWorkspace(value) {
   return target;
 }
 
-function assertConfigWithinWorkspace(value) {
-  const target = path.resolve(value || defaultSubscriptionsPath);
-  const relative = path.relative(workflowRoot, target);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("config_must_stay_inside_workflow_project");
+function resolveSubscriptionsDocument(value) {
+  const target = path.resolve(value || subscriptionDocumentPath());
+  if (path.extname(target).toLowerCase()!=='.md') throw new Error('rss_subscription_input_is_now_the_three_section_markdown_document');
   return target;
 }
 
@@ -166,6 +165,7 @@ async function sync(options) {
     userInstruction: String(options["user-instruction"] || ""),
     fetchFulltext,
     articleFetcher,
+    acceptItem: options.acceptItem,
     maxItems,
     fetchedAt,
     runId: id
@@ -173,13 +173,13 @@ async function sync(options) {
 }
 
 async function subscriptions(options = {}) {
-  const configPath = assertConfigWithinWorkspace(options.config || defaultSubscriptionsPath);
+  const configPath = resolveSubscriptionsDocument(options.config);
   const registry = await loadSubscriptionRegistry(configPath);
   return subscriptionRegistryResult(registry, configPath);
 }
 
 async function syncAll(options = {}) {
-  const configPath = assertConfigWithinWorkspace(options.config || defaultSubscriptionsPath);
+  const configPath = resolveSubscriptionsDocument(options.config);
   const outputRoot = assertOutputWithinWorkspace(options.output || defaultOutputRoot);
   const registry = await loadSubscriptionRegistry(configPath);
   const batchId = runId();
@@ -202,11 +202,11 @@ function help() {
       discover: "rss-source discover --url <website-url>",
       validate: "rss-source validate --feed-url <feed-url> | --url <website-url>",
       sync: "rss-source sync --feed-url <feed-url> [--limit 1-100] [--fetch-fulltext] [--force] [--user-instruction <text>]",
-      subscriptions: "rss-source subscriptions [--config <project-local-json>]",
-      "sync-all": "rss-source sync-all [--config <project-local-json>] [--subscription-id <id>] [--limit 1-100] [--fetch-fulltext] [--force]"
+      subscriptions: "rss-source subscriptions [--config <three-section-markdown>] (reports section only)",
+      "sync-all": "rss-source sync-all [--config <three-section-markdown>] [--subscription-id <id>] [--limit 1-100] [--fetch-fulltext] [--force]"
     },
     default_output: defaultOutputRoot,
-    default_subscriptions: defaultSubscriptionsPath,
+    default_subscriptions: subscriptionDocumentPath(),
     safety: {
       writes_reading_area: false,
       uses_browser_or_login_state: false,

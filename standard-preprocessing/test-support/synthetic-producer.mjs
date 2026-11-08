@@ -1,12 +1,24 @@
+import {createHash} from 'node:crypto';
+const sha = text => createHash('sha256').update(text).digest('hex');
+
 export class SyntheticProducer {
-  constructor({ invalid = false } = {}) {
+  constructor({ invalid = false, uncertain = false } = {}) {
     this.invalid = invalid;
+    this.uncertain = uncertain;
     this.calls = 0;
     this.lastPayload = null;
     this.routingCalls = 0;
+    this.bodyCalls = [];
   }
 
-  async classifyWorkflow({ fixed_labels = {} } = {}) {
+  async refineFullText({markdown, mode}) {
+    this.bodyCalls.push({markdown,mode});
+    return {markdown,receipt:{status:'completed',mode,model:'synthetic-full-text',
+      api_calls_total:1,api_calls_this_run:1,thinking:'disabled',finish_reason:'stop',
+      input_sha256:sha(markdown),body_sha256:sha(markdown),semantic_acceptance:'fixture_only'}};
+  }
+
+  async classifyWorkflow({ fixed_labels = {}, required_labels = [] } = {}) {
     this.routingCalls += 1;
     return {
       output: {
@@ -14,8 +26,10 @@ export class SyntheticProducer {
         content_profile: fixed_labels.content_profile || "natural_language",
         source_language: fixed_labels.source_language || "zh",
         confidence: 0.99,
-        reason: "合成生产器提供稳定的离线路由结果。"
+        reason: "合成生产器提供稳定的离线路由结果。",
+        ...(this.uncertain ? { ...Object.fromEntries(required_labels.map(key => [key, null])), confidence: 0.2, reason: "测试材料缺少足够分类信息。" } : {})
       },
+      ...(this.uncertain ? { needs_classification: true } : {}),
       provider: "synthetic",
       model: "synthetic-workflow-router-v1",
       usage: null,
@@ -54,7 +68,8 @@ export class SyntheticProducer {
       });
     }
     const targetBlocks = payload.blocks.filter((block) => block.type !== "heading");
-    const insights = targetBlocks.slice(0, Math.min(3, targetBlocks.length)).map((block, index) => ({
+    const guideEnabled = payload.cleaning_policy?.include_reading_guide !== false;
+    const insights = (guideEnabled ? targetBlocks : []).slice(0, Math.min(3, targetBlocks.length)).map((block, index) => ({
       title: ["语义与渲染分离", "幂等身份稳定", "失败必须显式"][index] || `真实洞察 ${index + 1}`,
       description: [
         "模型负责生成可校验的语义结果，本地代码负责稳定锚点与链接；两者分离后，模型无需猜测 Obsidian block id，正文跳转也能确定性复现并接受独立验证。",
@@ -72,11 +87,11 @@ export class SyntheticProducer {
           source_block_key: block.source_block_key,
           markdown: block.markdown
         })),
-        judgments: {
+        judgments: guideEnabled ? {
           value: { level: "high", reason: "合同与失败边界清楚，可直接复用。" },
           density: { level: "high", reason: "包含接口、幂等和降级三个独立信息点。" },
           continue_reading: { level: 4, reason: "值得精细阅读以核验合同细节。" }
-        },
+        } : null,
         insights,
         translation: {
           is_bilingual: translationBlocks.length > 0 && originalBlocks.length > 0,

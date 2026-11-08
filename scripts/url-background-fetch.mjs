@@ -204,6 +204,13 @@ function authPageReason(document, finalUrl) {
 }
 
 function jsRenderReason(document, visibleText, { scriptCount, noscript }) {
+  // A bootstrap error can contain enough text to pass the short-shell check.
+  // Reject it only when no article/post content accompanies the error screen.
+  if (!document.querySelector('article, [data-testid="tweetText"], [data-testid="twitterArticleReadView"]')
+      && /Something went wrong,? but (?:don[’']t|do not) fret/iu.test(visibleText)
+      && /privacy related extensions may cause issues/iu.test(visibleText)) {
+    return "javascript_application_error_screen";
+  }
   if (scriptCount === 0 || visibleText.length >= 120) return null;
   const shell = document.querySelector("#app:empty, #root:empty, #__next:empty, #__nuxt:empty, [data-reactroot]:empty");
   const pageText = normalizedText(document.body?.textContent);

@@ -1,69 +1,31 @@
-import {
-  buildPreprocessRequest,
-  runPreprocessingRequest,
-  isReadyResult,
-  standardWorkflowOptions
-} from "../index.mjs";
+import { buildPreprocessRequest, runPreprocessingRequest, standardWorkflowOptions } from "../index.mjs";
 
-const DEFAULT_BROWSER_PREPROCESS_ATTEMPTS = 3;
-
-function retryableReviewResult(result) {
-  return Boolean(
-    result
-    && (
-      result.status === "completed_with_warnings"
-      || (
-        result.status === "idempotent_replay"
-        && result.receipt?.replay_of_status === "completed_with_warnings"
-      )
-    )
-    && result.processing_state === "degraded"
-    && result.artifacts?.target_zone === "preprocess-review"
-  );
+export function browserCaptureProcessingOptions(action, overrides = {}) {
+  if (!['save', 'import'].includes(action)) throw new Error('unsupported_browser_capture_action');
+  return action === 'save'
+    ? { ...overrides, spoken_to_written: false, structure_body: false, translate: false, include_reading_guide: false }
+    : { ...overrides, include_reading_guide: true };
 }
 
 export async function preprocessBrowserCapture({
-  markdown,
-  sourceMetadata,
-  userInstruction = "",
-  processingOptions = {},
-  outputDir,
-  publishPath,
-  assetSourceDir,
-  cacheDir,
-  producer,
-  maxAttempts = DEFAULT_BROWSER_PREPROCESS_ATTEMPTS
+  markdown, sourceMetadata, userInstruction = "", processingOptions = {},
+  outputDir, publishPath, assetSourceDir, cacheDir, producer, onProgress
 }) {
   const request = buildPreprocessRequest({
     markdown,
     sourceType: "browser_capture_markdown",
-    sourceMetadata,
+    sourceMetadata: { input_form: "written", ...sourceMetadata },
     userInstruction,
-    processingOptions: standardWorkflowOptions({
-      input_form: "written",
-      ...processingOptions
-    })
+    processingOptions: standardWorkflowOptions(processingOptions)
   });
-  const boundedAttempts = Math.max(1, Math.min(3, Number(maxAttempts) || DEFAULT_BROWSER_PREPROCESS_ATTEMPTS));
-  const workflowAttempts = [];
-  let latestRun = null;
-  for (let attempt = 1; attempt <= boundedAttempts; attempt += 1) {
-    latestRun = await runPreprocessingRequest(request, {
-      outputDir,
-      publishPath,
-      assetSourceDir,
-      cacheDir,
-      producer,
-      skipCacheRead: attempt > 1
-    });
-    workflowAttempts.push({
-      attempt,
-      status: latestRun.result?.status || "unknown",
-      processing_state: latestRun.result?.processing_state || "unknown",
-      target_zone: latestRun.result?.artifacts?.target_zone || "unknown",
-      model_calls: Number(latestRun.result?.receipt?.model?.calls || 0)
-    });
-    if (isReadyResult(latestRun.result) || !retryableReviewResult(latestRun.result)) break;
-  }
-  return { ...latestRun, workflow_attempts: workflowAttempts };
+  // Stage processors own bounded retries. Re-running the workflow here multiplies calls.
+  const run = await runPreprocessingRequest(request, { outputDir, publishPath, assetSourceDir, cacheDir, producer, onProgress });
+  return {
+    ...run,
+    workflow_attempts: [{
+      attempt: 1, status: run.result.status, processing_state: run.result.processing_state,
+      target_zone: run.result.artifacts?.target_zone || null,
+      model_calls: run.result.receipt?.model?.calls || 0
+    }]
+  };
 }

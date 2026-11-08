@@ -247,7 +247,7 @@ test("English math workflow preserves discovered terms and appends the normalize
                 ? "algorithm 作用于 data structure；这里将这种说明称为 recipe，并将 $f(x)$ 映射到 $g(x)$。"
                 : block.markdown
           })),
-          ...semantic(payload.blocks.find((block) => block.markdown.includes("algorithm")).source_block_key),
+          judgments: null, insights: [], translation: { is_bilingual: false, alignments: [] },
           terminology: { policy: "preserve-source-terms/v1", terms }
         }
       };
@@ -257,7 +257,8 @@ test("English math workflow preserves discovered terms and appends the normalize
   const result = run.result;
   assert.equal(result.status, "completed", JSON.stringify(result.errors));
   assert.equal(result.receipt.workflow_route.content_profile.value, "math_lecture");
-  assert.deepEqual(result.receipt.workflow_route.stages.map((stage) => stage.id), ["profile_translation", "profile_standardization"]);
+  assert.deepEqual(result.receipt.workflow_route.stages.map((stage) => stage.id), ["profile_translation"]);
+  assert.equal(result.receipt.reading_guide.status, "skipped");
   assert.equal(result.receipt.processing_profile.version, MATH_LECTURE_PROFILE_VERSION);
   assert.equal(result.receipt.processing_profile.prompt_version, MATH_LECTURE_PROMPT_VERSION);
   assert.deepEqual(result.artifacts.cleaning_manifest.protected_terms, ["algorithm", "data structure", "recipe"]);
@@ -295,7 +296,9 @@ test("English natural-language workflow appends the normalized original without 
               ? "# 一则实践笔记"
               : "细致观察能把证据与假设区分开来，从而改善判断。"
           })),
-          ...semantic(payload.blocks.find((block) => block.type === "paragraph").source_block_key)
+          ...(payload.cleaning_policy.include_reading_guide === false
+            ? { judgments: null, insights: [], translation: { is_bilingual: false, alignments: [] } }
+            : semantic(payload.blocks.find((block) => block.type === "paragraph").source_block_key))
         }
       };
     }
@@ -303,7 +306,7 @@ test("English natural-language workflow appends the normalized original without 
   const { result } = await runPreprocessingRequest(request, { producer, cacheDir: false });
   assert.equal(result.status, "completed", JSON.stringify(result.errors));
   assert.equal(result.receipt.workflow_route.content_profile.value, "natural_language");
-  assert.deepEqual(result.receipt.workflow_route.stages.map((stage) => stage.id), ["profile_translation", "profile_standardization"]);
+  assert.deepEqual(result.receipt.workflow_route.stages.map((stage) => stage.id), ["profile_translation", "reading_guide"]);
   assert.equal(result.receipt.processing_profile, undefined);
   assert.match(result.artifacts.reading_markdown, /细致观察能把证据与假设区分开来/u);
   assert.match(result.artifacts.reading_markdown, /## 原文\n\n# A practical note/u);
@@ -343,7 +346,7 @@ test("AI-routed bilingual material is standardized without entering translation"
   assert.equal(result.status, "completed", JSON.stringify(result.errors));
   assert.equal(result.receipt.workflow_route.source_language.value, "bilingual");
   assert.equal(result.receipt.workflow_route.translation_required, false);
-  assert.deepEqual(result.receipt.workflow_route.stages.map((stage) => stage.id), ["profile_standardization"]);
+  assert.deepEqual(result.receipt.workflow_route.stages.map((stage) => stage.id), ["profile_standardization", "reading_guide"]);
   assert.equal(result.receipt.validations.find((item) => item.name === "workflow_bilingual_translation_skip")?.status, "passed");
   assert.doesNotMatch(result.artifacts.reading_markdown, /\n## 原文\n/u);
 });

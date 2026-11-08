@@ -1,0 +1,70 @@
+# 导入规则清单
+
+更新：2026-09-19。用户已允许高级与复杂导入；规则在共享导入服务执行，网页只展示规则和结果。首个高级规则是“知乎专栏默认导入全部文章”。
+
+| 规则 | 触发输入 | 默认行为 |
+| --- | --- | --- |
+| 知乎专栏 → 全部文章 | `https://www.zhihu.com/column/<id>`、`https://zhihu.com/column/<id>`、`https://zhuanlan.zhihu.com/<slug>` | 完整枚举分页与置顶文章，全局去重后逐篇导入；自动按每批最多 50 篇提交既有后端。 |
+| YouTube → 字幕全文 | watch、youtu.be、shorts、live 单视频链接 | 优先人工字幕，复用既有 VTT 解析、分段和标准预处理；按 video ID 去重。采用下方统一验收规则，可读结果正常落盘，不启动 ASR。见[视频状态](VIDEO_WORKFLOW_STATUS.md)。 |
+| 普通链接 → 单篇导入 | 未命中高级规则的 HTTP(S) URL；知乎 `/p/<article-id>` 仍属单篇 | 沿用标准采集、预处理、目录路由、去重与正式落盘。 |
+
+机器清单为 `scripts/import-rule-catalog.mjs`，只读接口为 `GET /api/browser-import/rules`。页面 `/import` 顶部直接显示清单。新增高级规则应增加有界的识别与展开处理器，再调用同一个 broker 与逐篇 worker，不另建导入后端。
+
+## 统一验收规则
+
+所有来源复用同一标准处理器和 `scripts/standard-import-quality.mjs`，不按当前任务、视频 ID、作者或 Canary 设置验收例外。
+
+- 正文缺失、采集明显截断、来源错配、必要映射缺失和严重内容损失必须修复；错误候选不能覆盖已有正文。能够完整恢复来源正文时，按已有可读 warning 合同处理并保留真实状态。
+- 问句数量、标题层级和单个口语词等通用编辑细节仅记录提示，不单独触发整篇重跑。显式口述/字幕书面化阶段另有来源中立的必要产物检查：结构化候选须通过源文保真、书面表达、去重复和层级关系复核；失败按原输入重新生成，不能发布原文回退。必需产物通过的可读 `ready / warning` 均可落盘。
+- 审计、错误原因、指标和处理日志只保存在独立审计目录与回执中，不进入阅读正文。
+- PDF/MinerU 导入默认用本地脚本保存逐页文本层，并对照 OCR 与抽取 Markdown 的文字覆盖、数字及代码误标候选；排版差异按共享规范处理。对照不增加模型调用，不自动触发 OCR、翻译或导读重跑，已导入材料可只读补审计。见 [PDF 文本层自动对照](../rich-text-import/README.md#pdf-文本层自动对照)。
+- 所有发布的阅读文件采用 [中文字形规范](../standard-preprocessing/docs/processing-plan.md#中文字形规范)：可读繁体中文以 OpenCC `t2s` 机械转为简体，原始来源和受保护的链接、代码、公式、身份字段不改；标准入口与文学直发使用同一实现。
+- 修正规则只修改共享实现，先用普通与失败样例验证，再从原始输入重跑；后续导入沿用同一规则。具体文本内容和分类结果可以不同，处理入口、验收边界、去重与发布机制保持一致。
+
+## 章节目录型网页导入（CLI 首批已验证，尚未接入网页集合规则）
+
+2026-09-18 用户确认：以 `https://supermemo.guru/wiki/Problem_of_Schooling` 为首个来源，导入其 `Chapters` 目录树列出的全部章节，包含 Summary、Glossary、References。正文内普通概念链接保留为链接，不递归扩展到整站；不同时导入 Printable version 造成重复。
+
+- 根页面对应 `阅读区/Supermemo guru/Problem of Schooling/`，复用用户现有的 `Supermemo guru` 文件夹（保留其实际拼写），不另建平级来源目录。根页面的 Introduction 正文单独保存。按页面真实分组及嵌套列表建立子文件夹，保留来源顺序；不把目录展开后的文章平铺。
+- 叶子文章保存为以文章标题命名的 Markdown。有子章节且自身有正文的节点建立同名文件夹，文件夹内保存该节点的同名正文文件和子章节。例如 `Socialization/Optimal socialization/Optimal socialization.md` 与 `Socialization/Optimal socialization/Socialization model.md`。文件名只做必要的 Windows 非法字符处理，来源标题与 URL 保存在元数据。
+- 只提取正文，保留正文标题、列表、引用和必要图表；去除网站导航、编辑入口、页脚和联系作者模板等页面杂项。页面自带的章节 Summary 与模型生成摘要不同，前者属于已确认范围。
+- 使用现有标准预处理，显式设置 `processing_options.include_reading_guide=false`。不生成导读卡、价值判断或核心洞察；英文翻译、原文附后、来源溯源和完整性校验照常执行。不得误选跳过翻译的 `original_text` 模式。
+- 先完整枚举并冻结章节 URL、目录路径及顺序，再验证正文采集和小批量处理，最后批量执行。全局规范化 URL 去重，同一正文只保存一份，其他章节归属保留引用；保护已存在文章、标注和人工优先级。
+- 导入前须将 `Supermemo guru` 内已有 Markdown（含子目录）纳入来源身份核对，并继续遵守阅读区全局 URL 去重。以文档来源元数据 `source_url` / `canonical_url` 的规范化身份为依据，不能仅比较文件名、新书目标路径或当前批次；文件移动后也应按实际文件恢复匹配，旧登记路径失效不能作为重新导入的理由。找不到可靠来源或发现多个既有副本时保留异常明细，不凭标题猜测、覆盖或合并。
+- 已核验的重复样本：`阅读区/Supermemo guru/Pleasure of learning - supermemo.guru.md` 的 `source_url` 为 `https://supermemo.guru/wiki/Pleasure_of_learning`，`material_id` 为 `mat-03851fd78cb87629192c`，对应新书的 `Brain science → Pleasure of learning`。导入时复用这个原文件，不复制正文、不重新翻译、不迁移或改写原文件；书内目录索引保留指向其实际位置的 Obsidian 链接，确保章节可达。原文件已有导读卡，本次 `include_reading_guide=false` 只约束新加工内容，不追溯删除旧文件中的导读、洞察或批注。
+- 此样本的去重验收必须同时确认：采集/翻译前命中真实现存文件；全书结果将该章节计为“复用已有”；没有新增该来源的正文副本；原文件内容哈希不变；新书章节索引能够打开原文件。不能只报告“已跳过”而丢失章节归属。2026-09-18 首批 CLI 已通过这组检查，网页集合入口仍未接线。
+- 完成验收须逐篇核对章节清单、路径、正式正文、哈希与质量状态。可读 warning 按现有合同保留并报告；抓取失败、缺页和空正文不得算作全集成功。
+
+现役目录规则尚未实现上述展开与层级映射，不能把本需求记录解释为已经支持一键导入。采集核验只证明对应输入与采集方式，不能用 Cookie 同步状态或浏览器单页可见性代替全书验收。
+
+2026-09-18 采集核验：Chrome 当前目录包含 14 个分组、167 个章节主链接条目，按当前 href 去重为 162 篇（尚未核验所有跳转别名）。目录页和三篇章节经共享后台函数匿名/携带匹配 Cookie 抓取均返回 403；Chrome 已加载页面的 DOM 正文采集成功。三篇样本为 Pleasure of learning、Learn drive、Socialization model，已检查正文首尾和标题结构。该结果证明页面快照采集可行，不代表已经完成正文净化、翻译、无导读发布或全书导入。精确范围、统计和复跑脚本见 [采集核验](D:/Artifacts/ProgressiveReading/chapter-collection-20260918/采集核验.md)。
+
+### 首批 10 篇执行与自动化边界
+
+2026-09-18 已建立全书 14 个分组及真实嵌套子目录，`目录.md` 保留全部 167 条的顺序与层级。按 Chapters 前 10 条执行：新增 9 篇、复用已有 1 篇；新增中 5 篇完成译文及原文附后，4 篇翻译未通过，按标准合同保留完整英文正文并标记 warning。Introduction 与其余章节尚未导入。不得把 warning 计为翻译成功，或把首批结果计为全书完成。
+
+实现入口：`scripts/import-wiki-chapters.mjs`，复用现有标准预处理与发布器。`plan` 冻结目录、查找阅读区既有来源并建层级；`run` 预检快照齐备，按顺序完成正文提取、处理、发布、质量记录与索引更新，已完成项检查哈希后跳过。已发布但未写入计划的中断状态会按原始快照和实际发布审计恢复，不误计为既有文章复用。`--refresh-sources` 只在提取规则改变来源正文时重跑，核对本轮原文件哈希并保留旧发布证据；不得覆盖用户修改。
+
+```powershell
+node scripts/import-wiki-chapters.mjs run 'D:/Artifacts/ProgressiveReading/chapter-collection-20260918/trial-10/plan.json' 'D:/Artifacts/ProgressiveReading/chapter-collection-20260918/captures'
+node scripts/verify-wiki-chapters.mjs 'D:/Artifacts/ProgressiveReading/chapter-collection-20260918/trial-10/plan.json' 'D:/Artifacts/ProgressiveReading/chapter-collection-20260918/captures'
+```
+
+独立验收直接读取冻结 HTML、原始请求和正式文件：逐篇核对正文文本覆盖、原文字符（仅归一空白）、无导读及零导读调用、发布哈希、阅读区来源唯一、目录链接与既有文章哈希。5 项隔离 fixture 测试通过；真实 9 篇新文章的发布检查通过，保留 4 篇翻译警告。见 [首批验收](D:/Artifacts/ProgressiveReading/chapter-collection-20260918/trial-10/验收.md) 与同目录 `acceptance.json`。原始失败及后续修订记录保留在文章审计目录和 `plan.attempt_history`。
+
+用户确认快照获取也应自动化，不把逐页 GUI 操作作为正式方案。当前已自动化的是快照之后的 CLI 链路；本批 HTML 仍经真实 Chrome DOM 临时采集。后台 HTTP、匹配 Cookie 与兼容 HTTP 探针仍返回 403。下一处接线应复用现有扩展的页面快照能力，让有界任务自动打开页面、等待正文并提交快照；尚未实现或激活该入口，不声称已经实现无需 GUI 的全链路，也不另建独立浏览器控制服务。
+
+## 知乎专栏完整性
+
+- 把整个专栏作为一个持久父任务，保存在原 broker 状态文件；文章批次仍是同一 broker 内的普通请求。首次枚举完整后冻结列表，进度保存后可恢复；长任务更新租约，子批次 ID 稳定。
+- 分页必须明确结束；有 totals 时核验数量一致，读取期间 totals 变化、缺失下一页、重复页、分页跳出当前知乎专栏或未知条目类型均失败，不将部分列表自动当作全集。
+- 独立读取置顶文章并与普通列表去重。明确的回答、视频、想法等非文章条目单独计数；不把未知类型默认为已排除。
+- 1000 页是技术上限；达到上限但未结束时显示枚举不完整，不截取前 1000 页导入。
+- 先枚举完整，再开始正文写入；枚举失败时文章写入为零。
+- 显示每篇文章的成功、质量警告或失败。重试专栏会重新枚举，已成功的文章由后端核验并复用；之前的失败记录保留。单次受理 202 和父任务结束均不代表所有文章已成功。
+- URL 入口原有 50 个输入链接限制继续保留；这是输入项限制，专栏展开后的文章数可以超过 50。
+- 登录或访问限制返回可见失败，不绕过登录/验证码，也不把网页首页当成全部文章。使用已有本地快照匹配，不采集或输出 Cookie。
+
+实现复用了现有知乎 JSON 请求函数。专栏普通分页与置顶接口的当前参考是维护中的 [RSSHub 专栏源码](https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/zhuanlan.ts)；这属于网站接口实践，不是知乎开放平台对全量枚举的稳定性保证。当前官方 Skill 提供的公开检索/本人数据 API 不包含任意专栏全集枚举。
+
+实际运行状态以本机健康接口和来源返回为准。公开源码不附带私人材料与历史运行回执；合成回归入口见 [安装与兼容性](SETUP.md)。

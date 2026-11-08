@@ -98,7 +98,7 @@ test("request schema publishes the cross-field insight budget as a mandatory run
   );
 });
 
-test("result schema rejects a missing receipt model, malformed block id, obsolete reading level, and sub-60 insight", async () => {
+test("result schema requires structural fields and permits short nonempty insights", async () => {
   const { validateResult } = await contractValidators();
   const request = await readJson(path.join(fixtures, "monolingual.request.json"));
   const result = await processMaterial(request, {
@@ -120,6 +120,8 @@ test("result schema rejects a missing receipt model, malformed block id, obsolet
 
   const shortInsight = structuredClone(result);
   shortInsight.artifacts.semantic.insights[0].description = "一句过短的洞察";
+  assert.equal(validateResult(shortInsight), true);
+  shortInsight.artifacts.semantic.insights[0].description = "";
   assert.equal(validateResult(shortInsight), false);
 });
 
@@ -134,7 +136,7 @@ test("failed request results remain valid contract results without pretending to
   assert.equal(validateResult(result), true, explain(validateResult));
 });
 
-test("core rejects exactly 59 non-whitespace insight characters and accepts exactly 60", async () => {
+test("core accepts generated insights on both sides of the retired 60-character threshold", async () => {
   const base = await readJson(path.join(fixtures, "monolingual.request.json"));
   base.processing_options = { cleaning_mode: "semantic_only" };
   const exactFiftyNine = "洞".repeat(59);
@@ -144,10 +146,10 @@ test("core rejects exactly 59 non-whitespace insight characters and accepts exac
 
   const rejectedProducer = producerWithDescription(exactFiftyNine);
   const rejected = await processMaterial(structuredClone(base), { producer: rejectedProducer });
-  assert.equal(rejected.status, "completed_with_warnings");
-  assert.equal(rejected.processing_state, "degraded");
-  assert.equal(rejectedProducer.calls, 3);
-  assert.match(rejected.errors[0].message, /insight_description_too_brief:0:59\/60/u);
+  assert.equal(rejected.status, "completed");
+  assert.equal(rejected.processing_state, "rendered");
+  assert.equal(rejectedProducer.calls, 1);
+  assert.deepEqual(rejected.errors, []);
 
   const acceptedProducer = producerWithDescription(exactSixty);
   const accepted = await processMaterial(structuredClone(base), { producer: acceptedProducer });

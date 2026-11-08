@@ -16,6 +16,7 @@ node_modules/
 待归档原文/
 RemNote 导出队列/
 imports/
+附件/Readwise/
 standard-preprocessing/canary/
 remnote-formal-archive/canary/runs/
 摘要区/
@@ -26,3 +27,19 @@ remnote-formal-archive/canary/runs/
 !scripts/test-chrome-cookie-jar-e2e.mjs
 !scripts/check-cookie-snapshot-consumer.mjs
 !docs/CHROME_COOKIE_JAR_SYNC_INTERFACE.md
+
+# Local reading libraries, subscriptions, installation receipts and recovery records.
+PiKaChu345 数学笔记库/
+cs-plan-full/
+zhihu_md/
+附件/
+移出阅读池/
+.codex-temp/
+.pytest_cache/
+**/.pytest_cache/
+recovery-logs/
+config/pikachu345-library.current.json
+config/progressive-reading-components.v1.json
+config/rss-subscriptions.v1.json
+docs/CODEX_THREAD_LOCAL_MIGRATION.md
+docs/PIKACHU345_LIBRARY_MIGRATION_ACCEPTANCE.md

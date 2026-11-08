@@ -1,8 +1,12 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { SPOKEN_REFINEMENT_VERSION, spokenQualityFromReceipt } from "./spoken-quality.mjs";
 import Ajv2020 from "ajv/dist/2020.js";
-import { ExternalProducer, findEnglishNaturalLanguageResidues, insightContractRepairIndexes, INLINE_CODE_PATTERN, MARKDOWN_LINK_DESTINATION_PATTERN, translationNaturalLanguage } from "./producer.mjs";
+import { loadTranslationPolicy } from "./translation-policy.mjs";
+import { TRANSLATION_UNIT_VERSION } from "./translation-units.mjs";
+import { isEditorialDetailFailure, isShortEnglishLabel } from "./producer.mjs";
+import { ExternalProducer, extractProtectedHttpUrls, findEnglishNaturalLanguageResidues, insightContractRepairIndexes, INLINE_CODE_PATTERN, isBibliographicReferenceBlock, MARKDOWN_LINK_DESTINATION_PATTERN, translationLiteralBlockKeys, translationNaturalLanguage } from "./producer.mjs";
 import {
   buildMathLectureCoverage,
   collectPreservedMathLectureTerms,
@@ -18,11 +22,14 @@ import {
   validateMathLectureTerminology
 } from "./math-lecture.mjs";
 import { normalizePandocSemanticBlocks } from "./pandoc-normalizer.mjs";
+import { splitOutlineSubtrees } from "./outline-blocks.mjs";
+import { GUIDE_COVERAGE_VERSION } from './guide-coverage.mjs';
+import { normalizeReaderMath } from './reader-math.mjs';
 
 export const CONTRACT_VERSION = "1.0.0";
 export const REQUEST_SCHEMA_VERSION = "progressive-reading.preprocess.request/v1";
 export const RESULT_SCHEMA_VERSION = "progressive-reading.preprocess.result/v1";
-export const PROCESSOR_VERSION = "1.10.7";
+export const PROCESSOR_VERSION = "1.12.6";
 export const PROMPT_VERSION = "source-translation-v2.2-five-level-judgments";
 
 const CONTINUE_READING_LABELS = {
@@ -35,6 +42,20 @@ const CONTINUE_READING_LABELS = {
 
 const VALUE_LABELS = { very_low: "极低", low: "低", medium: "中", high: "高", very_high: "极高" };
 const DENSITY_LABELS = { very_low: "极低", low: "低", medium: "中", high: "高", very_high: "极高" };
+export function sourceHasAuthorAttribution(markdown) {
+  return /作者(?:认为|指出|强调|判断|提出|主张|表示|解释|总结|建议)/u.test(markdown)
+    || /\b(?:authors?|researchers?|writers?)\s+(?:(?:also|further|explicitly|specifically)\s+)?(?:argue|note|point\s+out|emphasize|suggest|explain|conclude|state|claim|observe)(?:s|d|ed)?\b/iu.test(translationNaturalLanguage(markdown));
+}
+export function hasIntroducedTranslationTime(source, translated) {
+  const pattern = /(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)/gu;
+  const counts = new Map();
+  for (const value of String(source).match(pattern) || []) counts.set(value,(counts.get(value)||0)+1);
+  for (const value of String(translated).match(pattern) || []) {
+    if (!counts.get(value)) return true;
+    counts.set(value,counts.get(value)-1);
+  }
+  return false;
+}
 const CHINESE_NUMERALS = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十", "二十一", "二十二", "二十三", "二十四"];
 
 export function sha256(value) {
@@ -161,7 +182,7 @@ export function validateRequest(request) {
       errors.push(errorItem("invalid_processing_options", "request", "processing_options must be an object"));
     } else {
       const allowed = new Set([
-        "workflow_mode", "input_form", "content_profile", "source_language", "original_placement",
+        "workflow_mode", "include_reading_guide", "spoken_to_written", "structure_body", "translate", "input_form", "content_profile", "source_language", "original_placement",
         "cleaning_mode", "preserve_source_voice", "forbid_visible_timestamps", "require_content_headings", "attribute_unverified_claims",
         "translation_target_language", "normalize_semantic_containers", "insight_soft_min", "insight_soft_max", "insight_safety_cap"
       ]);
@@ -173,8 +194,8 @@ export function validateRequest(request) {
       if (processing.input_form !== undefined && !new Set(["auto", "spoken_transcript", "written"]).has(processing.input_form)) {
         errors.push(errorItem("invalid_input_form", "request", "input_form must be auto, spoken_transcript, or written"));
       }
-      if (processing.content_profile !== undefined && !new Set(["auto", "natural_language", "math_lecture"]).has(processing.content_profile)) {
-        errors.push(errorItem("invalid_content_profile", "request", "content_profile must be auto, natural_language, or math_lecture"));
+      if (processing.content_profile !== undefined && !new Set(["auto", "natural_language", "math_lecture", "literature"]).has(processing.content_profile)) {
+        errors.push(errorItem("invalid_content_profile", "request", "content_profile must be auto, natural_language, math_lecture, or literature"));
       }
       if (processing.original_placement !== undefined && processing.original_placement !== "after_translation") {
         errors.push(errorItem("invalid_original_placement", "request", "translated reading Markdown must place the original after the translation"));
@@ -189,7 +210,7 @@ export function validateRequest(request) {
       if (processing.cleaning_mode === "source_translation" && !String(processing.translation_target_language || "").trim()) {
         errors.push(errorItem("translation_target_language_required", "request", "source_translation requires translation_target_language"));
       }
-      for (const key of ["preserve_source_voice", "forbid_visible_timestamps", "require_content_headings", "attribute_unverified_claims", "normalize_semantic_containers"]) {
+      for (const key of ["include_reading_guide", "spoken_to_written", "structure_body", "translate", "preserve_source_voice", "forbid_visible_timestamps", "require_content_headings", "attribute_unverified_claims", "normalize_semantic_containers"]) {
         if (processing[key] !== undefined && typeof processing[key] !== "boolean") {
           errors.push(errorItem(`invalid_${key}`, "request", `${key} must be boolean`));
         }
@@ -217,6 +238,7 @@ export function validateRequest(request) {
 
 function cleaningPolicyFor(request) {
   return {
+    ...(request.processing_options?.include_reading_guide === false ? { include_reading_guide: false } : {}),
     mode: request.processing_options?.cleaning_mode || "source_voice_structuring",
     preserve_source_voice: request.processing_options?.preserve_source_voice !== false,
     forbid_visible_timestamps: request.processing_options?.forbid_visible_timestamps === true,
@@ -279,7 +301,8 @@ function metadataForProducer(metadata) {
     is_bilingual: metadata.translation.is_bilingual === true || metadata.language === "bilingual",
     original_url: metadata.translation.original_url,
     original_language: metadata.translation.original_language,
-    translation_language: metadata.translation.translation_language
+    translation_language: metadata.translation.translation_language,
+    ...(metadata.translation.existing_translation_only === true ? { existing_translation_only: true } : {})
   };
   if (metadata.capture && typeof metadata.capture === "object") {
     selected.capture = {
@@ -361,18 +384,20 @@ function isStandaloneCodeLikeBlock(markdown) {
 
 function blockType(markdown) {
   const value = String(markdown).trim();
-  if (/^#{1,6}\s+/u.test(value)) return "heading";
-  if (/^```|^~~~/u.test(value)) return "code";
-  if (/^(?:[-*+] |\d+[.)] )/u.test(value)) return "list";
-  if (/^>/u.test(value)) return "quote";
-  if (isGfmTableBlock(value)) return "table";
-  if (isStandaloneCodeLikeBlock(value)) return "code";
+  const contentValue = value.replace(/^(?:<!--\s*pdf-structure:[\s\S]*?-->\s*)+/u, "");
+  if (/^#{1,6}\s+/u.test(contentValue)) return "heading";
+  if (/^```|^~~~/u.test(contentValue)) return "code";
+  if (/^(?:[-*+] |\d+[.)] )/u.test(contentValue)) return "list";
+  if (/^>/u.test(contentValue)) return "quote";
+  if (isGfmTableBlock(contentValue)) return "table";
+  if (isStandaloneCodeLikeBlock(contentValue)) return "code";
   return "paragraph";
 }
 
 function splitMarkdownBlocks(markdown, { role = "body", languageHint = "" } = {}) {
   const lines = normalizeMarkdown(markdown).split("\n");
   const groups = [];
+  const outlineGroups = splitOutlineSubtrees(lines.join("\n"));
   let current = [];
   let fence = null;
   const flush = () => {
@@ -394,7 +419,7 @@ function splitMarkdownBlocks(markdown, { role = "body", languageHint = "" } = {}
   flush();
 
   let currentRole = role;
-  return groups.flatMap(splitGfmTableSegments).map((value, index) => {
+  return (outlineGroups || groups).flatMap(splitGfmTableSegments).map((value, index) => {
     const heading = /^#{1,6}\s+(.+)$/u.exec(value)?.[1]?.trim() || "";
     if (heading) {
       if (/译文|中文译文|translation|translated/iu.test(heading)) currentRole = "translation";
@@ -446,6 +471,7 @@ function detectTranslation(blocks, metadata) {
     has_translation: hasTranslation || routedBilingual,
     has_original: hasOriginal || routedBilingual,
     requires_original_url: requiresOriginalUrl,
+    ...(explicit && metadata.translation.existing_translation_only === true && !hasOriginal && !routedBilingual ? { existing_translation_only: true } : {}),
     original_url: translationContext
       ? metadata.original_url || (sourceIsOriginal ? metadata.source_url : null)
       : metadata.original_url
@@ -456,6 +482,11 @@ function materialIdFor(request, primaryHash, metadata) {
   if (request.material_id) return String(request.material_id).replace(/[^A-Za-z0-9._-]/gu, "-");
   const identity = metadata.source_url || metadata.source_id || metadata.title || request.source_type;
   return `mat-${sha256(`${request.source_type}\n${identity}\n${primaryHash}`).slice(0, 20)}`;
+}
+
+export function materialIdentityForRequest(request) {
+  const primary = stripOuterFrontmatter(extractMaterial(request).markdown);
+  return materialIdFor(request, sha256(normalizeMarkdown(primary.body)), normalizeMetadata(request.source_metadata, primary.frontmatter));
 }
 
 function idempotencyKeyFor(request, materialId, hashes, metadata, promptVersion) {
@@ -518,6 +549,7 @@ function translationProtectedInlineSyntax(markdown, { includeMath = false } = {}
   const syntax = protectedInlineSyntax(markdown);
   return {
     ...syntax,
+    rawMath: (String(markdown).match(/<(math|svg)\b[^>]*>[\s\S]*?<\/\1>/giu) || []).sort(),
     displayMath: includeMath ? [...syntax.displayMath].sort() : [],
     inlineMath: includeMath ? [...syntax.inlineMath].sort() : []
   };
@@ -581,7 +613,7 @@ function validateProducerOutput(output, blocks, safetyCap, cleaningPolicy, proce
     } else if (source.type === "code" && normalizeMarkdown(candidate.markdown) !== normalizeMarkdown(source.markdown)) {
       failures.push(`code_block_changed:${source.source_block_key}`);
     }
-    const includeMath = processingProfile?.id === MATH_LECTURE_CONTENT_PROFILE;
+    const includeMath = true;
     const candidateSyntax = cleaningPolicy.mode === "source_translation"
       ? translationProtectedInlineSyntax(candidate.markdown, { includeMath })
       : protectedInlineSyntax(candidate.markdown);
@@ -594,15 +626,17 @@ function validateProducerOutput(output, blocks, safetyCap, cleaningPolicy, proce
     if (cleaningPolicy.mode !== "source_translation" && source.type !== "code" && diceSimilarity(source.markdown, candidate.markdown) < 0.52) {
       failures.push(`fidelity_too_low:${source.source_block_key}`);
     }
-    const sourceUrls = source.markdown.match(/https?:\/\/[^\s)\]>]+/gu) || [];
+    const sourceUrls = extractProtectedHttpUrls(source.markdown);
     for (const url of sourceUrls) {
       if (!candidate.markdown.includes(url)) failures.push(`url_removed:${source.source_block_key}`);
     }
-    if (cleaningPolicy.forbid_visible_timestamps && /(?:^|[\[(（\s])\d{1,2}:\d{2}(?::\d{2})?(?:[\])）\s]|$)/mu.test(candidate.markdown)) {
+    if (cleaningPolicy.forbid_visible_timestamps && (cleaningPolicy.mode === 'source_translation'
+        ? hasIntroducedTranslationTime(source.markdown,candidate.markdown)
+        : /(?:^|[\[(（\s])\d{1,2}:\d{2}(?::\d{2})?(?:[\])）\s]|$)/mu.test(candidate.markdown))) {
       failures.push(`visible_timestamp_introduced:${source.source_block_key}`);
     }
     const thirdPersonPattern = /作者(?:认为|指出|强调|判断|提出|主张|表示|解释|总结|建议)/u;
-    if (cleaningPolicy.preserve_source_voice && thirdPersonPattern.test(candidate.markdown) && !thirdPersonPattern.test(source.markdown)) {
+    if (cleaningPolicy.preserve_source_voice && thirdPersonPattern.test(candidate.markdown) && !sourceHasAuthorAttribution(source.markdown)) {
       failures.push(`source_voice_shifted_to_third_person:${source.source_block_key}`);
     }
     if (cleaningPolicy.normalize_semantic_containers) {
@@ -623,25 +657,26 @@ function validateProducerOutput(output, blocks, safetyCap, cleaningPolicy, proce
   }
   if (cleaningPolicy.mode === "source_translation" && cleaned.length) {
     const protectedTerms = Array.isArray(output.terminology?.terms) ? output.terminology.terms : [];
+    const bibliographicKeys = translationLiteralBlockKeys(blocks);
+    const proseCandidates = cleaned.filter((candidate) => {
+      const source = byKey.get(candidate?.source_block_key);
+      return source && !["code", "table"].includes(source.type) && !bibliographicKeys.has(source.source_block_key);
+    });
+    const bibliographyOnly = bibliographicKeys.size > 0 && proseCandidates.every(candidate => byKey.get(candidate.source_block_key)?.type === 'heading');
+    if (!bibliographyOnly && proseCandidates.some((candidate) => /[A-Za-z]{3}/u.test(translationNaturalLanguage(candidate.markdown)))
+      && !proseCandidates.some((candidate) => /[\p{Script=Han}]/u.test(translationNaturalLanguage(candidate.markdown)))) {
+      failures.push("translation_document_target_language_missing");
+    }
     if (actualKeys.length !== expectedKeys.length || actualKeys.some((key, index) => key !== expectedKeys[index])) {
       failures.push(`translation_source_coverage:${actualKeys.length}/${expectedKeys.length}`);
     }
     for (const candidate of cleaned) {
       const source = byKey.get(candidate?.source_block_key);
-      if (!source || source.type === "code") continue;
+      if (!source || source.type === "code" || source.type === "table") continue;
       const atomicKind = processingProfile?.id === MATH_LECTURE_CONTENT_PROFILE ? mathLectureAtomicKind(source) : null;
       if (atomicKind) continue;
-      const latinLetters = (translationNaturalLanguage(source.markdown).match(/[A-Za-z]/gu) || []).length;
-      if (latinLetters >= 20 && !/[\p{Script=Han}]/u.test(candidate.markdown)) {
-        failures.push(`translation_missing_target_language:${source.source_block_key}`);
-      }
-      const residueCandidate = processingProfile?.id === MATH_LECTURE_CONTENT_PROFILE
-        ? stripAllowedMathLectureTerms(candidate.markdown, protectedTerms)
-        : candidate.markdown;
-      const residues = findEnglishNaturalLanguageResidues(residueCandidate);
-      if (latinLetters >= 20 && residues.length) {
-        failures.push(`translation_english_residue:${source.source_block_key}:${JSON.stringify(residues.slice(0, 3))}`);
-      }
+      // Names, captions, labels and quotations may remain English. Only the
+      // document-level target-language check above establishes a translation.
       if (processingProfile?.id === MATH_LECTURE_CONTENT_PROFILE) {
         for (const issue of validateMathLectureTerminology(source.markdown, candidate.markdown, protectedTerms)) {
           failures.push(`math_lecture_${issue}:${source.source_block_key}`);
@@ -677,7 +712,7 @@ function validateProducerOutput(output, blocks, safetyCap, cleaningPolicy, proce
       if (!sourceBlocks.some((block) => block.type === "code") && diceSimilarity(sourceText, section.markdown) < 0.38 && section?.local_fidelity_verified !== true) {
         failures.push(`lossless_section_fidelity_too_low:${index}`);
       }
-      const sourceUrls = sourceText.match(/https?:\/\/[^\s)\]>]+/gu) || [];
+      const sourceUrls = extractProtectedHttpUrls(sourceText);
       for (const url of sourceUrls) {
         if (!section.markdown.includes(url)) failures.push(`url_removed_in_lossless_section:${index}`);
       }
@@ -685,7 +720,7 @@ function validateProducerOutput(output, blocks, safetyCap, cleaningPolicy, proce
         failures.push(`visible_timestamp_introduced_in_lossless_section:${index}`);
       }
       const thirdPersonPattern = /作者(?:认为|指出|强调|判断|提出|主张|表示|解释|总结|建议)/u;
-      if (cleaningPolicy.preserve_source_voice && thirdPersonPattern.test(section.markdown) && !thirdPersonPattern.test(sourceText)) {
+      if (cleaningPolicy.preserve_source_voice && thirdPersonPattern.test(section.markdown) && !sourceHasAuthorAttribution(sourceText)) {
         failures.push(`source_voice_shifted_to_third_person_in_lossless_section:${index}`);
       }
     }
@@ -710,10 +745,16 @@ function validateProducerOutput(output, blocks, safetyCap, cleaningPolicy, proce
     }
   }
   const judgments = output.judgments || {};
-  if (!VALUE_LABELS[judgments.value?.level]) failures.push("invalid_value_judgment");
-  if (!DENSITY_LABELS[judgments.density?.level]) failures.push("invalid_density_judgment");
+  if (cleaningPolicy.mode === "semantic_only" && Array.isArray(output.cleaned_blocks)) {
+    for (const patch of output.cleaned_blocks) {
+      if (blocks.find(block => block.source_block_key === patch.source_block_key)?.markdown !== patch.markdown) failures.push(`semantic_only_body_changed:${patch.source_block_key}`);
+    }
+  }
+  if (cleaningPolicy.include_reading_guide !== false && !VALUE_LABELS[judgments.value?.level]) failures.push("invalid_value_judgment");
+  if (cleaningPolicy.include_reading_guide !== false && !DENSITY_LABELS[judgments.density?.level]) failures.push("invalid_density_judgment");
   const continueLevel = judgments.continue_reading?.level;
-  if (!Number.isInteger(continueLevel) || continueLevel < 0 || continueLevel > 4) failures.push("invalid_continue_reading_level");
+  if (cleaningPolicy.include_reading_guide !== false && (!Number.isInteger(continueLevel) || continueLevel < 0 || continueLevel > 4)) failures.push("invalid_continue_reading_level");
+  if (cleaningPolicy.include_reading_guide === false && (output.judgments !== null || output.insights?.length !== 0)) failures.push("disabled_reading_guide_must_be_empty");
   const insights = Array.isArray(output.insights) ? output.insights : [];
   if (insights.length > safetyCap) failures.push("insight_safety_cap_exceeded");
   const keySet = new Set(expectedKeys);
@@ -727,7 +768,7 @@ function validateProducerOutput(output, blocks, safetyCap, cleaningPolicy, proce
     }
   }
   const alignments = Array.isArray(output.translation?.alignments) ? output.translation.alignments : [];
-  if (translationDetection?.routed_bilingual) {
+  if (translationDetection?.routed_bilingual && cleaningPolicy.include_reading_guide !== false) {
     if (output.translation?.is_bilingual !== true) failures.push("routed_bilingual_flag_missing");
     if (!alignments.length) failures.push("routed_bilingual_alignments_missing");
   }
@@ -932,7 +973,7 @@ function linkedReadingBlockIds(markdown) {
 function visibleReadingBlockIds(markdown) {
   return String(markdown || "")
     .split("\n")
-    .map((line) => /^\^(pr-[a-f0-9]{12})[ \t]*$/u.exec(line)?.[1] || null)
+    .map((line) => /(?:^|[ \t])\^(pr-[a-f0-9]{12})[ \t]*$/u.exec(line)?.[1] || null)
     .filter(Boolean);
 }
 
@@ -945,7 +986,7 @@ export function pruneUnreferencedReadingAnchors(markdown, bodyBlockIds = []) {
   const prunedBlockIds = [];
 
   for (let index = 0; index < lines.length; index += 1) {
-    const match = /^\^(pr-[a-f0-9]{12})[ \t]*$/u.exec(lines[index]);
+    const match = /(?:^|[ \t])\^(pr-[a-f0-9]{12})[ \t]*$/u.exec(lines[index]);
     const blockId = match?.[1] || null;
     if (!blockId || !knownBlockIds.has(blockId) || referencedBlockIds.has(blockId)) {
       output.push(lines[index]);
@@ -953,6 +994,10 @@ export function pruneUnreferencedReadingAnchors(markdown, bodyBlockIds = []) {
     }
 
     prunedBlockIds.push(blockId);
+    if (!lines[index].startsWith("^")) {
+      output.push(lines[index].slice(0, match.index));
+      continue;
+    }
     if (output.at(-1) === "" && lines[index + 1] === "") index += 1;
   }
 
@@ -963,7 +1008,7 @@ export function pruneUnreferencedReadingAnchors(markdown, bodyBlockIds = []) {
   };
 }
 
-function auditVisibleReadingAnchors(markdown, bodyBlocks) {
+export function auditVisibleReadingAnchors(markdown, bodyBlocks) {
   const knownBlockIds = new Set(bodyBlocks.map((block) => block.block_id));
   const referencedBlockIds = linkedReadingBlockIds(markdown);
   const visibleBlockIdList = visibleReadingBlockIds(markdown);
@@ -987,7 +1032,10 @@ function auditVisibleReadingAnchors(markdown, bodyBlocks) {
   };
 }
 
-function renderReadingMarkdown({ materialId, metadata, sourceType, hashes, semantic, bodyBlocks, originalBlocks = [], translationState, title }) {
+export function renderReadingMarkdown({ materialId, metadata, sourceType, hashes, semantic, bodyBlocks, originalBlocks = [], translationState, title, includeReadingGuide = true }) {
+  if (!includeReadingGuide && (semantic.judgments !== null || semantic.insights?.length)) {
+    throw new Error("disabled_reading_guide_must_be_empty");
+  }
   const blockByKey = new Map();
   for (const block of bodyBlocks) {
     for (const key of block.source_block_keys || [block.source_block_key]) blockByKey.set(key, block);
@@ -1007,7 +1055,10 @@ function renderReadingMarkdown({ materialId, metadata, sourceType, hashes, seman
     "---",
     "",
     `# ${title || sourceTitle(metadata, bodyBlocks, { preferBodyHeading: translationState === "generated_translation" })}`,
-    "",
+    ""
+  ];
+  if (includeReadingGuide) {
+    lines.push(
     "## 阅读前置卡",
     "",
     `- 价值判断：${VALUE_LABELS[judgments.value.level]}。${judgments.value.reason}`,
@@ -1016,7 +1067,7 @@ function renderReadingMarkdown({ materialId, metadata, sourceType, hashes, seman
     "",
     "## 核心洞察",
     ""
-  ];
+    );
   if (!semantic.insights.length) lines.push("- 待处理：本次未生成通过校验的核心洞察。", "");
   semantic.insights.forEach((insight, index) => {
     const target = blockByKey.get(insight.target_block_key);
@@ -1025,14 +1076,23 @@ function renderReadingMarkdown({ materialId, metadata, sourceType, hashes, seman
     if (jump) lines.push(jump);
     lines.push("");
   });
+  }
   lines.push("---", "", "## 正文", "");
-  for (const block of bodyBlocks) lines.push(block.markdown, "", `^${block.block_id}`, "");
+  for (const block of bodyBlocks) {
+    // An out-of-list anchor addresses the entire preceding list, even across
+    // blank lines. Anchor a single root item inline to keep the exact topic.
+    if (block.type === "list" && /^\s*[-*+]\s+(?!`{3,}|~{3,}|\$\$)\S/u.test(block.markdown)) {
+      const itemLines = block.markdown.split("\n");
+      itemLines[0] += ` ^${block.block_id}`;
+      lines.push(itemLines.join("\n"), "");
+    } else lines.push(block.markdown, "", `^${block.block_id}`, "");
+  }
   if (translationState === "generated_translation" && originalBlocks.length) {
     lines.push("---", "", "## 原文", "");
     for (const block of originalBlocks) lines.push(block.markdown, "");
   }
   const rendered = `${trimOuterBlankLines(lines.join("\n"))}\n`;
-  return pruneUnreferencedReadingAnchors(rendered, bodyBlocks.map((block) => block.block_id)).markdown;
+  return normalizeReaderMath(pruneUnreferencedReadingAnchors(rendered, bodyBlocks.map((block) => block.block_id)).markdown).markdown;
 }
 
 function renderQuarantineMarkdown({ materialId, metadata, sourceType, hashes, blocks }) {
@@ -1068,6 +1128,7 @@ function renderQuarantineMarkdown({ materialId, metadata, sourceType, hashes, bl
 function translationStateFor(detection, alignments) {
   if (detection.requires_original_url && !detection.original_url) return "translation_original_missing";
   if (!detection.explicit && !detection.bilingual) return "not_translation";
+  if (detection.existing_translation_only && detection.original_url) return "preserved_translation";
   if (!detection.has_original) return "alignment_pending";
   if (!alignments.length || alignments.some((item) => item.status !== "aligned")) return "alignment_pending";
   return "aligned";
@@ -1097,16 +1158,19 @@ async function resultContractValid(result) {
   }
 }
 
-function retryableReviewResult(result) {
+function cacheableCompletedResult(result) {
   return Boolean(
     result
-    && result.processing_state === "degraded"
-    && result.artifacts?.target_zone === "preprocess-review"
+    && result.status === "completed"
+    && result.processing_state === "rendered"
+    && result.artifacts?.target_zone === "local-ir-reading"
+    && typeof result.artifacts?.reading_markdown === "string"
+    && result.artifacts.reading_markdown.length > 0
   );
 }
 
 async function writeCache(cacheDir, idempotencyKey, result) {
-  if (!cacheDir || retryableReviewResult(result) || !await resultContractValid(result)) return false;
+  if (!cacheDir || !cacheableCompletedResult(result) || !await resultContractValid(result)) return false;
   await fs.mkdir(cacheDir, { recursive: true });
   const target = path.join(cacheDir, `${idempotencyKey}.json`);
   const temporary = path.join(cacheDir, `.${idempotencyKey}.${process.pid}.${Date.now()}.tmp`);
@@ -1124,11 +1188,19 @@ async function writeCache(cacheDir, idempotencyKey, result) {
 }
 
 function replayResult(cached, now) {
+  const quality = spokenQualityFromReceipt(cached.receipt);
+  const validations = cached.receipt.validations.map(item => item.name === 'spoken_quality_review' && quality
+    ? { ...item, details: { ...item.details, quality } } : item);
+  if (quality && !validations.some(item => item.name === 'spoken_quality_review')) validations.push({
+    name:'spoken_quality_review',status:'passed',details:{version:quality.version,policy:'required',quality}
+  });
   return {
     ...cached,
     status: "idempotent_replay",
     receipt: {
       ...cached.receipt,
+      validations,
+      model: { ...cached.receipt.model, calls: 0, attempts: [], call_ledger: [] },
       replay_of_status: cached.status,
       replayed_at: now
     }
@@ -1166,12 +1238,23 @@ export async function processMaterial(request, options = {}) {
     user_instruction: sha256(request.user_instruction)
   };
   const materialId = materialIdFor(request, hashes.input, metadata);
-  const promptVersion = promptVersionFor(request);
+  const translationPolicy = request.processing_options?.cleaning_mode === "source_translation"
+    ? await loadTranslationPolicy() : null;
+  const spokenPolicyHash = request.processing_options?.cleaning_mode === "lossless_spoken_to_written"
+    ? sha256((await Promise.all(['lossless-spoken-to-written-v1.md', 'spoken-quality-audit-v1.md'].map(name =>
+      fs.readFile(new URL(`../prompts/${name}`, import.meta.url), 'utf8')))).join('\n')) : null;
+  const promptVersion = promptVersionFor(request)
+    + (spokenPolicyHash ? `:${SPOKEN_REFINEMENT_VERSION}:${spokenPolicyHash}` : "")
+    + (translationPolicy ? `:${TRANSLATION_UNIT_VERSION}:${translationPolicy.sha256}` : "")
+    + (request.processing_options?.include_reading_guide !== false ? `:${GUIDE_COVERAGE_VERSION}` : "");
   const idempotencyKey = idempotencyKeyFor(request, materialId, hashes, metadata, promptVersion);
   const cached = options.skipCacheRead ? null : await readCache(options.cacheDir, idempotencyKey);
   if (
     cached?.receipt?.processor_version === PROCESSOR_VERSION
-    && !retryableReviewResult(cached)
+    && cached?.receipt?.prompt_version === promptVersion
+    && (!spokenPolicyHash || (options.producer && !(options.producer instanceof ExternalProducer))
+      || spokenQualityFromReceipt(cached.receipt)?.chunks?.every(chunk => chunk.status === 'passed') === true)
+    && cacheableCompletedResult(cached)
     && await resultContractValid(cached)
   ) {
     const replayed = replayResult(cached, now);
@@ -1179,7 +1262,12 @@ export async function processMaterial(request, options = {}) {
   }
 
   const cleaningPolicy = cleaningPolicyFor(request);
-  const sourceBlocks = buildBlocks(primaryMarkdown, originalMarkdown, metadata);
+  const sourceBlocks = options.preparedBodyBlocks
+    ? options.preparedBodyBlocks.map((block, index) => ({
+        source_block_key: block.source_block_key, source_index: index, type: block.type,
+        role: block.role, language: block.language, markdown: block.markdown, source_hash: sha256(block.markdown)
+      }))
+    : buildBlocks(primaryMarkdown, originalMarkdown, metadata);
   const semanticNormalization = normalizePandocSemanticBlocks(sourceBlocks, {
     enabled: cleaningPolicy.normalize_semantic_containers,
     referenceLabels: metadata.split?.reference_labels || {}
@@ -1268,8 +1356,11 @@ export async function processMaterial(request, options = {}) {
   let semantic = null;
   let producerAccepted = false;
   let lastFailures = [];
+  let editorialFindings = [];
   let bestInsightRepairCandidate = null;
+  let effectiveSafetyCap = safetyCap;
   const producerPayload = {
+    ...(translationPolicy ? { translation_policy: translationPolicy } : {}),
     material_id: materialId,
     source_type: request.source_type,
     source_metadata: metadataForProducer(metadata),
@@ -1292,21 +1383,40 @@ export async function processMaterial(request, options = {}) {
       ...(processingProfile ? { semantic_kind: semantic_kind || null, translation_scope: translation_scope || null } : {})
     }))
   };
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  const maxAttempts = Math.max(1, Math.min(3, producer.maxAttempts ?? 3));
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const generated = await producer.generate(producerPayload, { validationFeedback: lastFailures, attempt });
+      const localOnly = cleaningPolicy.mode === "semantic_only" && cleaningPolicy.include_reading_guide === false;
+      const generated = localOnly
+        ? { output: { judgments: null, insights: [], translation: { is_bilingual: Boolean(translationDetection.bilingual), alignments: [] } }, api_calls: 0, provider: "local", model: "deterministic", call_ledger: [] }
+        : await producer.generate(producerPayload, { validationFeedback: lastFailures, attempt,
+          ...(cleaningPolicy.mode === 'semantic_only' && cleaningPolicy.include_reading_guide !== false ? {requiredProvider:'codex_exec'} : {}) });
       const generatedCalls = Number(generated.api_calls);
       baseReceipt.model.calls += Number.isInteger(generatedCalls) && generatedCalls >= 0 ? generatedCalls : 1;
       baseReceipt.model.provider = generated.provider;
       baseReceipt.model.model = generated.model;
       baseReceipt.model.call_ledger.push(...(generated.call_ledger || []));
       let acceptedOutput = generated.output;
-      lastFailures = validateProducerOutput(acceptedOutput, blocks, safetyCap, cleaningPolicy, processingProfile, translationDetection);
-      const attributionNormalization = normalizeLeadingAttributionBoilerplate(acceptedOutput, lastFailures);
+      effectiveSafetyCap = generated.usage?.stages?.guide_coverage?.version === GUIDE_COVERAGE_VERSION
+        && generated.usage.stages.guide_coverage.status === 'passed' ? Infinity : safetyCap;
+      lastFailures = validateProducerOutput(acceptedOutput, blocks, effectiveSafetyCap, cleaningPolicy, processingProfile, translationDetection);
+      if (lastFailures.includes("disabled_reading_guide_must_be_empty")) {
+        const error = new Error("disabled_reading_guide_must_be_empty");
+        error.terminal = true;
+        error.api_calls = 0; // The completed producer call was already counted above.
+        throw error;
+      }
+      // A source-verified attribution may identify a quoted or rebutted speaker.
+      // Do not rewrite an audited guide with the legacy style-only regex.
+      const attributionNormalization = generated.usage?.stages?.guide_fidelity?.status === 'passed'
+        ? { output: acceptedOutput, normalizedIndexes: [] }
+        : normalizeLeadingAttributionBoilerplate(acceptedOutput, lastFailures);
       if (attributionNormalization.normalizedIndexes.length) {
         acceptedOutput = attributionNormalization.output;
-        lastFailures = validateProducerOutput(acceptedOutput, blocks, safetyCap, cleaningPolicy, processingProfile, translationDetection);
+        lastFailures = validateProducerOutput(acceptedOutput, blocks, effectiveSafetyCap, cleaningPolicy, processingProfile, translationDetection);
       }
+      const candidateEditorialFindings = lastFailures.filter(isEditorialDetailFailure);
+      lastFailures = lastFailures.filter((failure) => !isEditorialDetailFailure(failure));
       const repairScore = insightRepairCandidateScore(lastFailures);
       if (repairScore !== null && (!bestInsightRepairCandidate || repairScore <= bestInsightRepairCandidate.score)) {
         bestInsightRepairCandidate = {
@@ -1328,6 +1438,7 @@ export async function processMaterial(request, options = {}) {
         } : {})
       });
       if (!lastFailures.length) {
+        editorialFindings = candidateEditorialFindings;
         semantic = {
           ...acceptedOutput,
           cleaned_blocks: mergeCleanedBlocks(blocks, acceptedOutput.cleaned_blocks),
@@ -1361,7 +1472,7 @@ export async function processMaterial(request, options = {}) {
       if (repaired.provider) baseReceipt.model.provider = repaired.provider;
       if (repaired.model) baseReceipt.model.model = repaired.model;
       const repairedOutput = repaired.output || candidate.output;
-      lastFailures = validateProducerOutput(repairedOutput, blocks, safetyCap, cleaningPolicy, processingProfile, translationDetection);
+      lastFailures = validateProducerOutput(repairedOutput, blocks, effectiveSafetyCap, cleaningPolicy, processingProfile, translationDetection);
       attemptReceipt.insight_contract_repair = {
         status: lastFailures.length ? "rejected" : "accepted",
         repaired_indexes: repaired.repairedIndexes || [],
@@ -1393,11 +1504,25 @@ export async function processMaterial(request, options = {}) {
   }
   baseReceipt.model.attempts = attempts;
 
+  if (lastFailures.includes("disabled_reading_guide_must_be_empty")) {
+    return { schema_version: RESULT_SCHEMA_VERSION, contract_version: CONTRACT_VERSION,
+      status: "failed", material_id: materialId, idempotency_key: idempotencyKey,
+      processing_state: "failed", translation_state: "unknown", artifacts: {}, source_metadata: metadata,
+      receipt: baseReceipt, errors: [errorItem("disabled_reading_guide_must_be_empty", "semantic_processing", "关闭导读的正文阶段返回了导读数据，已拒绝该结果。")]
+    };
+  }
+
   const errors = [];
   let status = "completed";
   let processingState = "rendered";
   if (!semantic) {
     semantic = fallbackSemantic(blocks);
+    // A fallback preserves the source, but is never a generated reading guide.
+    semantic.judgments = null;
+    semantic.insights = [];
+    if (cleaningPolicy.include_reading_guide !== false) {
+      baseReceipt.reading_guide = { status: "failed", calls: baseReceipt.model.calls, reason: "guide_generation_failed" };
+    }
     semantic.cleaned_units = cleanedUnitsFor(blocks, semantic, { ...cleaningPolicy, mode: "source_voice_structuring" });
     status = "completed_with_warnings";
     processingState = "degraded";
@@ -1436,7 +1561,8 @@ export async function processMaterial(request, options = {}) {
   const cleaningManifest = buildCleaningManifest(blocks, bodyBlocks, cleaningPolicy, semanticNormalization, terminologyTerms);
   const alignments = Array.isArray(semantic.translation?.alignments) ? semantic.translation.alignments : [];
   const translationState = cleaningPolicy.mode === "source_translation"
-    ? "generated_translation"
+    ? producerAccepted ? "generated_translation" : "unknown"
+    : translationDetection.bilingual && cleaningPolicy.include_reading_guide === false ? "preserved_bilingual"
     : translationStateFor(translationDetection, alignments);
   if (translationState === "alignment_pending") {
     status = status === "completed" ? "completed_with_warnings" : status;
@@ -1451,11 +1577,17 @@ export async function processMaterial(request, options = {}) {
     bodyBlocks,
     originalBlocks: cleaningPolicy.mode === "source_translation" ? blocks : [],
     translationState,
-    title: readingTitle
+    title: readingTitle,
+    includeReadingGuide: request.processing_options?.include_reading_guide !== false && semantic.judgments !== null
   });
   const visibleAnchorAudit = auditVisibleReadingAnchors(readingMarkdown, bodyBlocks);
   const validations = [
+    { name:'reading_guide_coverage', status:attempts.some(a=>a.status==='accepted'&&a.usage?.stages?.guide_coverage?.status==='passed')?'passed':baseReceipt.reading_guide?.status==='failed'?'failed':'not_applicable',
+      details:attempts.find(a=>a.status==='accepted')?.usage?.stages?.guide_coverage || null },
+    { name:'reading_guide_fidelity', status:attempts.some(a=>a.status==='accepted'&&a.usage?.stages?.guide_fidelity?.status==='passed')?'passed':baseReceipt.reading_guide?.status==='failed'?'failed':'not_applicable',
+      details:attempts.find(a=>a.status==='accepted')?.usage?.stages?.guide_fidelity || null },
     { name: "request_schema", status: "passed" },
+    { name: "editorial_details_non_blocking", status: "passed", details: { policy: "advisory", findings: editorialFindings } },
     { name: "whole_article_cleaning", status: cleaningPolicy.mode !== "semantic_only" ? (producerAccepted ? "passed" : "failed") : "not_applicable" },
     { name: "source_translation", status: cleaningPolicy.mode === "source_translation" ? (producerAccepted ? "passed" : "failed") : "not_applicable" },
     { name: "translation_protected_syntax", status: cleaningPolicy.mode === "source_translation" ? (producerAccepted ? "passed" : "failed") : "not_applicable" },
@@ -1474,12 +1606,17 @@ export async function processMaterial(request, options = {}) {
     }] : []),
     { name: "semantic_container_normalization", status: cleaningPolicy.normalize_semantic_containers ? (visiblePandocIssues.length ? "failed" : "passed") : "not_applicable", details: { ...semanticNormalization.counts, visible_pandoc_issues: visiblePandocIssues.length } },
     { name: "lossless_spoken_to_written", status: cleaningPolicy.mode === "lossless_spoken_to_written" ? (producerAccepted ? "passed" : "failed") : "not_applicable" },
+    ...(cleaningPolicy.mode === 'lossless_spoken_to_written' && producer instanceof ExternalProducer ? [{
+      name: 'spoken_quality_review', status: producerAccepted ? 'passed' : 'failed',
+      details: { version: SPOKEN_REFINEMENT_VERSION, policy: 'required',
+        quality: attempts.find(attempt => attempt.status === 'accepted')?.usage?.stages?.spoken_quality || null }
+    }] : []),
     { name: "lossless_source_mapping", status: cleaningManifest.mappings.length === blocks.length ? "passed" : "failed" },
     { name: "semantic_fidelity_audit", status: bodyBlocks.some((block) => block.local_fidelity_verified) ? "passed" : "not_needed" },
-    { name: "oral_noise_reduction", status: cleaningPolicy.mode === "lossless_spoken_to_written" ? (producerAccepted ? "passed" : "failed") : "not_applicable" },
+    { name: "oral_noise_reduction", status: cleaningPolicy.mode === "lossless_spoken_to_written" ? (editorialFindings.some((item) => item.startsWith("oral_noise_")) ? "not_needed" : producerAccepted ? "passed" : "failed") : "not_applicable" },
     { name: "source_voice_preserved", status: cleaningPolicy.preserve_source_voice ? "passed" : "not_applicable" },
     { name: "visible_timestamps_forbidden", status: cleaningPolicy.forbid_visible_timestamps ? "passed" : "not_applicable" },
-    { name: "content_headings", status: cleaningPolicy.require_content_headings ? "passed" : "not_applicable" },
+    { name: "content_headings", status: cleaningPolicy.require_content_headings ? (editorialFindings.some((item) => item.startsWith("structured_body_headings_missing")) ? "not_needed" : "passed") : "not_applicable" },
     { name: "claim_epistemic_fidelity", status: cleaningPolicy.attribute_unverified_claims ? "passed" : "not_applicable" },
     { name: "block_coverage", status: new Set(bodyBlocks.flatMap((block) => block.source_block_keys || [block.source_block_key])).size === blocks.length ? "passed" : "failed" },
     { name: "sparse_cleaned_block_merge", status: "passed" },

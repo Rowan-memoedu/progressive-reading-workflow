@@ -2,9 +2,9 @@
 
 ## 工程所有权与交接点
 
-- Obsidian 阅读 UI 与“批量归档”按钮入口由工程四 Thread `00000000-0000-0000-0000-000000000000` 维护。
-- 点击后的批量归档后端由独立子模块 Thread `00000000-0000-0000-0000-000000000000` 维护；它负责生成符合本合同的 native-v2 JSON，并止于 `export_package_ready`。
-- 正式归档 Thread `00000000-0000-0000-0000-000000000000` 只从 JSON 包开始，负责 RemNote 写入、回读、receipt 与最终本地 `archived`。
+- Obsidian 阅读 UI 与“批量归档”按钮入口由Obsidian 宿主 维护。
+- 点击后的批量归档后端由独立批量归档后端 维护；它负责生成符合本合同的 native-v2 JSON，并止于 `export_package_ready`。
+- 正式归档模块 只从 JSON 包开始，负责 RemNote 写入、回读、receipt 与最终本地 `archived`。
 
 三个边界共享同一状态语义和本合同，不得各自建立第二套状态或导入器。
 

@@ -7,7 +7,7 @@
   "forced_rescan_entry": "npm run rss:source:sync:all -- --force",
   "single_feed_entry": "npm run rss:source:sync:v1 -- --feed-url <feed-url> --limit <1-100>",
   "subscriptions_entry": "npm run rss:source:subscriptions",
-  "subscriptions_config": "config/rss-subscriptions.v1.json",
+  "subscriptions_config": "D:/AppData/RSSImport/RSS 自动导入.md (第三个区域)",
   "subscriptions_contract": "progressive-reading.rss-subscriptions/v1",
   "subscriptions_schema": "rss-source/contracts/subscriptions.v1.schema.json",
   "legacy_audit_status": "retired_immutable_snapshot",

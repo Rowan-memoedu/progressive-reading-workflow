@@ -39,3 +39,8 @@
 .local-ir-browser-toast.is-error {
   border-left: 4px solid #b42318;
 }
+
+.local-ir-browser-toast.is-warning {
+  border-left: 4px solid #d97706;
+  background: #fffbeb;
+}

@@ -235,8 +235,39 @@ const app = spawn(process.execPath, [appScript], {
 });
 app.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
 
+async function verifyRetainedRss() {
+  const requestsBeforeCache = observedCookies.length;
+  for (const mode of ["original_text", "standard_preprocess"]) {
+    const cached = await postJson(`${appBase}/api/browser-import/requests`, {
+      urls: [`${sourceBase}/retained-rss-${mode}`],
+      source: "rss_auto_import",
+      destination_folder: "RSS/保留正文",
+      processing_mode: mode,
+      cached_rss_article: {
+        title: "已接收的旧文章",
+        markdown: "先前收到的完整正文。\n\n- 保留来源段落。\n- 保留列表格式。",
+        published_at: "2026-08-31T16:00:00Z"
+      }
+    });
+    const done = await waitForJson(`${appBase}/api/browser-import/requests/${cached.request_id}`, value => value.terminal);
+    const result = done.results[0];
+    assert.ok(["imported", "imported_with_warnings"].includes(result.status), JSON.stringify(result));
+    assert.equal(result.receipt.processing_mode, mode);
+    assert.equal(result.receipt.source_reused, "retained_rss_fulltext");
+    if (mode === "original_text") assert.equal(result.receipt.llm_used, false);
+    const file = result.artifacts.find(artifact => artifact.kind === "markdown").path;
+    assert.ok(file.includes(path.join("RSS","保留正文")));
+    assert.match(await fs.readFile(file,"utf8"), /先前收到的完整正文/u);
+  }
+  assert.equal(observedCookies.length, requestsBeforeCache, "retained RSS must not refetch the source page");
+}
+
 try {
   const health = await waitForJson(`${appBase}/api/highlights/health`, (value) => value.status === "ok");
+  if (process.argv.includes("--retained-rss")) {
+    await verifyRetainedRss();
+    console.log(JSON.stringify({status:"passed",check:"retained_rss_fulltext_both_import_modes"}));
+  } else {
   assert.equal(health.standardImport.defaultTransport, "background_fetch");
   assert.equal(health.standardImport.browserTabCreatedOnNormalPath, false);
   assert.equal(health.standardImport.cookiePolicy, "versioned_local_snapshot_domain_hostonly_path_secure_expiry_matching");
@@ -300,7 +331,7 @@ try {
     user_instruction: "只整理结构，保留作者原有视角"
   });
   assert.equal(obsidianFirst.transport, "background_fetch");
-  assert.equal(obsidianFirst.status, "completed");
+  assert.equal(obsidianFirst.status, "completed", JSON.stringify(obsidianFirst.results));
   assert.equal(obsidianFirst.results[0].status, "imported");
 
   const obsidianReplay = await postJson(`${appBase}/api/highlights/import-local-urls`, {
@@ -316,6 +347,7 @@ try {
   assert.ok(observedCookies.length >= 8);
   assert.ok(observedCookies.every((value) => value === syntheticCookie), "the configured synthetic Cookie must apply only to its exact hostname");
   assert.ok(crossHostCookies.length >= 1 && crossHostCookies.every((value) => value === null), "redirects to another hostname must strip the source hostname Cookie");
+  await verifyRetainedRss();
   assert.doesNotMatch(await allTextFiles(workflowRoot), /synthetic_session|fixture_only_not_real/, "broker, receipts, Markdown and audit files must not persist Cookie values");
 
   console.log(JSON.stringify({
@@ -330,6 +362,7 @@ try {
       "requires_js_render",
       "standard_preprocess",
       "idempotent_replay",
+      "retained_rss_fulltext_both_import_modes",
       "versioned_snapshot_exact_hostname_cookie",
       "invalid_cookie_config_fails_startup_without_secret_echo",
       "cross_hostname_cookie_stripping",
@@ -339,6 +372,7 @@ try {
     request_status: completed.status,
     obsidian_replay_status: obsidianReplay.results[0].status
   }, null, 2));
+  }
 } catch (error) {
   error.message = `${error.message}\napp_stderr=${stderr}`;
   throw error;

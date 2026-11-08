@@ -7,13 +7,13 @@ param(
     [ValidatePattern('^\d{4}\.\d{2}\.\d{2}-r[1-9]\d*$')]
     [string]$Version,
 
-    [string]$Target = 'D:/Projects/progressive-reading-workflow\阅读区\PiKaChu345 数学笔记库',
+    [string]$Target = (Join-Path $PSScriptRoot '..\阅读区\PiKaChu345 数学笔记库'),
 
-    [string]$RollbackRoot = 'D:\KnowledgeBases\ToolTrials\Pika-Library-Rollback',
+    [string]$RollbackRoot = (Join-Path $PSScriptRoot '..\.local-ir\library-rollback'),
 
-    [string]$ManifestPath = 'D:/Projects/progressive-reading-workflow\config\pikachu345-library.current.json',
+    [string]$ManifestPath = (Join-Path $PSScriptRoot '..\config\pikachu345-library.current.json'),
 
-    [string]$HostVaultRoot = 'D:/Projects',
+    [string]$HostVaultRoot = (Join-Path $PSScriptRoot '..'),
 
     [string]$SourceDynamic = '',
 

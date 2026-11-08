@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { standardWorkflowOptions } from "../standard-preprocessing/index.mjs";
 import {
   applyDecision,
   generateSummaries,
@@ -17,6 +18,9 @@ import {
   setDecision,
   workflowPaths
 } from "../rss-reading/core.mjs";
+
+const priorRssImportHome = process.env.RSS_IMPORT_HOME;
+test.afterEach(()=>{if(priorRssImportHome===undefined)delete process.env.RSS_IMPORT_HOME;else process.env.RSS_IMPORT_HOME=priorRssImportHome;});
 
 function hash(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -86,7 +90,11 @@ function sourcePackage({ materialId, url, title, contentStatus, requestReady = t
 }
 
 async function createFixture() {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rss-reading-test-"));
+  const fixtureRoot='D:/Artifacts/RSS-Routing-20260915/tests';await fs.mkdir(fixtureRoot,{recursive:true});
+  const root = await fs.mkdtemp(path.join(fixtureRoot, "rss-reading-test-"));
+  const configHome=path.join(root,'rss-config');await fs.mkdir(configHome);
+  await fs.writeFile(path.join(configHome,'RSS 自动导入.md'),'```json\n{}\n```\n## ① 标准流程导入\n## ② 原文直接导入\n## ③ 日报与周报\nFixture：https://example.test/feed.xml\n');
+  process.env.RSS_IMPORT_HOME=configHome;
   const paths = workflowPaths(root);
   const legacyDecisions = Array.from({ length: 22 }, (_, index) => ({
     decision_id: `legacy-${index + 1}`,
@@ -173,6 +181,12 @@ async function createFixture() {
 async function fixturePreviewRunner({ item, request }) {
   const short = item.route === "short_aggregate";
   assert.equal(request.processing_options.workflow_mode, short ? "standard" : "single_stage");
+  if (short) {
+    const source = JSON.parse(await fs.readFile(item.preprocess_request_path, "utf8"));
+    assert.equal(request.user_instruction, source.user_instruction);
+    assert.deepEqual(request.material, source.material);
+    assert.deepEqual(request.processing_options, standardWorkflowOptions(source.processing_options));
+  }
   return {
     result: {
       schema_version: "progressive-reading.preprocess.result/v1",

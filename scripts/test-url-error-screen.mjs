@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import {fetchUrlWithoutBrowser} from './url-background-fetch.mjs';
+const warning='Something went wrong, but don’t fret — let’s give it another shot. Some privacy related extensions may cause issues on this site. Please disable them and try again.';
+const response=body=>async()=>new Response(`<html><body>${body}<script src="app.js"></script></body></html>`,{headers:{'content-type':'text/html'}});
+await assert.rejects(fetchUrlWithoutBrowser('https://social.example.test/post/1',{fetchImpl:response(`<div>${warning}</div>`)}),e=>e.status==='requires_js_render'||e.message.includes('javascript_application_error_screen'));
+const article=await fetchUrlWithoutBrowser('https://blog.example.test/error-analysis',{fetchImpl:response(`<article><h1>Debugging a bootstrap failure</h1><p>${warning}</p><p>This article explains the failure and its recovery.</p></article>`)});
+assert.match(article.visibleText,/Debugging a bootstrap failure/);
+const short=await fetchUrlWithoutBrowser('https://example.test/note',{fetchImpl:response('<article>A short but complete note.</article>')});
+assert.match(short.visibleText,/short but complete note/);
+console.log(JSON.stringify({status:'passed',checks:['reject_bootstrap_error','preserve_article_quoting_error','preserve_short_article']}));

@@ -1,5 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { active as unifiedActive } from '../subscription-workflow/catalog.mjs';
+import { paths as subscriptionPaths, withLock } from '../subscription-workflow/config.mjs';
 import {
   applyDecision,
   DEFAULT_WORKFLOW_ROOT,
@@ -31,7 +33,7 @@ function parseArgs(argv) {
   return result;
 }
 
-async function main() {
+async function runMain() {
   const command = process.argv[2] || "status";
   const options = parseArgs(process.argv.slice(3));
   const workflowRoot = path.resolve(options.root || DEFAULT_WORKFLOW_ROOT);
@@ -81,10 +83,16 @@ async function main() {
     result = await publishSelected(workflowRoot, options["material-id"]);
   } else {
     result = {
-      commands: ["status", "queue", "migrate-legacy", "daily", "weekly", "generate --mode daily|weekly|all", "canary", "clearance", "decision --material-id <id> --decision <state>", "publish --material-id <id>"]
+      commands: ["status", "queue", "migrate-legacy", "daily", "weekly", "generate --mode daily|weekly|short-weekly|all", "canary", "clearance", "decision --material-id <id> --decision <state>", "publish --material-id <id>"]
     };
   }
   console.log(JSON.stringify({ ok: true, command, result }, null, 2));
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(3));
+  const root = path.resolve(options.root || DEFAULT_WORKFLOW_ROOT);
+  return unifiedActive(root) ? withLock(path.join(subscriptionPaths(root).home, 'worker.lock'), runMain) : runMain();
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

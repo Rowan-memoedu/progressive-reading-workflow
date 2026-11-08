@@ -2,10 +2,11 @@ import { execFileSync } from "node:child_process";
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {loadBatchProducerConfig, requestProducerText} from '../standard-preprocessing/lib/producer.mjs';
 
 const DEFAULT_QUEUE_DIR = "RemNote 导出队列";
 const CONFIG_DIR = path.join(os.homedir(), "Documents", "New project");
-const REQUIRED_CONFIG = ["AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL"];
+const REQUIRED_CONFIG = ["AI_PRODUCER_BASE_URL", "DEEPSEEK_READING_API_KEY", "AI_PRODUCER_MODEL"];
 
 const args = parseArgs(process.argv.slice(2));
 const root = process.cwd();
@@ -39,7 +40,7 @@ async function main() {
     return;
   }
 
-  const config = await loadProducerConfig();
+  const config = await loadBatchProducerConfig();
   for (const { item, annotation } of tasks) {
     try {
       const result = await resolveAnnotation(config, item.data, annotation);
@@ -99,21 +100,9 @@ async function resolveAnnotation(config, data, annotation) {
     ]
   };
 
-  const response = await fetch(chatCompletionsUrl(config.AI_PRODUCER_BASE_URL), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${config.AI_PRODUCER_API_KEY}`
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(120000)
+  const dataJson = await requestProducerText(config, {
+    system:payload.messages[0].content, user:payload.messages[1].content
   });
-
-  if (!response.ok) {
-    throw new Error(`API ${response.status}: ${await response.text()}`);
-  }
-
-  const dataJson = await response.json();
   const text = dataJson?.choices?.[0]?.message?.content || "";
   return parseJsonObject(text);
 }

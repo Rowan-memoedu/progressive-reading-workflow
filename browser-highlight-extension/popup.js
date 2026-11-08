@@ -1,4 +1,4 @@
-const VERSION = "0.5.14";
+const VERSION = "0.5.17";
 const DEFAULT_PORT = 37829;
 const PORT_SCAN_LABEL = "37829-37849";
 

@@ -63,6 +63,10 @@ class CorePackageTests(unittest.TestCase):
             self.assertEqual(request["source_type"], "pdf")
             self.assertEqual(request["user_instruction"], "保留术语。")
             self.assertEqual(request["source_metadata"]["source_sha256"], before)
+            self.assertEqual(
+                request["processing_options"],
+                {"workflow_mode": "standard"},
+            )
             self.assertEqual(Path(run["output_dir"]), output)
 
     def test_ocr_required_never_builds_downstream_request(self) -> None:

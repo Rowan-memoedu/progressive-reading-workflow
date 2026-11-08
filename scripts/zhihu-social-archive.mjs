@@ -384,13 +384,14 @@ function cleanupRequest(item) {
   throw new Error("zhihu_cleanup_item_invalid");
 }
 
-async function requestZhihuJson(url, {
+export async function requestZhihuJson(url, {
   cookieByHostname,
   cookieHeaderForUrl,
-  fetchImpl,
+  fetchImpl = fetch,
   method = "GET",
   json = null,
-  retryDelaysMs = [1000, 3000, 8000, 20000]
+  retryDelaysMs = [1000, 3000, 8000, 20000],
+  allowAnonymous = false
 }) {
   const parsed = new URL(url);
   if (parsed.protocol !== "https:" || parsed.hostname !== "www.zhihu.com") {
@@ -399,10 +400,11 @@ async function requestZhihuJson(url, {
   const cookie = typeof cookieHeaderForUrl === "function"
     ? await cookieHeaderForUrl(parsed.href)
     : cookieByHostname?.get?.("www.zhihu.com") || cookieByHostname?.get?.("zhihu.com") || "";
-  if (!cookie) throw new Error("zhihu_cookie_not_synced");
+  if (!cookie && !allowAnonymous) throw new Error("zhihu_cookie_not_synced");
+  if (allowAnonymous && method !== "GET") throw new Error("zhihu_anonymous_read_only");
   const headers = {
     Accept: "application/json, text/plain, */*",
-    Cookie: cookie
+    ...(cookie ? { Cookie: cookie } : {})
   };
   if (/^\/api\/v3\/moments\//u.test(parsed.pathname)) headers["X-API-VERSION"] = "3.0.40";
   const options = { method, headers, redirect: "error" };

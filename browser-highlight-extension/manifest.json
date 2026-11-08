@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local IR Browser Highlight",
-  "version": "0.5.14",
+  "version": "0.5.17",
   "description": "Explicitly initialize browser reading drafts, then annotate in processing or cloze mode with Local IR-compatible virtual highlights.",
   "permissions": [
     "activeTab",

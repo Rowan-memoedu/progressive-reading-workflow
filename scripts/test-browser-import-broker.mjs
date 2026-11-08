@@ -10,7 +10,7 @@ import {
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "local-ir-browser-broker-"));
 let now = Date.parse("2026-08-21T00:00:00.000Z");
 try {
-  const broker = new BrowserImportBroker({ stateRoot: root, now: () => now, leaseMs: 1000, retryDelayMs: 100 });
+  const broker = new BrowserImportBroker({ stateRoot: root, now: () => now, leaseMs: 1000, retryDelayMs: 100, concurrency: 4 });
   const request = await broker.createRequest(["https://a.test/article", "https://b.test/article"], {
     source: "test",
     clientRequestId: "fixture-request-1",
@@ -125,6 +125,23 @@ try {
   assert.doesNotMatch(await fs.readFile(path.join(root, "state.json"), "utf8"), /private-cookie-must-not-persist/);
   assert.equal(await broker.claimTask("local-background-worker", "terminal-check", { transport: BACKGROUND_FETCH_TRANSPORT }), null);
 
+  const warningRequest = await broker.createRequest(["https://warning.test/article"], { source: "test" });
+  const warningTask = await broker.claimTask("warning-worker");
+  const warningSummary = await broker.completeTask(warningTask.id, {
+    ok: true,
+    result: {
+      status: "imported_with_warnings",
+      final_url: warningTask.requested_url,
+      artifacts: [{ kind: "markdown", path: "warning.md" }],
+      receipt: { quality_status: "warning", readable_with_warnings: true }
+    },
+    leaseToken: warningTask.lease_token
+  });
+  assert.equal(warningSummary.status, "completed_with_warnings");
+  assert.equal(warningSummary.warnings, 1);
+  assert.equal(warningSummary.concurrency, 1);
+  assert.equal((await broker.findSuccessfulResultForUrl(warningTask.requested_url)).status, "imported_with_warnings");
+
   const reloaded = new BrowserImportBroker({ stateRoot: root });
   const persisted = await reloaded.getRequest(request.request_id);
   assert.equal(persisted.status, "completed_with_failures");
@@ -134,7 +151,7 @@ try {
   assert.equal((await reloaded.getRequest(exhaustedRequest.request_id)).status, "failed");
   assert.equal(await reloaded.claimTask("worker-c"), null);
 
-  console.log(JSON.stringify({ status: "passed", checks: ["durable_request", "idempotent_request_creation", "idempotent_task_claim", "claim", "completion", "lease_recovery", "mixed_batch_receipt", "bounded_retry", "retry_backoff", "retry_exhaustion", "stale_lease_rejection", "transport_isolation", "explicit_degraded_status", "cookie_field_redaction"] }, null, 2));
+  console.log(JSON.stringify({ status: "passed", checks: ["durable_request", "idempotent_request_creation", "idempotent_task_claim", "claim", "completion", "lease_recovery", "mixed_batch_receipt", "bounded_retry", "retry_backoff", "retry_exhaustion", "stale_lease_rejection", "transport_isolation", "explicit_degraded_status", "readable_warning_status", "configured_concurrency", "cookie_field_redaction"] }, null, 2));
 } finally {
   await fs.rm(root, { recursive: true, force: true });
 }

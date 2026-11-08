@@ -5,6 +5,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import sanitizeFilename from "sanitize-filename";
+import { standardWorkflowOptions } from "../standard-preprocessing/index.mjs";
+import { renameWithRetry } from "../rss-source/core.mjs";
+import { publicationMetadata } from "../subscription-workflow/publication-time.mjs";
+import { includesPublication } from "../subscription-workflow/history.mjs";
+import { appendShortReport, shortKey, rollShortReports, archiveSummaryReports } from "../subscription-workflow/report-archive.mjs";
+import { loadSubscriptionRegistry } from '../rss-source/subscriptions.mjs';
+import { active as unifiedActive, canonicalCatalog, mergeIdentity, findExistingPublication } from '../subscription-workflow/catalog.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_WORKFLOW_ROOT = path.resolve(__dirname, "..");
@@ -85,17 +92,7 @@ function normalizeUrl(value) {
   }
 }
 
-function meaningfulLength(markdown) {
-  return String(markdown || "")
-    .replace(/^---\r?\n[\s\S]*?\r?\n---\s*/u, "")
-    .replace(/<!--[^]*?-->/gu, "")
-    .replace(/!\[[^\]]*\]\([^)]*\)/gu, " ")
-    .replace(/\[([^\]]+)\]\([^)]*\)/gu, "$1")
-    .replace(/https?:\/\/\S+/gu, " ")
-    .replace(/[#>*_`~|\-]+/gu, " ")
-    .replace(/\s+/gu, "")
-    .length;
-}
+import { meaningfulLength } from '../subscription-workflow/content-length.mjs';
 
 function safeTitle(value, fallback) {
   const title = sanitizeFilename(String(value || fallback || "RSS 未命名")).replace(/\s+/gu, " ").trim();
@@ -142,7 +139,9 @@ async function walkFiles(root) {
 
 export function workflowPaths(workflowRoot = DEFAULT_WORKFLOW_ROOT) {
   const root = path.resolve(workflowRoot);
+  const unified = unifiedActive(root);
   return {
+    unified, reportLabel: unified ? '订阅' : 'RSS',
     workflowRoot: root,
     packagesRoot: path.join(root, "imports", "rss", "source-v1", "packages"),
     batchesRoot: path.join(root, "imports", "rss", "source-v1", "batches"),
@@ -154,11 +153,12 @@ export function workflowPaths(workflowRoot = DEFAULT_WORKFLOW_ROOT) {
     previewsRoot: path.join(root, "imports", "rss-reading", "previews"),
     legacyOutputManifestPath: path.join(root, "imports", "rss-reading", "legacy-output-migration.json"),
     supersededReportReceiptPath: path.join(root, "imports", "rss-reading", "superseded-report-migration.json"),
-    summaryRoot: path.join(root, "摘要区", "RSS"),
+    summaryRoot: path.join(root, "摘要区", unified ? '订阅' : 'RSS'),
+    previousSummaryRoot: path.join(root, '摘要区', 'RSS'),
     legacySummaryArchiveRoot: path.join(root, "摘要区", "RSS", "历史归档", "legacy-v0"),
     supersededSummaryArchiveRoot: path.join(root, "摘要区", "RSS", "历史归档", "consumer-v1-obsolete"),
     readingRoot: path.join(root, "阅读区", "RSS"),
-    shortWeeklyRoot: path.join(root, "阅读区", "RSS", "短文周报"),
+    shortWeeklyRoot: path.join(root, "阅读区", unified ? '订阅' : 'RSS', "短文周报"),
     localIrStateRoot: path.join(root, ".local-ir", "browser-document-state"),
     preprocessRoot: path.join(root, "imports", "preprocess-runs", "rss"),
     preprocessCli: path.join(root, "standard-preprocessing", "cli.mjs")
@@ -336,11 +336,16 @@ function validatePackage(pkg, packageFile) {
 
 export async function scanCatalog(workflowRoot = DEFAULT_WORKFLOW_ROOT) {
   const paths = workflowPaths(workflowRoot);
+  const registry = await loadSubscriptionRegistry();
+  const reportFeeds = new Map(registry.subscriptions.filter(item=>item.enabled).map(item=>[normalizeUrl(item.feed_url),item]));
   const packageFiles = (await walkFiles(paths.packagesRoot)).filter((file) => path.basename(file) === "package.json");
   const items = [];
   for (const packageFile of packageFiles) {
     const pkg = await readJson(packageFile);
     validatePackage(pkg, packageFile);
+    const packageFeed = pkg.identity.normalized_feed_url || pkg.source_metadata.feed_url;
+    const subscription = packageFeed ? reportFeeds.get(normalizeUrl(packageFeed)) : null;
+    if (!subscription || !includesPublication(subscription, pkg.source_metadata.published_at)) continue;
     const packageDir = path.dirname(packageFile);
     const requestPath = pkg.artifacts?.preprocess_request
       ? path.resolve(packageDir, pkg.artifacts.preprocess_request)
@@ -384,7 +389,7 @@ export async function scanCatalog(workflowRoot = DEFAULT_WORKFLOW_ROOT) {
     });
   }
   items.sort((a, b) => String(b.publishedAt || b.fetchedAt || "").localeCompare(String(a.publishedAt || a.fetchedAt || "")) || a.title.localeCompare(b.title));
-  return { paths, items };
+  return { paths, items: unifiedActive(workflowRoot) ? await canonicalCatalog(workflowRoot, items) : items };
 }
 
 function emptyLedger() {
@@ -448,6 +453,7 @@ export async function syncLedger(workflowRoot = DEFAULT_WORKFLOW_ROOT, catalog =
   await importLegacy(ledger, paths);
   const legacyByUrl = new Map(ledger.legacy_decisions.map((item) => [item.normalized_item_url, item]));
   for (const current of items) {
+    mergeIdentity(ledger, current);
     const existing = ledger.items[current.materialId] || null;
     const legacy = current.itemUrl ? legacyByUrl.get(normalizeUrl(current.itemUrl)) : null;
     const item = existing || {
@@ -461,14 +467,36 @@ export async function syncLedger(workflowRoot = DEFAULT_WORKFLOW_ROOT, catalog =
       delivery: {},
       history: []
     };
-    const sourceRevision = sha256(`${current.packageSha256}:${current.requestSha256 || "blocked"}:${current.contentStatus}:${current.route}`);
+    const sourceRevision = current.preservedSourceRevision || sha256(`${current.packageSha256}:${current.requestSha256 || "blocked"}:${current.contentStatus}:${current.route}`);
     const observedAt = nowIso();
+    item.published_at ||= current.publishedAt || null;
+    if (current.externallyPublished && existsSync(current.externallyPublished.path)) {
+      item.publication = {...current.externallyPublished,status:'published',preserved_existing:true};
+      item.delivery.active_review_path = null;
+      current.route = 'import_activity';
+    }
+    if (current.canonicalKey && existing?.content_status === 'fulltext_ready' && !current.eligible) {
+      existing.source_refresh_failure = { status:current.contentStatus, errors:current.errors, checked_at:observedAt };
+      existing.canonical_key = current.canonicalKey; existing.subscription_ids = current.subscriptionIds;
+      if (current.route === 'import_activity') existing.route = 'import_activity';
+      continue;
+    }
+    delete item.source_refresh_failure;
+    if (current.canonicalKey && current.eligible && existing?.content_status === 'fulltext_ready' && existing.source_revision !== sourceRevision
+      && (existing.publication || existing.review_preview?.status === 'ready' || existing.delivery?.short_weekly_revision)) {
+      existing.available_revision = { source_revision: sourceRevision, request_path: current.requestPath, detected_at: existing.available_revision?.source_revision === sourceRevision ? existing.available_revision.detected_at : observedAt };
+      existing.canonical_key = current.canonicalKey;
+      existing.subscription_ids = current.subscriptionIds;
+      if (current.route === 'import_activity') existing.route = 'import_activity';
+      continue;
+    }
     Object.assign(item, {
+      ...(current.canonicalKey ? { canonical_key: current.canonicalKey, subscription_ids: current.subscriptionIds,
+        platform: current.platform, destination: current.destination, video: current.video } : {}),
       title: current.title,
       item_url: current.itemUrl,
       feed_url: current.feedUrl,
       author: current.author,
-      published_at: current.publishedAt,
       fetched_at: current.fetchedAt,
       source_id: current.sourceId,
       content_status: current.contentStatus,
@@ -586,12 +614,14 @@ function longReviewBlock(item, index, options = {}) {
     ...actions,
     "",
     `**当前状态**：${decisionLabel(item)}`,
+    item.available_revision ? '> 来源有更新；当前卡片与已入库正文保持原版本。' : '',
     `**一句话核心**：${ready ? firstSentence(preview.core, 180) : "预览处理尚未完成，暂不建议审批。"}`,
     `**为什么值得读**：${ready ? `${humanValue(preview.value_level)}；${firstSentence(preview.value_reason, 180)}` : "待判断"}`,
     `**可能新增量**：${ready ? firstSentence(preview.novelty || preview.core, 180) : "待判断"}`,
     `**预计阅读成本**：${readingCost(item.meaningful_length)}`,
     `**建议读法**：${ready ? readingRoute(preview.continue_reading?.level) : "待判断"}`,
     item.legacy_decision_id ? `**历史记录**：旧账本中已有决定；为避免把历史勾选冒充当前发布授权，本次仍需明确勾选。` : "",
+    publicationMetadata(item.published_at),
     "<!-- rss-reading:end -->"
   ].filter((line) => line !== "").join("\n");
 }
@@ -634,6 +664,7 @@ function blockedReviewBlock(item, index) {
     "",
     ...explanation,
     item.legacy_decision_id ? "历史账本中已有决定；该决定被保留，但不会绕过正文就绪门禁。" : "",
+    publicationMetadata(item.published_at),
     "<!-- rss-reading:end -->"
   ].filter((line) => line !== "").join("\n");
 }
@@ -655,24 +686,24 @@ function shortWeeklyBlock(item, index, language) {
   const title = language === "zh" ? (preview.chinese_title || item.title) : item.title;
   const body = language === "zh" ? preview.chinese_body : preview.original_body;
   const linkLabel = language === "zh" ? "原文链接" : "Original";
-  return [
-    `#### ${index}. ${title}`,
+  const content = [
+    `#### ${index == null ? "" : `${index}. `}${title}`,
     "",
     body || (preview.status === "ready" ? "本条没有可显示的正文。" : "本条预览处理尚未完成。"),
     "",
     item.item_url ? `[${linkLabel}](${item.item_url})` : ""
   ].filter((line) => line !== "").join("\n");
+  return [content, publicationMetadata(item.published_at)].filter(Boolean).join("\n\n");
 }
 
-function parseSummaryDecisions(text, file) {
+function parseSummaryDecisions(text, file, activeItem = null) {
   const changes = [];
-  const blocks = String(text || "").split(/(?=<!-- rss-reading:item )/gu).slice(1);
-  for (const block of blocks) {
-    const materialId = /<!-- rss-reading:item\s+([^\s>]+)\s+-->/u.exec(block)?.[1];
-    if (!materialId) continue;
+  const blocks = String(text || "").matchAll(/<!-- rss-reading:item\s+([^\s>]+)\s+-->[\s\S]*?<!-- rss-reading:end -->/gu);
+  for (const [block, materialId] of blocks) {
+    if (activeItem && !activeItem(materialId, file)) continue;
     const decisionMatches = [...block.matchAll(/^- 选择状态：([^\r\n]+)$/gmu)];
     const authMatches = [...block.matchAll(/^- 发布授权：([^\r\n]+)$/gmu)];
-    if (decisionMatches.length || authMatches.length) {
+    if (!activeItem && (decisionMatches.length || authMatches.length)) {
       if (decisionMatches.length !== 1 || authMatches.length !== 1) throw new Error(`summary_state_not_unique:${file}:${materialId}`);
       const decision = decisionMatches[0][1].trim();
       const authorization = authMatches[0][1].trim().toLowerCase();
@@ -689,6 +720,13 @@ function parseSummaryDecisions(text, file) {
     ];
     const present = actions.map((action) => ({ ...action, matches: [...block.matchAll(action.pattern)] }));
     if (present.every((action) => action.matches.length === 0)) continue;
+    if (activeItem) {
+      const checked = present.flatMap(action => action.matches.filter(match => /[xX]/u.test(match[1])).map(() => action));
+      const valid = checked.length === 1 && present.every(action => action.matches.length === 1);
+      changes.push({ materialId, decision: valid ? checked[0].decision : "unresolved",
+        publicationAuthorized: valid && checked[0].authorize, file });
+      continue;
+    }
     if (present.some((action) => action.matches.length !== 1)) throw new Error(`summary_action_not_unique:${file}:${materialId}`);
     const checked = present.filter((action) => /[xX]/u.test(action.matches[0][1]));
     if (checked.length > 1) throw new Error(`summary_action_conflict:${file}:${materialId}`);
@@ -700,18 +738,26 @@ function parseSummaryDecisions(text, file) {
 
 async function ingestExistingSummaries(paths, ledger) {
   const recorded = [];
-  const files = (await walkFiles(paths.summaryRoot)).filter((file) => /RSS (?:长文日报|长文周报|日报)\.md$/u.test(path.basename(file)));
+  const files = [...new Set([...(await walkFiles(paths.summaryRoot)), ...(paths.unified ? await walkFiles(paths.previousSummaryRoot) : [])])]
+    .filter((file) => /(?:RSS|订阅) (?:长文日报|长文周报|日报)\.md$/u.test(path.basename(file)));
   const byMaterial = new Map();
+  const activeItem = paths.unified ? (id, file) => {
+    const item = ledger.items[id];
+    return Boolean(item && !item.canonical_material_id && item.delivery?.active_review_path
+      && path.resolve(item.delivery.active_review_path) === path.resolve(file));
+  } : null;
   for (const file of files) {
-    const changes = parseSummaryDecisions(await fs.readFile(file, "utf8"), file);
+    const changes = parseSummaryDecisions(await fs.readFile(file, "utf8"), file, activeItem);
     for (const change of changes) {
       if (!byMaterial.has(change.materialId)) byMaterial.set(change.materialId, []);
       byMaterial.get(change.materialId).push(change);
     }
   }
   for (const [materialId, changes] of byMaterial) {
-    const item = ledger.items[materialId];
+    const original = ledger.items[materialId];
+    const item = ledger.items[original?.canonical_material_id || materialId];
     if (!item) continue;
+    if (original?.canonical_material_id) continue;
     if (Object.prototype.hasOwnProperty.call(item.delivery || {}, "active_review_path") && !item.delivery.active_review_path) continue;
     const activePath = item.delivery?.active_review_path ? path.resolve(item.delivery.active_review_path) : null;
     const activeChanges = activePath ? changes.filter((change) => path.resolve(change.file) === activePath) : changes;
@@ -722,9 +768,12 @@ async function ingestExistingSummaries(paths, ledger) {
       const signature = `${change.decision}:${change.publicationAuthorized ? "yes" : "no"}`;
       if (signature !== currentSignature && !altered.has(signature)) altered.set(signature, change);
     }
-    if (altered.size > 1) throw new Error(`summary_decision_conflict:${materialId}:${[...altered.keys()].join(",")}`);
+    if (altered.size > 1 && !paths.unified) throw new Error(`summary_decision_conflict:${materialId}:${[...altered.keys()].join(",")}`);
     if (altered.size === 0) continue;
-    const change = [...altered.values()][0];
+    const signatures = new Set(activeChanges.map(change => `${change.decision}:${change.publicationAuthorized}`));
+    const change = signatures.size > 1 && paths.unified
+      ? { decision:"unresolved", publicationAuthorized:false, file:activePath }
+      : [...altered.values()][0];
     item.decision = change.decision;
     item.decision_source = "summary_markdown";
     item.decision_at = nowIso();
@@ -736,16 +785,23 @@ async function ingestExistingSummaries(paths, ledger) {
       publication_authorized: item.publication_authorized,
       source: change.file
     });
-    recorded.push({ material_id: materialId, decision: item.decision, source: change.file });
+    if (['selected', 'deferred'].includes(item.decision)) item.pending_markdown_action = item.decision;
+    else {
+      delete item.pending_markdown_action;
+      if (paths.unified && item.decision === "dismissed") item.delivery.active_review_path = null;
+      if (item.decision === "unresolved") {
+        delete item.publication_failure;
+        delete item.requested_action;
+      }
+    }
+    recorded.push({ material_id: item.material_id, decision: item.decision, source: change.file });
   }
   return recorded;
 }
 
 function consumerInstruction(mode, existing = "") {
   const shared = "用于渐进阅读 RSS 筛选。读者关注 RemNote、Codex、AI Agent、渐进阅读、卡片化沉淀和教育科技产品工作流；偏好高密度、可操作、可沉淀的材料，反感空泛总结和营销口号。只基于输入内容处理，不新增外部事实。";
-  const task = mode === "short_aggregate"
-    ? "这是短文周报条目：生成忠实、可直接阅读的中文译文，并清除订阅、推广、登录、分享等非正文尾巴；保留英文原文。"
-    : mode === "publication"
+  const task = mode === "publication"
       ? "这是用户已批准的正式阅读稿：执行标准工作流、必要翻译、阅读前置卡和洞察生成。"
       : mode === "long_review_excerpt"
         ? "这是长文筛选预览，输入是来源正文的有界节选而非全文；只根据节选生成判断。第一条洞察写一句话核心，第二条优先写本文可能提供的信息增量，第三条可写适用边界。"
@@ -765,6 +821,15 @@ function boundedScreeningExcerpt(markdown, maxLength = 6000) {
 async function buildConsumerRequest(item, mode) {
   const request = await readJson(item.preprocess_request_path);
   if (!request) throw new Error(`preview_request_missing:${item.material_id}`);
+  if (mode === "short_aggregate") {
+    return {
+      ...request,
+      processing_options: standardWorkflowOptions({
+        ...request.processing_options,
+        workflow_mode: "standard"
+      })
+    };
+  }
   const workflowMode = mode === "long_review" ? "single_stage" : "standard";
   const material = mode === "long_review_excerpt"
     ? { ...request.material, markdown: boundedScreeningExcerpt(request.material?.markdown) }
@@ -775,6 +840,7 @@ async function buildConsumerRequest(item, mode) {
     user_instruction: consumerInstruction(mode, request.user_instruction),
     processing_options: {
       ...(request.processing_options || {}),
+      ...(item.platform === 'bilibili' && mode === 'long_review' ? { cleaning_mode: 'semantic_only', spoken_to_written: false, structure_body: false, translate: false } : {}),
       workflow_mode: workflowMode,
       insight_soft_min: 1,
       insight_soft_max: 3,
@@ -815,11 +881,12 @@ function reviewPreviewFromResult(item, result, request, evidence) {
   };
   if (item.route === "short_aggregate") {
     const sections = parseReadingSections(result.artifacts.reading_markdown);
-    const sourceMarkdown = compactText(request.material?.markdown);
+    const sourceMarkdown = String(request.material?.markdown || '').trim();
     if (!sections.translated || !/[\u3400-\u9fff]/u.test(sections.translated)) throw new Error(`preview_chinese_body_missing:${item.material_id}`);
     preview.chinese_title = sections.title || item.title;
     preview.chinese_body = sections.translated;
     preview.original_body = sections.original || sourceMarkdown;
+    preview.source_language = result.receipt?.workflow_route?.source_language?.value || null;
   }
   return preview;
 }
@@ -844,15 +911,19 @@ async function ensureReviewPreview(paths, item, options = {}) {
     item.review_preview = { status: "blocked", reason: `source_not_ready_${item.content_status}` };
     return item.review_preview;
   }
-  const variants = item.route === "long_review" ? ["long_review", "long_review_excerpt"] : [item.route];
+  if (paths.unified && item.review_preview?.status === 'ready'
+    && item.review_preview.source_request_sha256 === item.preprocess_request_sha256
+    && item.review_preview.result_path && existsSync(item.review_preview.result_path)) return item.review_preview;
+  const variants = item.route === "long_review" ? (item.platform === 'bilibili' ? ["long_review"] : ["long_review", "long_review_excerpt"]) : [item.route];
   const runner = options.previewRunner || defaultPreviewRunner;
   const errors = [];
   for (const variant of variants) {
     const request = await buildConsumerRequest(item, variant);
     const consumerRequestSha256 = sha256(Buffer.from(JSON.stringify(request), "utf8"));
-    const outputDir = path.join(paths.previewsRoot, item.material_id, consumerRequestSha256.slice(0, 16));
-    const previewPath = path.join(outputDir, "preview.json");
-    const resultPath = path.join(outputDir, "result.json");
+    let outputDir = path.join(paths.previewsRoot, item.material_id, consumerRequestSha256.slice(0, 16));
+    if (item.review_preview?.status === 'ready' && item.review_preview.consumer_request_sha256 === consumerRequestSha256 && existsSync(item.review_preview.result_path)) return item.review_preview;
+    let previewPath = path.join(outputDir, "preview.json");
+    let resultPath = path.join(outputDir, "result.json");
     const cached = await readJson(previewPath);
     if (cached?.status === "ready" && cached.consumer_request_sha256 === consumerRequestSha256 && existsSync(cached.result_path)) {
       if (!cached.preview_variant) {
@@ -862,7 +933,12 @@ async function ensureReviewPreview(paths, item, options = {}) {
       item.review_preview = cached;
       return cached;
     }
-    const existingResult = await readJson(resultPath);
+    let existingResult = await readJson(resultPath);
+    if (options.retryCycle && existingResult && !['completed','idempotent_replay'].includes(existingResult.status)) {
+      outputDir = path.join(outputDir, 'retries', sha256(String(options.retryCycle)).slice(0,16));
+      previewPath = path.join(outputDir, 'preview.json'); resultPath = path.join(outputDir, 'result.json');
+      existingResult = await readJson(resultPath);
+    }
     if (existingResult && !(new Set(["completed", "idempotent_replay"]).has(existingResult.status)
       && existingResult.processing_state === "rendered" && existingResult.artifacts?.target_zone === "local-ir-reading")) {
       errors.push(`${variant}:${existingResult.status}:${existingResult.processing_state}`);
@@ -894,6 +970,7 @@ async function ensureReviewPreviews(paths, items, options = {}) {
   const failures = [];
   let cursor = 0;
   let completed = 0;
+  let delivery = Promise.resolve();
   const concurrency = Math.max(1, Math.min(3, Number(options.previewConcurrency || 2)));
   async function worker() {
     while (cursor < eligible.length) {
@@ -902,14 +979,26 @@ async function ensureReviewPreviews(paths, items, options = {}) {
       const item = eligible[index];
       try {
         await ensureReviewPreview(paths, item, options);
-        completed += 1;
-        options.onPreviewProgress?.({ completed, total: eligible.length, materialId: item.material_id, status: "ready" });
       } catch (error) {
         item.review_preview = { status: "failed", reason: error.message };
         failures.push({ material_id: item.material_id, error: error.message });
         completed += 1;
         options.onPreviewProgress?.({ completed, total: eligible.length, materialId: item.material_id, status: "failed", error: error.message });
+        continue;
       }
+      const completedCount = ++completed;
+      if (item.route === "short_aggregate" && options.deliverShort) {
+        const attempt = delivery.then(() => options.deliverShort(item));
+        delivery = attempt.catch(() => {});
+        try {
+          await attempt;
+        } catch (error) {
+          failures.push({ material_id: item.material_id, error: error.message });
+          options.onPreviewProgress?.({ completed: completedCount, total: eligible.length, materialId: item.material_id, status: "failed", error: error.message });
+          continue;
+        }
+      }
+      options.onPreviewProgress?.({ completed: completedCount, total: eligible.length, materialId: item.material_id, status: "ready" });
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, eligible.length || 1) }, () => worker()));
@@ -1008,9 +1097,9 @@ async function writeSummary(target, content, itemCount) {
 
 async function renderDailySummary(target, date, longItems, blockedItems, shortCount) {
   const lines = [
-    `# ${date} RSS 长文日报`,
+    `# ${date} ${path.basename(path.dirname(target)) === '订阅' ? '订阅' : 'RSS'} 长文日报`,
     "",
-    `本次增量有 ${longItems.length} 篇长文待筛选；${shortCount} 篇短文进入本周短文池；${blockedItems.length} 篇正文受来源限制或尚未就绪。`,
+    `本次增量有 ${longItems.length} 篇长文待筛选；${shortCount} 篇短文待收录；${blockedItems.length} 篇正文受来源限制或尚未就绪。`,
     "",
     "审批方式：每篇最多勾选一个动作。不操作即维持未决；“正式入库”会自动执行标准预处理并发布；“稍后再看”会先发布，再进入 Local IR Later 7 天。",
     ""
@@ -1031,7 +1120,7 @@ async function renderDailySummary(target, date, longItems, blockedItems, shortCo
 
 async function renderShortWeekly(target, week, items) {
   const lines = [
-    `# ${week} RSS 短文周报`,
+    `# ${week} ${path.basename(path.dirname(path.dirname(target))) === '订阅' ? '订阅' : 'RSS'} 短文周报`,
     "",
     "本周短文已通过标准预处理生成中文主文，并保留 English Appendix 供原文核对。",
     "",
@@ -1047,9 +1136,10 @@ async function renderShortWeekly(target, week, items) {
       number += 1;
     }
   }
-  lines.push("## English Appendix", "");
+  const originals = items.filter(item => item.review_preview?.source_language === 'en' || (!item.review_preview?.source_language && item.review_preview?.translation_state === 'generated_translation'));
+  if (originals.length) lines.push("## English Appendix", "");
   number = 1;
-  for (const [source, sourceItems] of groupBySource(items)) {
+  for (const [source, sourceItems] of groupBySource(originals)) {
     lines.push(`### ${source}`, "");
     for (const item of sourceItems) {
       lines.push(shortWeeklyBlock(item, number, "en"), "");
@@ -1059,9 +1149,47 @@ async function renderShortWeekly(target, week, items) {
   return writeSummary(target, lines.join("\n"), items.length);
 }
 
+async function deliverShortToWeek(paths, ledger, item, week) {
+  const delivery = item.delivery ||= {};
+  if (delivery.short_weekly_revision === item.source_revision) return;
+  if (delivery.short_weekly_pending?.revision === item.source_revision
+    && !ledger.report_runs.weekly[delivery.short_weekly_pending.week]?.short_weekly?.archived_path) {
+    week = delivery.short_weekly_pending.week;
+  } else {
+    delivery.short_weekly_pending = { revision: item.source_revision, week };
+    await writeJson(paths.ledgerPath, ledger);
+  }
+  const target = path.join(paths.shortWeeklyRoot, `${week} ${paths.reportLabel} 短文周报.md`);
+  const title = `# ${week} ${paths.reportLabel} 短文周报`;
+  const readTarget = () => fs.readFile(target, "utf8").catch(error => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  const existing = await readTarget();
+  const delivered = Object.values(ledger.items).filter(entry => entry.delivery?.short_weekly_path === target);
+  if (existing === null && delivered.length) throw new Error(`short_weekly_file_missing:${target}`);
+  if (!delivered.length && existing !== null && existing.split(/\r?\n/u, 1)[0] !== title) throw new Error(`short_weekly_title_mismatch:${target}`);
+  const preview = item.review_preview;
+  const hasEnglish = preview.source_language === "en" || (!preview.source_language && preview.translation_state === "generated_translation");
+  const appended = await appendShortReport(target, week, shortKey(item), shortWeeklyBlock(item, null, "zh"),
+    hasEnglish ? shortWeeklyBlock(item, null, "en") : null, sourceLabel(item));
+  delivery.short_weekly_revision = item.source_revision;
+  delivery.short_weekly_key = week;
+  delivery.short_weekly_path = target;
+  delete delivery.short_weekly_pending;
+  ledger.report_runs ||= { daily: {}, weekly: {} };
+  ledger.report_runs.weekly ||= {};
+  ledger.report_runs.weekly[week] = {
+    ...ledger.report_runs.weekly[week],
+    generated_at: nowIso(),
+    short_weekly: { ...appended, item_count: delivered.length + 1 }
+  };
+  await writeJson(paths.ledgerPath, ledger);
+}
+
 async function renderLongWeekly(target, week, items, blockedItems = []) {
   const lines = [
-    `# ${week} RSS 长文周报`,
+    `# ${week} ${path.basename(path.dirname(target)) === '订阅' ? '订阅' : 'RSS'} 长文周报`,
     "",
     `本期汇总截至生成时仍未决定的 ${items.length} 篇长文。未操作条目会维持未决并滚入下一期。`,
     "",
@@ -1081,12 +1209,35 @@ async function renderLongWeekly(target, week, items, blockedItems = []) {
 }
 
 async function refreshHistoricalReviewNotices(paths, ledger) {
+  if (paths.unified) {
+    const files = [...new Set([...(await walkFiles(paths.summaryRoot)), ...(await walkFiles(paths.previousSummaryRoot))])]
+      .filter(file => /(?:RSS|订阅) (?:日报|长文日报|长文周报)\.md$/u.test(path.basename(file)));
+    const changedFiles = []; let changedItems = 0;
+    for (const file of files) {
+      const before = await fs.readFile(file, 'utf8');
+      const after = before.replace(/<!-- rss-reading:item\s+([^\s>]+)\s+-->[\s\S]*?<!-- rss-reading:end -->/gu, (block,id) => {
+        const original = ledger.items[id], item = ledger.items[original?.canonical_material_id || id];
+        if (!item || !Object.hasOwn(item.delivery || {}, 'active_review_path')) return block;
+        const active = item.delivery.active_review_path;
+        if (!original?.canonical_material_id && active && path.resolve(active) === path.resolve(file)) return block;
+        const link = active ? path.relative(path.dirname(file),active).replaceAll('\\','/') : null;
+        const notice = link ? `> 本条保留为历史记录；请在 [${path.basename(active)}](<${link}>) 操作。` : '> 本条保留为历史记录；目前没有待处理动作。';
+        const updated = block.replace(/^- \[[ xX]\] (?:正式入库|稍后再看|不保留)[^\r\n]*\r?\n?/gmu,'')
+          .replace(/^\*\*当前状态\*\*：[^\r\n]*\r?\n?/gmu,'')
+          .replace(/^> 本(?:页|条)[^\r\n]*(?:历史|当前|待处理)[^\r\n]*\r?\n?/gmu,'')
+          .replace('<!-- rss-reading:end -->', notice+'\n<!-- rss-reading:end -->');
+        if (updated !== block) changedItems++; return updated;
+      });
+      if (after !== before) { await fs.writeFile(file,after); changedFiles.push({path:file,sha256:sha256(after)}); }
+    }
+    return {changed_files:changedFiles,changed_items:changedItems};
+  }
   if (!existsSync(paths.summaryRoot)) return { changed_files: [], changed_items: 0 };
   const entries = await fs.readdir(paths.summaryRoot, { withFileTypes: true });
   const changedFiles = [];
   let changedItems = 0;
   for (const entry of entries) {
-    if (!entry.isFile() || !/^\d{4}-\d{2}-\d{2} RSS 日报\.md$/u.test(entry.name)) continue;
+    if (!entry.isFile() || !/^\d{4}-\d{2}-\d{2} (?:RSS|订阅) 日报\.md$/u.test(entry.name)) continue;
     const file = path.join(paths.summaryRoot, entry.name);
     const before = await fs.readFile(file, "utf8");
     const after = before.replace(/<!-- rss-reading:item\s+([^\s>]+)\s+-->[\s\S]*?<!-- rss-reading:end -->/gu, (block, materialId) => {
@@ -1111,21 +1262,28 @@ function uniqueItems(items) {
 export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, options = {}) {
   const date = options.date || localDate();
   const week = options.week || isoWeek();
+  if (!/^\d{4}-W(?:0[1-9]|[1-4]\d|5[0-3])$/u.test(week) || !/^\d{4}-\d{2}-\d{2}$/u.test(date)) throw new Error("report_period_invalid");
   const mode = options.mode || "daily";
-  if (!new Set(["daily", "weekly", "all"]).has(mode)) throw new Error(`generation_mode_invalid:${mode}`);
+  if (!new Set(["daily", "weekly", "short-weekly", "all"]).has(mode)) throw new Error(`generation_mode_invalid:${mode}`);
   const runDaily = mode === "daily" || mode === "all";
   const runWeekly = mode === "weekly" || mode === "all";
+  const shortOnly = mode === "short-weekly";
+  const runShortWeekly = runWeekly || shortOnly;
   let synced = await syncLedger(workflowRoot);
   const { paths } = synced;
+  const subscribedMaterialIds = new Set(synced.catalog.items.map(item=>item.materialId));
   let ledger = synced.ledger;
   ledger.report_runs ||= { daily: {}, weekly: {} };
   ledger.report_runs.daily ||= {};
   ledger.report_runs.weekly ||= {};
-  const ingestedDecisions = options.ingestSummaries !== false ? await ingestExistingSummaries(paths, ledger) : [];
+  const shortRollover = paths.unified
+    ? await rollShortReports(paths, ledger, week, () => writeJson(paths.ledgerPath, ledger), sourceLabel)
+    : [];
+  const ingestedDecisions = !shortOnly && options.ingestSummaries !== false ? await ingestExistingSummaries(paths, ledger) : [];
   await writeJson(paths.ledgerPath, ledger);
   const decisionActions = { completed: [], failures: [] };
   if (options.executeDecisions !== false) {
-    for (const change of ingestedDecisions.filter((item) => item.decision === "selected" || item.decision === "deferred")) {
+    for (const change of ingestedDecisions.filter((item) => subscribedMaterialIds.has(item.material_id) && (item.decision === "selected" || item.decision === "deferred"))) {
       try {
         const result = await applyDecision(workflowRoot, change.material_id, change.decision, {
           source: "summary_markdown",
@@ -1150,9 +1308,9 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
     .sort((a, b) => String(b.published_at || b.fetched_at || "").localeCompare(String(a.published_at || a.fetched_at || "")) || a.title.localeCompare(b.title));
   const fulltextCount = items.filter((item) => item.eligible_for_preprocess).length;
   const blockedCount = items.length - fulltextCount;
-  const dailyPath = path.join(paths.summaryRoot, `${date} RSS 日报.md`);
-  const longWeeklyPath = path.join(paths.summaryRoot, `${week} RSS 长文周报.md`);
-  const shortWeeklyPath = path.join(paths.shortWeeklyRoot, `${week} RSS 短文周报.md`);
+  const dailyPath = path.join(paths.summaryRoot, `${date} ${paths.reportLabel} 日报.md`);
+  const longWeeklyPath = path.join(paths.summaryRoot, `${week} ${paths.reportLabel} 长文周报.md`);
+  const shortWeeklyPath = path.join(paths.shortWeeklyRoot, `${week} ${paths.reportLabel} 短文周报.md`);
 
   if (runDaily) {
     for (const item of items) {
@@ -1170,11 +1328,16 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
 
   const dailyItems = runDaily ? items.filter((item) => item.route === "long_review" && item.delivery?.daily_report_key === date) : [];
   const dailyBlocked = runDaily ? items.filter((item) => item.route === "blocked" && item.delivery?.blocked_report_key === date) : [];
-  const pendingShort = runWeekly ? items.filter((item) => item.route === "short_aggregate" && item.delivery?.short_weekly_revision !== item.source_revision) : [];
+  const pendingShort = runShortWeekly ? items.filter((item) => item.route === "short_aggregate" && item.delivery?.short_weekly_revision !== item.source_revision) : [];
   const weeklyLong = runWeekly ? items.filter((item) => item.route === "long_review" && item.decision === "unresolved" && item.eligible_for_preprocess) : [];
-  const weeklyBlocked = runWeekly ? items.filter((item) => item.route === "blocked" && item.decision === "unresolved") : [];
+  const weeklyBlocked = runWeekly ? items.filter((item) => item.route === "blocked" && item.decision !== "dismissed" && item.publication?.status !== "published") : [];
   const previewTargets = uniqueItems([...dailyItems, ...pendingShort, ...weeklyLong]);
-  const preview = await ensureReviewPreviews(paths, previewTargets, options);
+  const preview = await ensureReviewPreviews(paths, previewTargets, {
+    ...options,
+    deliverShort: paths.unified
+      ? item => deliverShortToWeek(paths, ledger, item, options.week || isoWeek())
+      : undefined
+  });
   const legacyCounts = ledger.legacy_import.counts;
   const batch = await latestBatch(paths);
   const legacyOutputMigration = await verifiedLegacyManifest(paths) || {
@@ -1193,8 +1356,13 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
     for (const item of dailyBlocked) item.delivery.blocked_daily_revision = item.source_revision;
     ledger.report_runs.daily[date] = { path: daily.path, sha256: daily.sha256, generated_at: generatedAt };
   }
-  if (runWeekly) {
-    const readyShort = pendingShort.filter((item) => item.review_preview?.status === "ready");
+  if (runShortWeekly && paths.unified) {
+    const delivered = items.filter(item => item.delivery?.short_weekly_path === shortWeeklyPath);
+    if (delivered.length && existsSync(shortWeeklyPath)) {
+      shortWeekly = { path: shortWeeklyPath, sha256: await fileSha256(shortWeeklyPath), item_count: delivered.length };
+    }
+  } else if (runShortWeekly) {
+    const readyShort = pendingShort.filter(item => item.review_preview?.status === "ready");
     if (readyShort.length) {
       shortWeekly = await renderShortWeekly(shortWeeklyPath, week, readyShort);
       for (const item of readyShort) {
@@ -1203,23 +1371,36 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
         item.delivery.short_weekly_path = shortWeekly.path;
       }
     }
+  }
+  if (runWeekly) {
+    if (paths.unified) {
+      for (const item of Object.values(ledger.items)) {
+        const active = item.delivery?.active_review_path;
+        const activeWeek = active && /^(\d{4}-W\d{2}) (?:RSS|订阅) 长文周报\.md$/u.exec(path.basename(active))?.[1];
+        if (activeWeek && activeWeek < week) item.delivery.active_review_path = null;
+      }
+    }
     if (weeklyLong.length || weeklyBlocked.length) {
       const supersededDailyPaths = new Set(weeklyLong
         .map((item) => item.delivery?.active_review_path)
-        .filter((target) => target && /RSS 日报\.md$/u.test(path.basename(target))));
+        .filter((target) => target && /(?:RSS|订阅) 日报\.md$/u.test(path.basename(target))));
       for (const item of weeklyLong) {
         item.delivery.active_review_path = longWeeklyPath;
         item.delivery.long_weekly_key = week;
       }
       longWeekly = await renderLongWeekly(longWeeklyPath, week, weeklyLong, weeklyBlocked);
       for (const supersededPath of supersededDailyPaths) {
-        const reportDate = /^(\d{4}-\d{2}-\d{2}) RSS 日报\.md$/u.exec(path.basename(supersededPath))?.[1];
+        const reportDate = /^(\d{4}-\d{2}-\d{2}) (?:RSS|订阅) 日报\.md$/u.exec(path.basename(supersededPath))?.[1];
         if (!reportDate) continue;
-        const assignedLong = items.filter((item) => item.route === "long_review" && item.delivery?.daily_report_path === supersededPath);
-        const assignedBlocked = items.filter((item) => item.route === "blocked" && item.delivery?.blocked_report_path === supersededPath);
-        const rewritten = await renderDailySummary(supersededPath, reportDate, assignedLong, assignedBlocked, 0);
-        if (daily && path.resolve(daily.path) === path.resolve(supersededPath)) daily = rewritten;
-        ledger.report_runs.daily[reportDate] = { path: rewritten.path, sha256: rewritten.sha256, generated_at: generatedAt, superseded_by: longWeeklyPath };
+        if (paths.unified) {
+          if (ledger.report_runs.daily[reportDate]) ledger.report_runs.daily[reportDate].superseded_by = longWeeklyPath;
+        } else {
+          const assignedLong = items.filter((item) => item.route === "long_review" && item.delivery?.daily_report_path === supersededPath);
+          const assignedBlocked = items.filter((item) => item.route === "blocked" && item.delivery?.blocked_report_path === supersededPath);
+          const rewritten = await renderDailySummary(supersededPath, reportDate, assignedLong, assignedBlocked, 0);
+          if (daily && path.resolve(daily.path) === path.resolve(supersededPath)) daily = rewritten;
+          ledger.report_runs.daily[reportDate] = { path: rewritten.path, sha256: rewritten.sha256, generated_at: generatedAt, superseded_by: longWeeklyPath };
+        }
       }
     }
     ledger.report_runs.weekly[week] = {
@@ -1227,11 +1408,22 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
       short_weekly: shortWeekly ? { path: shortWeekly.path, sha256: shortWeekly.sha256 } : null,
       long_weekly: longWeekly ? { path: longWeekly.path, sha256: longWeekly.sha256 } : null
     };
+  } else if (shortOnly && shortWeekly) {
+    ledger.report_runs.weekly[week] = {
+      ...ledger.report_runs.weekly[week],
+      generated_at: generatedAt,
+      short_weekly: { path: shortWeekly.path, sha256: shortWeekly.sha256 }
+    };
   }
   const supersededWeekly = runWeekly
     ? await archiveSupersededWeeklySummary(paths, week)
     : { status: "not_checked", verified: true };
-  const historicalNoticeRefresh = await refreshHistoricalReviewNotices(paths, ledger);
+  const historicalNoticeRefresh = shortOnly
+    ? { changed_files: [], changed_items: 0 }
+    : await refreshHistoricalReviewNotices(paths, ledger);
+  const archivedReports = paths.unified && !shortOnly
+    ? await archiveSummaryReports(paths, ledger, { date, week: runWeekly ? week : null, rolloverFile: longWeekly?.path }, () => writeJson(paths.ledgerPath, ledger))
+    : [];
   ledger.updated_at = nowIso();
   await writeJson(paths.ledgerPath, ledger);
   const runId = `${date.replaceAll("-", "")}-${randomUUID().slice(0, 8)}`;
@@ -1263,6 +1455,8 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
     preserved_historical_short_weeklies: preservedShortWeeklies,
     superseded_weekly_report: supersededWeekly,
     historical_review_notice_refresh: historicalNoticeRefresh,
+    short_weekly_rollover: shortRollover,
+    archived_reports: archivedReports,
     mode,
     outputs: {
       daily,
@@ -1407,17 +1601,39 @@ export async function publishSelected(workflowRoot, materialId, options = {}) {
   const item = ledger.items[materialId];
   const gate = publicationGate(item);
   if (!gate.allowed) throw new Error(`publication_gate_rejected:${gate.reason}`);
+  if (paths.unified) {
+    const preserved = item.publication?.path && existsSync(item.publication.path)
+      ? { path: item.publication.path, sha256: await fileSha256(item.publication.path) }
+      : item.item_url ? await findExistingPublication(workflowRoot, item.item_url) : null;
+    if (preserved) {
+      item.publication = { ...item.publication, ...preserved, status: 'published', preserved_existing: true, published_at: item.publication?.published_at || nowIso() };
+      await writeJson(paths.ledgerPath, ledger);
+      return { status: 'already_published', material_id: materialId, ...preserved, preserved_existing: true };
+    }
+    if (item.platform === 'bilibili') {
+      const { publishVideoSelection } = await import('../subscription-workflow/adapters.mjs');
+      const result = await publishVideoSelection(workflowRoot, item);
+      item.publication = { status: 'published', published_at: nowIso(), path: result.publication,
+        sha256: await fileSha256(result.publication), result_path: result.runDir, workflow: 'illustrated' };
+      addHistory(item, { type: 'published', path: result.publication, source: item.publication_authorization_source });
+      await writeJson(paths.ledgerPath, ledger);
+      return { status: 'published', material_id: materialId, ...item.publication };
+    }
+  }
   if (item.publication?.status === "published" && existsSync(item.publication.path)) {
     const existingHash = await fileSha256(item.publication.path);
     if (existingHash === item.publication.sha256) {
       return { status: "already_published", material_id: materialId, path: item.publication.path, sha256: existingHash };
     }
   }
-  await fs.mkdir(paths.readingRoot, { recursive: true });
-  const publishPath = path.join(paths.readingRoot, `${safeTitle(item.title, materialId)}.md`);
-  const relative = path.relative(paths.readingRoot, publishPath);
+  const destinationRoot = paths.unified && item.destination ? path.resolve(workflowRoot, '阅读区', item.destination) : paths.readingRoot;
+  const destinationRelative = path.relative(path.join(workflowRoot, '阅读区'), destinationRoot);
+  if (destinationRelative.startsWith('..') || path.isAbsolute(destinationRelative)) throw new Error('publication_destination_outside_reading_area');
+  await fs.mkdir(destinationRoot, { recursive: true });
+  const publishPath = path.join(destinationRoot, `${safeTitle(item.title, materialId)}.md`);
+  const relative = path.relative(destinationRoot, publishPath);
   if (relative.startsWith("..") || path.isAbsolute(relative) || path.dirname(relative) !== ".") throw new Error("publication_path_not_flat_rss");
-  const outputDir = path.join(paths.preprocessRoot, materialId);
+  const outputDir = path.join(paths.preprocessRoot, materialId, ...(options.retryCycle && item.publication_failure ? ['retries', sha256(String(options.retryCycle)).slice(0,16)] : []));
   await fs.mkdir(outputDir, { recursive: true });
   const runner = options.runner || defaultPreprocessRunner;
   await runner({ paths, item, outputDir, publishPath });
@@ -1462,6 +1678,8 @@ export async function writeLocalIrLaterHandoff(workflowRoot, materialId, options
   if (!relativeMarkdownPath || relativeMarkdownPath.startsWith("../") || path.isAbsolute(relativeMarkdownPath)) throw new Error("later_markdown_not_in_vault");
   const stateRoot = path.resolve(options.sidecarRoot || paths.localIrStateRoot);
   const sidecarPath = path.join(stateRoot, `${path.basename(item.publication.path)}.browser-ir.json`);
+  const previousSidecar = await readJson(sidecarPath);
+  if (previousSidecar?.document?.path && previousSidecar.document.path !== relativeMarkdownPath) throw new Error('later_sidecar_document_identity_conflict');
   const committedAt = nowIso();
   const state = {
     schema: "local-ir.document-state",
@@ -1494,6 +1712,9 @@ export async function writeLocalIrLaterHandoff(workflowRoot, materialId, options
       completionIntent: null
     }
   };
+  if (previousSidecar) {
+    Object.assign(state, previousSidecar, { document: { ...previousSidecar.document, status: 'later', deferUntil, updatedAt: committedAt } });
+  }
   await writeJson(sidecarPath, state);
   const verified = await readJson(sidecarPath);
   if (verified?.document?.status !== "later" || verified?.document?.deferUntil !== deferUntil || verified?.document?.path !== relativeMarkdownPath) {
@@ -1523,7 +1744,7 @@ export async function applyDecision(workflowRoot, materialId, decision, options 
     source: options.source || "summary_panel"
   });
   try {
-    const publication = await publishSelected(workflowRoot, materialId, { runner: options.runner });
+    const publication = await publishSelected(workflowRoot, materialId, { runner: options.runner, retryCycle: options.retryCycle });
     if (requestedDecision === "deferred") {
       const later = await writeLocalIrLaterHandoff(workflowRoot, materialId, {
         date: options.date,
@@ -1537,17 +1758,66 @@ export async function applyDecision(workflowRoot, materialId, decision, options 
     item.delivery ||= {};
     item.delivery.active_review_path = null;
     item.requested_action = null;
+    delete item.publication_failure;
+    delete item.pending_markdown_action;
     await writeJson(synced.paths.ledgerPath, synced.ledger);
     return { status: "published", material_id: materialId, publication };
   } catch (error) {
     const synced = await syncLedger(workflowRoot);
     const item = synced.ledger.items[materialId];
     item.requested_action = requestedDecision;
+    delete item.pending_markdown_action;
     item.publication_failure = { at: nowIso(), error: error.message };
     addHistory(item, { type: "publication_failed", requested_decision: requestedDecision, error: error.message });
     await writeJson(synced.paths.ledgerPath, synced.ledger);
     throw error;
   }
+}
+
+export async function processMarkdownDecisions(workflowRoot = DEFAULT_WORKFLOW_ROOT, options = {}) {
+  const synced = await syncLedger(workflowRoot);
+  const changes = await ingestExistingSummaries(synced.paths, synced.ledger);
+  await writeJson(synced.paths.ledgerPath, synced.ledger);
+  const activeIds = new Set(synced.catalog.items.map(item => item.materialId));
+  const selected = Object.values(synced.ledger.items).filter(item => activeIds.has(item.material_id) && item.pending_markdown_action)
+    .map(item => ({ material_id: item.material_id, decision: item.pending_markdown_action }));
+  if (options.enqueueOnly) return { changes: changes.length, queued: selected.length, completed: [], failures: [] };
+  if (options.retry) for (const item of Object.values(synced.ledger.items)) {
+    if (activeIds.has(item.material_id) && item.publication_authorized && item.publication_failure
+      && (!options.platform || (item.platform || 'rss') === options.platform)) selected.push({ material_id: item.material_id, decision: item.requested_action || 'selected' });
+  }
+  const completed = [], failures = [];
+  for (const change of new Map(selected.map(item => [item.material_id,item])).values()) {
+    try { completed.push(await applyDecision(workflowRoot, change.material_id, change.decision, { source: 'summary_markdown', ...options })); }
+    catch (error) { failures.push({ material_id: change.material_id, error: error.message }); }
+  }
+  const current = await syncLedger(workflowRoot);
+  const archived = current.paths.unified
+    ? await archiveSummaryReports(current.paths, current.ledger, { date: options.date || localDate() }, () => writeJson(current.paths.ledgerPath, current.ledger))
+    : [];
+  return { changes: changes.length, completed, failures, archived_reports: archived };
+}
+
+export async function prepareSubscriptionPreviews(workflowRoot = DEFAULT_WORKFLOW_ROOT, platform = null, options = {}) {
+  const synced = await syncLedger(workflowRoot);
+  if (synced.paths.unified) {
+    synced.ledger.report_runs ||= { daily: {}, weekly: {} };
+    synced.ledger.report_runs.daily ||= {};
+    synced.ledger.report_runs.weekly ||= {};
+    await rollShortReports(synced.paths, synced.ledger, options.week || isoWeek(), () => writeJson(synced.paths.ledgerPath, synced.ledger), sourceLabel);
+  }
+  const activeIds = new Set(synced.catalog.items.map(item => item.materialId));
+  const items = Object.values(synced.ledger.items).filter(item => activeIds.has(item.material_id) && item.eligible_for_preprocess
+    && item.decision === 'unresolved' && (!platform || (item.platform || 'rss') === platform)
+    && (item.route === 'long_review' || item.route === 'short_aggregate'));
+  const result = await ensureReviewPreviews(synced.paths, items, {
+    ...options,
+    deliverShort: synced.paths.unified
+      ? item => deliverShortToWeek(synced.paths, synced.ledger, item, options.week || isoWeek())
+      : undefined
+  });
+  await writeJson(synced.paths.ledgerPath, synced.ledger);
+  return result;
 }
 
 async function snapshotTopLevelMarkdown(root) {

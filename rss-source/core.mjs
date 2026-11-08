@@ -370,6 +370,9 @@ export async function syncFeedDocument({
   fetchFulltext = false,
   articleFetcher = null,
   maxItems = 0,
+  onlyItemUrls = null,
+  acceptItem = null,
+  preserveFeedState = false,
   fetchedAt = new Date().toISOString(),
   runId = `${new Date().toISOString().replace(/[-:.TZ]/gu, "").slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`
 }) {
@@ -397,8 +400,24 @@ export async function syncFeedDocument({
   });
 
   const runItems = [];
-  const selectedItems = maxItems > 0 ? parsed.items.slice(0, maxItems) : parsed.items;
+  const allowedUrls = onlyItemUrls ? new Set(onlyItemUrls.map(normalizeUrl)) : null;
+  const candidates = allowedUrls ? parsed.items.filter(item => item.item_url && allowedUrls.has(normalizeUrl(item.item_url))) : parsed.items;
+  if (allowedUrls && new Set(candidates.map(item=>normalizeUrl(item.item_url))).size !== allowedUrls.size) {
+    throw new Error('retry_source_snapshot_missing_requested_items');
+  }
+  const eligibleItems = acceptItem ? candidates.filter(acceptItem) : candidates;
+  const selectedItems = maxItems > 0 ? eligibleItems.slice(0, maxItems) : eligibleItems;
   for (const item of selectedItems) {
+    const identity = identityFor(normalizedFeedUrl, item, item.feed_content.raw);
+    const duplicate = duplicateRecord(state, identity);
+    let existingPackage = null;
+    if (duplicate && await pathExists(duplicate.package_path)) {
+      try {
+        existingPackage = JSON.parse(await fs.readFile(path.join(duplicate.package_path, "package.json"), "utf8"));
+      } catch (error) {
+        throw new Error(`existing_package_unreadable_${duplicate.material_id}_${error.message}`, { cause: error });
+      }
+    }
     const statusHistory = [item.feed_content.status];
     let contentStatus = item.feed_content.status;
     let sourceRef = item.feed_content.ref;
@@ -411,7 +430,7 @@ export async function syncFeedDocument({
     if (contentStatus === "summary_only" && item.item_url) {
       statusHistory.push("fetch_required");
       contentStatus = "fetch_required";
-      if (fetchFulltext) {
+      if (fetchFulltext && existingPackage?.content_status !== "fulltext_ready") {
         try {
           if (typeof articleFetcher !== "function") throw new Error("article_fetcher_missing");
           const page = await articleFetcher(item.item_url);
@@ -441,16 +460,6 @@ export async function syncFeedDocument({
     // Feed-entry content remains the stable material identity. A public item page is
     // completeness evidence that may upgrade the same material without creating a
     // second active package for the same GUID/item URL.
-    const identity = identityFor(normalizedFeedUrl, item, item.feed_content.raw);
-    const duplicate = duplicateRecord(state, identity);
-    let existingPackage = null;
-    if (duplicate && await pathExists(duplicate.package_path)) {
-      try {
-        existingPackage = JSON.parse(await fs.readFile(path.join(duplicate.package_path, "package.json"), "utf8"));
-      } catch (error) {
-        throw new Error(`existing_package_unreadable_${duplicate.material_id}_${error.message}`, { cause: error });
-      }
-    }
     const existingStatus = existingPackage?.content_status || null;
     const updatesExisting = Boolean(existingPackage
       && existingStatus !== "fulltext_ready"
@@ -659,11 +668,11 @@ export async function syncFeedDocument({
     last_fetched_at: fetchedAt,
     last_run_id: runId,
     raw_feed_sha256: sha256(String(xml)),
-    inventory_complete: maxItems <= 0 || maxItems >= parsed.item_count
+    inventory_complete: !allowedUrls && !acceptItem && (maxItems <= 0 || maxItems >= parsed.item_count)
   };
-  state.feeds[normalizedFeedUrl] = feedState;
+  if (!preserveFeedState) state.feeds[normalizedFeedUrl] = feedState;
   const requestedFeedUrl = normalizeUrl(feedUrl);
-  if (requestedFeedUrl !== normalizedFeedUrl) {
+  if (!preserveFeedState && requestedFeedUrl !== normalizedFeedUrl) {
     state.feeds[requestedFeedUrl] = { ...feedState, canonical_feed_url: normalizedFeedUrl };
   }
   await writeJsonAtomic(statePath, state);

@@ -13,14 +13,14 @@ const [coreSource, contentSource] = await Promise.all([
 
 const waitForUi = () => new Promise((resolve) => setTimeout(resolve, 25));
 
-async function createHarness({ existingDraft = false, standardImportFails = false } = {}) {
+async function createHarness({ existingDraft = false, standardImportFails = false, initialStorage = {} } = {}) {
   const dom = new JSDOM("<!doctype html><html><head><title>Fixture</title></head><body><article><p>Alpha beta gamma.</p><p>Delta epsilon zeta.</p></article></body></html>", {
     url: "https://local.test/article",
     runScripts: "outside-only",
     pretendToBeVisual: true
   });
   const { window } = dom;
-  const storage = { localIrAuthoringMode: "off", localIrHighlightEnabled: false };
+  const storage = { localIrAuthoringMode: "off", localIrHighlightEnabled: false, ...initialStorage };
   const storageListeners = [];
   const runtimeListeners = [];
   let upsertCount = 0;
@@ -129,6 +129,49 @@ assert.equal(freshRoot.querySelector(".initialize").hidden, false);
 assert.equal(freshRoot.querySelector(".import-local").hidden, false);
 assert.equal(freshRoot.querySelector(".controls").hidden, true);
 
+const movable = await createHarness();
+const movableDock = movable.host.shadowRoot.querySelector(".dock");
+const handle = movable.host.shadowRoot.querySelector(".dock-handle");
+assert.equal(handle.getAttribute("aria-label"), "拖动工具框");
+Object.defineProperty(movable.window, "innerWidth", { value: 1000, writable: true });
+Object.defineProperty(movable.window, "innerHeight", { value: 800, writable: true });
+movableDock.getBoundingClientRect = () => ({ left: parseFloat(movableDock.style.left || "680"), top: parseFloat(movableDock.style.top || "720"), width: 300, height: 60 });
+const pointer = (target, type, x, y) => {
+  const event = new movable.window.MouseEvent(type, { bubbles: true, cancelable: true, button: 0, clientX: x, clientY: y });
+  Object.defineProperty(event, "pointerId", { value: 1 });
+  target.dispatchEvent(event);
+};
+pointer(handle, "pointerdown", 688, 728);
+pointer(movable.window, "pointermove", 108, 88);
+pointer(movable.window, "pointerup", 108, 88);
+assert.equal(movableDock.style.left, "100px");
+assert.equal(movableDock.style.top, "80px");
+assert.equal(movable.storage.localIrDockPosition.x, 100);
+assert.equal(movable.storage.localIrDockPosition.y, 80);
+assert.equal(movable.upsertCount, 0, "moving the tool must not initialize or modify a reading draft");
+pointer(movable.host.shadowRoot.querySelector(".initialize"), "pointerdown", 108, 88);
+pointer(movable.window, "pointermove", 600, 500);
+pointer(movable.window, "pointerup", 600, 500);
+assert.equal(movableDock.style.left, "100px", "action buttons must not start dragging");
+pointer(handle, "pointerdown", 108, 88);
+pointer(movable.window, "pointermove", -1000, 5000);
+pointer(movable.window, "pointerup", -1000, 5000);
+assert.equal(movableDock.style.left, "8px");
+assert.equal(movableDock.style.top, "732px");
+movable.window.innerWidth = 500;
+movable.window.innerHeight = 200;
+movable.window.dispatchEvent(new movable.window.Event("resize"));
+assert.equal(movableDock.style.top, "132px", "a smaller viewport must keep the dock reachable");
+assert.equal(movable.storage.localIrDockPosition.y, 732, "resize must not overwrite the preferred position");
+movable.window.innerHeight = 800;
+movable.window.dispatchEvent(new movable.window.Event("resize"));
+assert.equal(movableDock.style.top, "732px");
+handle.dispatchEvent(new movable.window.KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+assert.equal(movableDock.style.left, "18px");
+const restoredPosition = await createHarness({ initialStorage: movable.storage });
+assert.equal(restoredPosition.host.shadowRoot.querySelector(".dock").style.left, "18px");
+assert.equal(restoredPosition.host.shadowRoot.querySelector(".dock").style.top, "732px");
+
 freshRoot.querySelector(".initialize").click();
 await waitForUi();
 assert.equal(fresh.upsertCount, 1, "manual initialization must persist exactly one draft");
@@ -209,6 +252,10 @@ assert.equal(standardImportRoot.querySelector(".import-local").hidden, false);
 assert.equal(standardImportRoot.querySelector(".import-local").textContent, "重新导入");
 assert.equal(standardImportRoot.querySelector(".controls").hidden, true);
 assert.match(standardImportRoot.querySelector(".status").textContent, /已保存并锁定/);
+assert.equal(standardImportRoot.querySelector(".status").closest(".controls"), null, "import feedback must remain outside collapsed authoring controls");
+standardImportRoot.querySelector(".import-local").click();
+await new Promise(resolve => setTimeout(resolve, 75));
+assert.equal(standardImport.standardImportCount, 2, "locked reimport must dispatch a second real request");
 
 const failedStandardImport = await createHarness({ standardImportFails: true });
 const failedStandardImportRoot = failedStandardImport.host.shadowRoot;
@@ -245,10 +292,18 @@ standardImport.dom.window.close();
 failedStandardImport.dom.window.close();
 contextPageImport.dom.window.close();
 contextLinkFeedback.dom.window.close();
+movable.dom.window.close();
+restoredPosition.dom.window.close();
 
 console.log(JSON.stringify({
   status: "passed",
   checks: [
+    "dock_drag_and_position_persistence",
+    "dock_position_restored_on_new_page",
+    "dock_drag_does_not_initialize_or_submit_drafts",
+    "dock_action_buttons_do_not_drag",
+    "dock_stays_reachable_after_resize",
+    "dock_keyboard_movement",
     "fresh_page_no_auto_draft",
     "manual_initialization_single_write",
     "standard_import_initializes_then_submits",

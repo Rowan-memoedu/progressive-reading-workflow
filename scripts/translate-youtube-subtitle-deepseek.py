@@ -14,17 +14,12 @@ ZH_PATH = TARGET_DIR / "wsNzAuYDgy0.zh-CN.machine-translated.txt"
 CONFIG_DIR = Path.home() / "Documents" / "New project"
 
 
-def load_config() -> dict[str, str]:
-    config_file = next(CONFIG_DIR.glob("DeepSeek API*.md"))
-    config: dict[str, str] = {}
-    for line in config_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-        if line.startswith("AI_PRODUCER_") and "=" in line:
-            key, value = line.split("=", 1)
-            config[key.strip()] = value.strip()
-    for key in ("AI_PRODUCER_BASE_URL", "AI_PRODUCER_API_KEY", "AI_PRODUCER_MODEL"):
-        if not config.get(key):
-            raise RuntimeError(f"Missing {key}")
-    return config
+def load_config() -> dict:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'standard-preprocessing'))
+    from batch_transport import BatchClient
+    client = BatchClient()
+    return {'client':client, 'AI_PRODUCER_MODEL':client.model, 'AI_PRODUCER_BASE_URL':'codex_exec'}
 
 
 def decode_entities(text: str) -> str:
@@ -104,17 +99,7 @@ def call_deepseek(config: dict[str, str], text: str, index: int, total: int) -> 
             },
         ],
     }
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {config['AI_PRODUCER_API_KEY']}",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    data = config['client'].raw(payload['messages'], temperature=payload['temperature'])
     return data["choices"][0]["message"]["content"].strip()
 
 
