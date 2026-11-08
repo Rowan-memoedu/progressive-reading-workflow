@@ -186,7 +186,7 @@ async function applyPendingScopes(root, cycle, progress) {
     try {
       const result = await scanAndRecordScope(root,kind,cycle);
       const previews = await prepareSubscriptionPreviews(root,kind,{retryCycle:cycle,onPreviewProgress:progress});
-      failures.push(...(result.errors || []), ...previews.failures);
+      failures.push(...(result.errors || []), ...(result.warnings || []), ...previews.failures);
       failures.push(...(result.auto?.feeds || []).filter(feed=>feed.error).map(feed=>({error:feed.error})));
       failures.push(...(result.reports?.results || []).filter(feed=>!feed.ok).map(feed=>({error:feed.error?.message})));
       failures.push(...(result.sourceRetries || []).filter(retry=>retry.error).map(retry=>({error:retry.error})));
@@ -212,7 +212,7 @@ async function runJob(root, job, save) {
         try {
           const scan = await sourceScans[kind](root,job.cycle,{retryOnly:true});
           const previews = await prepareSubscriptionPreviews(root,kind,{retryCycle:job.cycle,onPreviewProgress:progress});
-          return [...(scan.errors || []), ...(scan.blocked || []), ...(previews.failures || []),
+          return [...(scan.errors || []), ...(scan.warnings || []), ...(scan.blocked || []), ...(previews.failures || []),
             ...(scan.events || []).filter(event=>event.status==='waiting_source').map(event=>({error:event.reason})),
             ...(scan.sourceRetries || []).filter(item=>item.error || item.status==='completed_with_failures')
               .map(item=>({error:item.error || '已重试，RSS 正文仍受来源限制'}))];
@@ -229,7 +229,7 @@ async function runJob(root, job, save) {
     const scan = await step('scan',() => scanAndRecordScope(root,job.kind,job.cycle));
     const previews = await step('previews',() => prepareSubscriptionPreviews(root,job.kind,{ retryCycle:job.cycle, previewConcurrency:2, onPreviewProgress:progress }));
     const decisions = await step('decisions',() => processMarkdownDecisions(root,{ retry:true, platform:job.kind, retryCycle:job.cycle }));
-    const faults = [...(scan.errors || []), ...(scan.blocked || []), ...(previews.failures || []), ...(decisions.failures || [])];
+    const faults = [...(scan.errors || []), ...(scan.warnings || []), ...(scan.blocked || []), ...(previews.failures || []), ...(decisions.failures || [])];
     faults.push(...(scan.events || []).filter(e=>e.status==='waiting_source').map(e=>({key:e.key,error:e.reason})));
     if (scan.auto) faults.push(...scan.auto.feeds.filter(f=>f.error).map(f=>({ url:f.url,error:f.error })));
     if (scan.reports?.status === 'completed_with_failures') faults.push({ error:'部分 RSS 正文仍未就绪', receipt:scan.reports.batch_dir });

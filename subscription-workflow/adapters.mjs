@@ -239,11 +239,12 @@ export function zhihuAccess(root) {
     fetchImpl: (url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(30000) }) };
 }
 
-export async function discoverAuthor(source, options, request = requestZhihuJson) {
+export async function discoverAuthor(source, options = {}, request = requestZhihuJson) {
   const token = new URL(source.url).pathname.split('/').filter(Boolean).at(-1), items = [];
   for (const kind of ['answers','articles']) {
     const endpoint = `/api/v4/members/${token}/${kind}`, visited = new Set(), found = new Set();
     let expectedTotal = null;
+    const observedTotals = new Set();
     let next = `https://www.zhihu.com${endpoint}?limit=20&offset=0&sort_by=created&include=data%5B*%5D.content,created,created_time,updated,updated_time`;
     while (next) {
       const target = new URL(next, 'https://www.zhihu.com');
@@ -257,7 +258,8 @@ export async function discoverAuthor(source, options, request = requestZhihuJson
       if (!Array.isArray(page.data) || typeof page.paging?.is_end !== 'boolean') throw new Error('知乎作者列表格式异常');
       if (page.paging.totals != null) {
         const total = Number(page.paging.totals);
-        if (!Number.isSafeInteger(total) || total < 0 || (expectedTotal != null && total !== expectedTotal)) throw new Error('知乎作者列表总数异常或已变化');
+        if (!Number.isSafeInteger(total) || total < 0) throw new Error('知乎作者列表总数异常');
+        observedTotals.add(total);
         expectedTotal = total;
       }
       const before = found.size;
@@ -274,19 +276,26 @@ export async function discoverAuthor(source, options, request = requestZhihuJson
       if (!page.paging.is_end && (!page.data.length || !page.paging.next)) throw new Error('知乎作者列表缺少后续页');
       next = page.paging.is_end ? null : page.paging.next;
     }
-    if (expectedTotal != null && found.size !== expectedTotal) throw new Error(`知乎作者列表总数不完整：平台 ${expectedTotal}，实际 ${found.size}`);
+    if (expectedTotal != null && (found.size !== expectedTotal || observedTotals.size > 1)) {
+      await options.onWarning?.({ code: 'zhihu_author_count_discrepancy', severity: 'warning', kind,
+        platform_total: expectedTotal, actual_count: found.size, observed_totals: [...observedTotals],
+        inventory_complete: false,
+        error: `知乎作者${kind === 'answers' ? '回答' : '文章'}数量异常：平台 ${expectedTotal}，实际 ${found.size}${observedTotals.size > 1 ? '；采集期间平台总数发生变化' : ''}。已获取内容继续处理。` });
+    }
   }
   return [...new Map(items.map(i => [i.url,i])).values()];
 }
 
 export async function scanZhihu(root, cycle, { access = zhihuAccess, discoverColumn = discoverZhihuColumn, discoverMember = discoverAuthor, fetchPage = fetchUrlWithoutBrowser, retryOnly = false } = {}) {
   const config = await loadConfig(root), file = path.join(paths(root).home, 'zhihu-state.json');
-  const state = await readJson(file, { sources: {}, entries: {} }), options = access(root), errors = [];
+  const state = await readJson(file, { sources: {}, entries: {} }), options = access(root), errors = [], warnings = [];
   for (const source of config.subscriptions.filter(s => s.enabled && s.kind.startsWith('zhihu_'))) {
     const previous = state.sources[source.id];
     if (retryOnly && !previous?.error) continue;
     try {
-      const listed = source.kind === 'zhihu_column' ? (await discoverColumn(source.url, options)).articles : await discoverMember(source, options);
+      const sourceWarnings = [];
+      const listed = source.kind === 'zhihu_column' ? (await discoverColumn(source.url, options)).articles : await discoverMember(source, { ...options,
+        onWarning: warning => { const entry = { ...warning, subscription_id: source.id, url: source.url, title: source.name }; sourceWarnings.push(entry); warnings.push(entry); } });
       const seen = new Set(previous?.seen || []);
       const backfill = ['since','all'].includes(source.history_mode);
       for (const item of listed) {
@@ -300,7 +309,8 @@ export async function scanZhihu(root, cycle, { access = zhihuAccess, discoverCol
         if (entry && item.revision && item.revision !== entry.revision && entry.status === 'ready') entry.source_updated = new Date().toISOString();
         seen.add(key);
       }
-      state.sources[source.id] = { baseline_at: previous?.baseline_at || new Date().toISOString(), seen: [...seen], checked_at: new Date().toISOString(), error: null };
+      state.sources[source.id] = { baseline_at: previous?.baseline_at || new Date().toISOString(), seen: [...seen], checked_at: new Date().toISOString(), error: null,
+        warnings: sourceWarnings, inventory_complete: sourceWarnings.length === 0 };
       await writeJson(file, state);
     } catch (error) { state.sources[source.id] = { ...previous, error: error.message, checked_at: new Date().toISOString() }; errors.push({ subscription_id: source.id, error: error.message }); }
   }
@@ -328,5 +338,5 @@ export async function scanZhihu(root, cycle, { access = zhihuAccess, discoverCol
     await writeJson(file, state);
   }
   await writeJson(file, state);
-  return { checked_at: new Date().toISOString(), subscriptions: Object.keys(state.sources).length, errors, retry: await retryAuto(root, 'zhihu', cycle) };
+  return { checked_at: new Date().toISOString(), subscriptions: Object.keys(state.sources).length, errors, warnings, retry: await retryAuto(root, 'zhihu', cycle) };
 }
