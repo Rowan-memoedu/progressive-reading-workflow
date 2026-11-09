@@ -1,0 +1,29 @@
+{
+  "policy": "mathematical-lecture/nested-lossless-v1",
+  "source_video": "synthetic:physics-work-energy",
+  "files": [],
+  "pages": [],
+  "images": [],
+  "transcripts": [{
+    "part": 1,
+    "title": "恒定质量质点的动能定理",
+    "cues": [
+      [0, "好，今天把合外力做功和速度变化连起来。"],
+      [1, "考虑惯性系中质量不变的质点，先讨论沿直线运动。这里的力是合外力。"],
+      [2, "牛顿第二定律给出合力等于质量乘加速度。"],
+      [3, "速度是位移对时间的导数；用链式法则，可以把加速度写成速度乘速度对位置的导数。"],
+      [4, "所以在沿运动的微小位移上，合力做功等于质量乘速度再乘速度的微分。"],
+      [5, "把两边沿实际运动过程积分，速度从初速度变化到末速度。"],
+      [6, "质量不变才可以放到积分号外。速度的积分是速度平方的一半。"],
+      [7, "定义动能为二分之一质量乘速度的平方，就得到合外力的总功等于动能的变化。"],
+      [8, "总功为正时动能增大，为负时动能减小；总功为零表示动能不变，不表示每一个力都没有做功。"],
+      [9, "例子：质量两千克，速度从三米每秒变成五米每秒，合外力做功等于二分之一乘二乘五的平方减三的平方，结果十六焦耳。"],
+      [10, "换成三维运动时用力和位移的点积，仍然得到同一个动能定理。"]
+    ]
+  }],
+  "board_blocks": [
+    {"index": 0, "page": 1, "type": "text", "text": "$F_{\\mathrm{net}}=ma$，$a=\\frac{dv}{dt}=\\frac{dv}{dx}\\frac{dx}{dt}=v\\frac{dv}{dx}$，所以 $dW_{\\mathrm{net}}=F_{\\mathrm{net}}dx=m v\\,dv$。"},
+    {"index": 1, "page": 1, "type": "text", "text": "$W_{\\mathrm{net}}=\\int_{v_0}^{v_1}mv\\,dv=\\frac12mv_1^2-\\frac12mv_0^2$；$K=\\frac12mv^2$。质量 $m$ 为常量。"},
+    {"index": 2, "page": 1, "type": "text", "text": "$m=2\\,\\mathrm{kg}$，$v_0=3\\,\\mathrm{m/s}$，$v_1=5\\,\\mathrm{m/s}$，$W_{\\mathrm{net}}=\\frac12\\times2\\times(25-9)=16\\,\\mathrm{J}$。三维：$dW_{\\mathrm{net}}=\\mathbf F_{\\mathrm{net}}\\cdot d\\mathbf r$。"}
+  ]
+}

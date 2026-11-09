@@ -15,8 +15,8 @@ test('default selects Codex independently of inherited DeepSeek model; explicit 
   try {
     const config = await loadProducerConfig();
     assert.equal(producerBackend(config), 'codex_exec');
-    assert.equal(config.AI_PRODUCER_CODEX_MODEL, 'gpt-6-luna');
-    assert.equal(producerModel({ ...config, AI_PRODUCER_CODEX_MODEL: '', AI_PRODUCER_MODEL: 'deepseek-fixture' }), 'gpt-6-luna');
+    assert.equal(config.AI_PRODUCER_CODEX_MODEL, 'gpt-6.1-sol');
+    assert.equal(producerModel({ ...config, AI_PRODUCER_CODEX_MODEL: '', AI_PRODUCER_MODEL: 'deepseek-fixture' }), 'gpt-6.1-sol');
     assert.equal(producerModel({ ...config, AI_PRODUCER_CODEX_MODEL: 'explicit-model' }), 'explicit-model');
     process.env.AI_PRODUCER_PROVIDER = 'deepseek';
     assert.equal(producerBackend(await loadProducerConfig()), 'deepseek');
@@ -39,7 +39,7 @@ test('Codex receives source as stdin, reads final file, maps usage, and cleans o
     assert.ok(args.includes('--ignore-user-config'));
     for(const setting of ['features.apps=false','features.skill_search=false','features.skip_host_skill_discovery=true'])assert.ok(args.includes(setting));
     assert.ok(!args.includes('--output-schema'));
-    assert.equal(args[args.indexOf('-m') + 1], 'gpt-6-luna');
+    assert.equal(args[args.indexOf('-m') + 1], 'gpt-6.1-sol');
     const child = new EventEmitter();
     child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.stdin = new EventEmitter();
     child.stdin.end = async prompt => {

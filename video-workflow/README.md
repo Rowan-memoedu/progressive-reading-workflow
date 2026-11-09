@@ -14,6 +14,10 @@ python video-workflow/fetch-public.py code
 
 可选渲染依赖见 `render-requirements.txt`。通过 `PROGRESSIVE_READING_VIDEO_PYTHON` 指定视频 Python 环境，音频/来源工具另支持 `PR_AUDIO_PYTHON`。截图使用隔离的无头 Chrome 播放器与目标站点范围内的临时凭据；退出清除临时凭据。
 
+## 数理课程讲义
+
+带配套板书或讲义的数学、物理等课程可使用独立的 [数理讲义入口](math-lecture/README.md)。该入口将多分 P 的字幕与 PDF 对齐为一份课程目录，按完整例题或推导分单元生成嵌套 lecture；公式使用 LaTeX，保留理由、条件和可达性，不生成导读卡，不执行下述图文截图流程。平台无字幕时可显式选择仅下载音轨并使用现有全局 ASR。各单元分别缓存、审核和恢复，最后整合为一份讲义并核验渲染。
+
 ## B 站视频与合集
 
 `watch.mjs` 和 `watch-core.mjs` 发现分 P 与合集，身份为 BV 号加 cid。新订阅默认建立当前基线，之后跟踪新增。已发布、仅后续验收失败的任务在显式恢复时核对原文哈希、来源和附件，再进入 verification-only；普通调度不自行恢复 blocked 项目。

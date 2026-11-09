@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import {createHash} from 'node:crypto';
 
 const execute = promisify(execFile);
-export const DEFAULT_CODEX_MODEL = 'gpt-6-luna';
+export const DEFAULT_CODEX_MODEL = 'gpt-6.1-sol';
 export const CODEX_TRANSPORT_VERSION = 'codex-exec-document/v2';
 
 export async function codexExecutable(config = {}) {
