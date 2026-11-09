@@ -5,6 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import sanitizeFilename from "sanitize-filename";
+import {readingDestination} from "../subscription-workflow/reading-options.mjs";
 import { standardWorkflowOptions } from "../standard-preprocessing/index.mjs";
 import { renameWithRetry } from "../rss-source/core.mjs";
 import { publicationMetadata } from "../subscription-workflow/publication-time.mjs";
@@ -468,6 +469,8 @@ export async function syncLedger(workflowRoot = DEFAULT_WORKFLOW_ROOT, catalog =
       history: []
     };
     const sourceRevision = current.preservedSourceRevision || sha256(`${current.packageSha256}:${current.requestSha256 || "blocked"}:${current.contentStatus}:${current.route}`);
+    if(current.subscriptionName)item.subscription_name=current.subscriptionName;
+    if(current.subscriptionKind)item.subscription_kind=current.subscriptionKind;
     const observedAt = nowIso();
     item.published_at ||= current.publishedAt || null;
     if (current.externallyPublished && existsSync(current.externallyPublished.path)) {
@@ -492,7 +495,7 @@ export async function syncLedger(workflowRoot = DEFAULT_WORKFLOW_ROOT, catalog =
     }
     Object.assign(item, {
       ...(current.canonicalKey ? { canonical_key: current.canonicalKey, subscription_ids: current.subscriptionIds,
-        platform: current.platform, destination: current.destination, video: current.video } : {}),
+        platform: current.platform, destination: current.destination, subscription_name:current.subscriptionName, subscription_kind:current.subscriptionKind, video: current.video } : {}),
       title: current.title,
       item_url: current.itemUrl,
       feed_url: current.feedUrl,
@@ -1626,7 +1629,7 @@ export async function publishSelected(workflowRoot, materialId, options = {}) {
       return { status: "already_published", material_id: materialId, path: item.publication.path, sha256: existingHash };
     }
   }
-  const destinationRoot = paths.unified && item.destination ? path.resolve(workflowRoot, '阅读区', item.destination) : paths.readingRoot;
+  const destinationRoot = paths.unified ? path.resolve(workflowRoot, '阅读区', readingDestination(item)) : paths.readingRoot;
   const destinationRelative = path.relative(path.join(workflowRoot, '阅读区'), destinationRoot);
   if (destinationRelative.startsWith('..') || path.isAbsolute(destinationRelative)) throw new Error('publication_destination_outside_reading_area');
   await fs.mkdir(destinationRoot, { recursive: true });

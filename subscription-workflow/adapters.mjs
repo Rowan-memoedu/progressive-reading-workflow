@@ -17,10 +17,11 @@ import { requestZhihuJson } from '../scripts/zhihu-social-archive.mjs';
 import { defaultCookieDataRoot } from '../scripts/live-cookie-snapshot.mjs';
 import { fetchUrlWithoutBrowser } from '../scripts/url-background-fetch.mjs';
 import { htmlArticleToMarkdown } from '../scripts/browser-page-markdown.mjs';
+import {readingDestination} from './reading-options.mjs';
 
 export function autoConfig(config, onlyRss = false) {
   const subscriptions = config.subscriptions.filter(s => s.enabled && !s.kind.startsWith('bilibili_') && s.mode !== 'reports' && (!onlyRss || s.kind === 'rss'))
-    .map(s => ({ url: s.url, name: s.name, route: s.mode, destination: s.destination, subscription_id: s.id,
+    .map(s => ({ url: s.url, name: s.name, route: s.mode, destination: readingDestination({platform:s.kind==='rss'?'rss':s.kind,destination:s.destination,subscription_name:s.name}), subscription_id: s.id,
       history_mode: s.history_mode, earliest_date: s.earliest_date }));
   return { ...config.rss_defaults, enabled: config.enabled, subscriptions, feeds: subscriptions.map(s => s.url),
     report_feeds: config.subscriptions.filter(s => s.enabled && s.kind === 'rss' && s.mode === 'reports').map(s => s.url),
@@ -142,7 +143,7 @@ export function sourceWatch(root, source) {
   return { workflow: WATCH_WORKFLOW, body_mode: 'strong_structuring', media_policy: 'generated_and_reviewed',
     frame_policy: WATCH_FRAME_POLICY, provider: 'codex_exec', model: WATCH_MODEL, part_unit: 'individual',
     ...source.watch, id: source.watch?.id || source.id, url: source.url, name: source.name,
-    destination: path.resolve(root, '阅读区', source.destination), public_packages: false,
+    destination: path.resolve(root, '阅读区', readingDestination({subscription_kind:source.kind,subscription_name:source.name,destination:source.destination})), public_packages: false,
     collection: source.kind === 'bilibili_collection', subscription_id: source.id, mode: source.mode,
     history_mode: source.history_mode, earliest_date: source.earliest_date };
 }

@@ -107,6 +107,8 @@ export async function canonicalCatalog(root, rssItems) {
         preservedSourceRevision: preserved.source_revision } : {}),
       canonicalKey: key, aliasIds: [...new Set([...versions.map(item => item.materialId), ...previous.map(item => item.material_id)])],
       subscriptionIds: ids, platform: latest.platform || 'rss',
+      subscriptionName: config.subscriptions.find(source=>ids.includes(source.id))?.name,
+      subscriptionKind: config.subscriptions.find(source=>ids.includes(source.id))?.kind,
       destination: latest.destination || config.subscriptions.find(source => ids.includes(source.id))?.destination || 'RSS' });
   }
   return result;

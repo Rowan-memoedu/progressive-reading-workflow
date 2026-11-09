@@ -1,4 +1,6 @@
 import fs from "node:fs/promises";
+import {fileURLToPath,pathToFileURL} from "node:url";
+import {readingDestination} from "./reading-options.mjs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { digest, loadConfig } from "./config.mjs";
@@ -160,24 +162,81 @@ function relocateLinks(text, source, target) {
   }).join("");
 }
 
+export function relocatedPath(value, mapping, workflowRoot) {
+  if (typeof value !== 'string') return value;
+  if (mapping.has(value)) return mapping.get(value);
+  if (/^file:\/\//iu.test(value)) { try { const file=fileURLToPath(value);return mapping.has(file)?pathToFileURL(mapping.get(file)).href:value; } catch {return value;} }
+  if (/^obsidian:\/\//iu.test(value)) {
+    try { const url=new URL(value);let changed=false;for(const key of ['path','file'])if(url.searchParams.has(key)){
+      const before=url.searchParams.get(key),after=relocatedPath(before,mapping,workflowRoot);if(before!==after){url.searchParams.set(key,after);changed=true;}
+    }return changed?url.href.replaceAll('+','%20'):value; } catch {return value;}
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(value)) return value;
+  const slash=value.replaceAll('\\','/');
+  for (const [from,to] of mapping) {
+    if(slash===from.replaceAll('\\','/'))return value.includes('\\')?to:to.replaceAll('\\','/');
+    if(!workflowRoot)continue;
+    const oldRelative=path.relative(workflowRoot,from).replaceAll('\\','/'),next=path.relative(workflowRoot,to).replaceAll('\\','/');
+    if(oldRelative&&(slash===oldRelative||slash.endsWith('/'+oldRelative))){
+      const result=slash.slice(0,-oldRelative.length)+next;return value.includes('\\')?result.replaceAll('/','\\'):result;
+    }
+  }
+  return value;
+}
+
+export function relocatedMarkdown(text, source, target, mapping = new Map(), workflowRoot) {
+  let fence = null;
+  return text.split(/(?<=\n)/u).map(line=>{
+    const delimiter = /^\s{0,3}(`{3,}|~{3,})/u.exec(line)?.[1];
+    if (delimiter) {
+      if (!fence) fence = delimiter;
+      else if (delimiter[0] === fence[0] && delimiter.length >= fence.length) fence = null;
+      return line;
+    }
+    if (fence) return line;
+    return line.replace(/(`+[^\r\n]*?`+)|(\]\()(<[^>\r\n]+>|[^\s()]+)(\))/gu,(match,code,open,destination,close)=>{
+      if (code) return match;
+      const raw = destination.startsWith("<") ? destination.slice(1,-1) : destination;
+      const mappedUri=/^(?:file|obsidian):|^[a-z]:[\\/]/iu.test(raw)?relocatedPath(raw,mapping,workflowRoot):raw;
+      if(mappedUri!==raw)return `${open}<${mappedUri}>${close}`;
+      if (/^(?:[a-z][a-z0-9+.-]*:|\/|#)/iu.test(raw)) return match;
+      const [,pathname,suffix] = /^([^#?]*)([\s\S]*)$/u.exec(raw);
+      let decoded;
+      try { decoded = decodeURI(pathname); } catch { return match; }
+      const absolute = path.resolve(path.dirname(source),decoded);
+      const mapped=mapping.get(absolute)||absolute;
+      if(source===target&&mapped===absolute)return match;
+      const relative = path.relative(path.dirname(target),mapped).replaceAll("\\","/");
+      const encoded = encodeURI(relative).replaceAll("#","%23").replaceAll("?","%3F");
+      return `${open}<${encoded+suffix}>${close}`;
+    });
+  }).join("");
+}
+
 export async function ensureArchiveSources(paths, ledger) {
   const config = await loadConfig(paths.workflowRoot);
   const priorOwners = new Set(Object.values(ledger.items).filter(item=>item.delivery?.short_weekly_path).flatMap(item=>item.subscription_ids || []));
   const sources = (config?.subscriptions || []).filter(source=>(source.mode==="reports" || priorOwners.has(source.id)) && !source.kind.startsWith("bilibili_"));
-  const folder = path.join(archiveRoot(paths),"短文");
   for (const category of ["日报","长文周报"]) await fs.mkdir(path.join(archiveRoot(paths),category),{recursive:true});
   ledger.short_archive_sources ||= {};
   for (const source of sources) {
     const stem = sanitizeFilename(source.name).trim().slice(0,100) || source.id;
     const marker = `<!-- subscriptions:archive-source ${source.id} -->`;
-    let name = ledger.short_archive_sources[source.id] || stem+".md";
-    let file = path.join(folder,path.basename(name));
+    const file = path.join(paths.workflowRoot,'待归档原文',readingDestination({subscription_kind:source.kind,subscription_name:source.name,destination:source.destination}),'短文归档.md');
+    const previousName=ledger.short_archive_sources[source.id] || stem+'.md';
+    const previous=path.join(archiveRoot(paths),/[\\/]/u.test(previousName)?previousName:path.join('短文',previousName));
+    const name=path.relative(archiveRoot(paths),file).replaceAll('\\','/');
     let existing = await readOptional(file);
+    if(existing===null&&previous!==file){
+      const legacy=await readOptional(previous);
+      if(legacy!==null){
+        if(!legacy.includes(marker))throw new Error(`short_archive_source_collision:${previous}`);
+        await moveReport(previous,file,digest(legacy),digest(relocatedMarkdown(legacy,previous,file)));
+        existing=await readOptional(file);
+      }
+    }
     if (existing !== null && !existing.includes(marker)) {
-      name = `${stem}（${source.id}）.md`;
-      file = path.join(folder,name);
-      existing = await readOptional(file);
-      if (existing !== null && !existing.includes(marker)) throw new Error(`short_archive_source_collision:${file}`);
+      throw new Error(`short_archive_source_collision:${file}`);
     }
     if (existing === null) await replaceChecked(file,null,`# ${source.name}\n\n${marker}\n`);
     ledger.short_archive_sources[source.id] = name;
@@ -185,7 +244,7 @@ export async function ensureArchiveSources(paths, ledger) {
   return sources;
 }
 
-async function moveReport(source, target, expected, destinationHash = expected) {
+export async function moveReport(source, target, expected, destinationHash = expected, mapping = new Map(), workflowRoot) {
   const text = await readOptional(source);
   const existing = await readOptional(target);
   if (text === null) {
@@ -193,7 +252,7 @@ async function moveReport(source, target, expected, destinationHash = expected) 
     throw new Error(`report_archive_source_missing:${source}`);
   }
   if (digest(text) !== expected) throw new Error(`report_changed_before_archive:${source}`);
-  const output = destinationHash === expected ? text : relocateLinks(text,source,target);
+  const output = destinationHash === expected ? text : relocatedMarkdown(text,source,target,mapping,workflowRoot);
   if (digest(output) !== destinationHash) throw new Error(`report_archive_hash_mismatch:${target}`);
   await fs.mkdir(path.dirname(target),{recursive:true});
   if (existing === null) await replaceChecked(target,null,output);
@@ -239,7 +298,7 @@ export async function rollShortReports(paths, ledger, week, save, labelFor) {
       for (const transfer of transfers) {
         const {item,key,body,original,complete,owner} = transfer;
         if (complete) {
-          const file = path.join(archiveRoot(paths),"短文",ledger.short_archive_sources[owner.id]);
+          const file = path.join(archiveRoot(paths),ledger.short_archive_sources[owner.id]);
           const before = await fs.readFile(file,"utf8");
           const marker = `<!-- subscriptions:archived-short ${key} -->`;
           const archivedBody = relocateLinks(body,source,file);

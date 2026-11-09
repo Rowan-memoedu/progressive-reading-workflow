@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { dataPath, artifactPath } from '../scripts/runtime-paths.mjs';
+import {readingDestination} from './reading-options.mjs';
 
 export const HOME = dataPath('ProgressiveReading', 'Subscriptions');
 export const SCHEMA = 'progressive-reading.subscriptions/v1';
@@ -99,7 +100,7 @@ export function normalizeSource(value, previous = null) {
     }
   }
   return { ...previous, id: previous?.id || 'sub-' + randomUUID(), kind, name, url: url.href,
-    mode, destination: folder, enabled: value.enabled ?? previous?.enabled ?? true,
+    mode, destination: readingDestination({subscription_kind:kind,subscription_name:name,destination:folder}), enabled: value.enabled ?? previous?.enabled ?? true,
     history_mode: historyMode, earliest_date: historyMode === 'since' ? earliest : null,
     added_at: previous?.added_at || new Date().toISOString(), updated_at: new Date().toISOString(),
     initial_policy: kind === 'rss' ? 'current_feed' : 'new_only' };
