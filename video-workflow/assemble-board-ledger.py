@@ -38,7 +38,7 @@ def bind_patch_source(patch, original):
     return {**patch,'before':original,'after':original[:start]+patch['after']+original[start+len(before):]},True
 def compile_ledger(transcript,raw_bytes,request,request_bytes,results,require_review=False):
     frames={f['file']:f for f in request['frames']};observations={};patches={};notes=[];unresolved=[];wire_repairs=[];out_of_scope=[];slice_projections=[];rejected=[]
-    review_receipts=[];retained=[]
+    review_receipts=[];retained=[];source_conflicts=[]
     for result in results:
         if result.get('provider')!='codex_exec' or result.get('image_count',0)<1:raise ValueError('board_visual_transport_required')
         value,repaired=decode_visual_json(result['output'])
@@ -52,6 +52,19 @@ def compile_ledger(transcript,raw_bytes,request,request_bytes,results,require_re
         if result['input'].get('visual_only') is True and value['patches']:raise ValueError('visual_only_source_stage_cannot_edit_captions')
         if repaired:wire_repairs.append({'job':result['id'],'method':'escape_literal_LaTeX_for_JSON','raw_response_modified':False})
         job=json.loads(result['input']['input']);low,high=job['main_range']
+        for item in value.get('source_conflicts',[]):
+            if item.get('kind') not in ('source_conflict','source_omission','source_self_correction','source_ambiguity') or not item.get('reason') or not item.get('observed'):
+                raise ValueError('source_conflict_description_required')
+            captions=item.get('captions',[]);evidence=item.get('evidence',[])
+            if not captions or not evidence or any(name not in frames for name in evidence):raise ValueError('source_conflict_evidence_required')
+            for caption in captions:
+                index=caption.get('segment_index')
+                if not isinstance(index,int) or not low<=index<=high or caption.get('before')!=transcript['segments'][index]['text']:
+                    raise ValueError('source_conflict_not_exact_source')
+                if any(p.get('segment_index')==index for p in value['patches']):raise ValueError('source_conflict_was_modified')
+                if not any(abs(seconds(transcript['segments'][index]['start'])-seconds(frames[name]['requested_time']))<=360 for name in evidence):
+                    raise ValueError('source_conflict_evidence_not_near_caption')
+            source_conflicts.append({'job':result['id'],**item})
         for item in value.get('retained_uncertainties',[]):
             index=item.get('segment_index')
             if not isinstance(index,int) or not low<=index<=high or item.get('before')!=transcript['segments'][index]['text'] or item.get('kind')!='lexical_or_context_only' or not item.get('reason'):
@@ -127,13 +140,15 @@ def compile_ledger(transcript,raw_bytes,request,request_bytes,results,require_re
         if row['reason']=='quoted_before_not_exact_source':continue
         if row['kind']=='patch':patches.pop(row['proposal']['segment_index'],None)
         else:notes.remove(row['proposal'])
+    protected={c['segment_index'] for item in source_conflicts for c in item['captions']}
+    if protected.intersection(patches):raise ValueError('source_conflict_was_modified')
     return {'version':'video-board-correction/v1','accepted':False,'unresolved':unresolved,
       'raw_transcript_sha256':sha(raw_bytes),'frame_request_sha256':sha(request_bytes),'frames':rows,
       'patches':sorted(patches.values(),key=lambda p:p['segment_index']),'formula_notes':sorted(notes,key=lambda n:n['after_segment_index']),
       'terminology_corrections':[],'diagram_corrections':[],'no_correction_needed':not patches and not notes,
       'wire_syntax_repairs':wire_repairs,'out_of_scope_proposals':out_of_scope,'source_slice_projections':slice_projections,
       'visual_evidence_adjustments':evidence_adjustments,'rejected_proposals':rejected,
-      'retained_uncertainties':retained,'independent_reviews':review_receipts,
+      'source_conflicts':source_conflicts,'retained_uncertainties':retained,'independent_reviews':review_receipts,
       'independent_review_passed':bool(review_receipts) and all(r['verdict']=='pass' and not r['issues'] for r in review_receipts)}
 
 def main():

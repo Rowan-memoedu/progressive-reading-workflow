@@ -1,5 +1,6 @@
 // Compile model-selected semantic scenes into bounded capture requests. This
 // only narrows declared windows; it cannot invent a scene or admit an image.
+import {normalizeMermaidSource} from './mermaid-source.mjs';
 const seconds=value=>String(value).split(':').reduce((sum,n)=>sum*60+Number(n),0);
 const valid=value=>typeof value==='string'&&/^\d{2}:[0-5]\d:[0-5]\d$/u.test(value);
 const validSubtitle=value=>typeof value==='string'&&/^\d{2,}:[0-5]\d:[0-5]\d(?:\.\d+)?$/u.test(value);
@@ -10,10 +11,10 @@ export function compileMediaSchedule(plan,transcript){
   effective.items.forEach((item,index)=>{
     if(item.kind==='mermaid'){
       const code=String(item.code||'');
-      if(/<\/?[a-z][^>]*>/iu.test(code))throw Error('unsafe_mermaid_html');
+      if(/<\/?[a-z][\w:-]*(?:\s+[^<>\n]*)?\/?>/iu.test(code))throw Error('unsafe_mermaid_html');
       // Mermaid's numeric entity renders the same mathematical less-than sign
       // inside a quoted label, without introducing an HTML token into the graph.
-      item.code=code.replace(/"(?:\\.|[^"\\])*"/gu,label=>label.replaceAll('<','#60;'));
+      item.code=normalizeMermaidSource(code);
       if(item.code!==code)changes.push({index,method:'mermaid_quoted_label_entity',before_sha_text:code,after_sha_text:item.code});
       return;
     }

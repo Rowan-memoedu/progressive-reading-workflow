@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import {normalizeMermaidSource} from './mermaid-source.mjs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
@@ -64,8 +65,7 @@ export function buildMediaBook(plan,transcript){
       imagePaths.push('images/shot_'+item.time.replaceAll(':','_')+'.png');
       chunks.push('!['+title+'](SCREENSHOT:'+item.time+')');
     }else{
-      const code=String(item.code||'').trim();
-      if(!/^(?:flowchart|graph)\s+(?:TD|TB|LR|RL|BT)\b/u.test(code)||/```|<|https?:|\bclick\b|%%\{/iu.test(code))throw new Error('invalid_or_unsafe_mermaid');
+      const code=normalizeMermaidSource(item.code);
       chunks.push('```mermaid\n'+code+'\n```');
     }
   }
@@ -161,7 +161,8 @@ export async function importIllustratedStrong({inputDir,outputDir,publishPath,co
       generatedMedia:extractBookMedia(corrected.book.materialized,corrected.book.imagePaths.map(name=>({path:name})))
         .map(item=>({...item,literal:item.literal||imageEmbed(item.label,item.path)})),transcript:corrected.transcript}));
     const ledger=await readJson(path.join(outputDir,'board-correction.json'));
-    const formulaCheck=checkFormulaConsistency(refinement.markdown,ledger.formula_notes.map(item=>item.text));
+    const formulaCheck=checkFormulaConsistency(refinement.markdown,ledger.formula_notes.map(item=>item.text),
+      {preservedSource:(ledger.source_conflicts||[]).flatMap(item=>item.captions.map(c=>c.before))});
     await fs.writeFile(path.join(corrected.outputDir,'formula-consistency.json'),JSON.stringify(formulaCheck,null,2)+'\n');
     if(formulaCheck.status!=='passed'){
       const pending={status:'needs_formula_review',body_saved:true,published:false,

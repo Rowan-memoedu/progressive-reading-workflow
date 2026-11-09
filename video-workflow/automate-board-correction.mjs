@@ -7,6 +7,7 @@ import {runBoardCorrectionJobs} from './run-board-correction.mjs';
 import {loadProducerConfig,producerModel} from '../standard-preprocessing/lib/producer.mjs';
 import {boardFollowupFrame} from './board-followup-frame.mjs';
 import {screenshotTiming} from './media-timing.mjs';
+import {normalizeMermaidSource} from './mermaid-source.mjs';
 
 const execute=promisify(execFile),root=import.meta.dirname;
 const json=value=>JSON.stringify(value,null,2)+'\n';
@@ -28,6 +29,40 @@ export function reviewJobs(jobs,results){
   });
 }
 
+// Reuse independently passed groups with identical raw input/images. Failed
+// groups alone are reviewed under the new policy; old responses stay frozen.
+export async function reusableSourceReviews(home,jobs,excludeKey,model){
+  const found=new Map();
+  const entries=await fs.readdir(home,{withFileTypes:true}).catch(error=>{if(error.code==='ENOENT')return [];throw error;});
+  for(const entry of entries.filter(e=>e.isDirectory()&&/^source-review-[a-f0-9]{12}-\d+$/u.test(e.name)).sort((a,b)=>a.name.localeCompare(b.name))){
+    if(excludeKey&&entry.name.includes(excludeKey))continue;
+    const dir=path.join(home,entry.name);
+    const prompt=await fs.readFile(path.join(dir,'prompt.md')).catch(()=>null);
+    if(!prompt||!entry.name.includes(hash(prompt).slice(0,12)))continue;
+    for(const row of await rows(path.join(dir,'results.jsonl')).catch(()=>[])){
+      const job=jobs.find(j=>String(j.id)===String(row.id));
+      if(!job||JSON.stringify(job)!==JSON.stringify(row.input)||row.provider!=='codex_exec'||row.image_count!==job.images.length||(model&&row.model!==model))continue;
+      let value;try{value=JSON.parse(row.output.replace(/^```(?:json)?\s*|\s*```$/gu,''));}catch{continue;}
+      if(value.review?.verdict==='pass'&&value.review.issues?.length===0&&value.unresolved?.length===0)
+        found.set(String(row.id),row);
+    }
+  }
+  return jobs.flatMap(job=>found.has(String(job.id))?[found.get(String(job.id))]:[]);
+}
+
+export async function resumeBoardEvidence(runDir,sourceSha){
+  const home=path.join(runDir,'board-automation');
+  const entries=await fs.readdir(home,{withFileTypes:true}).catch(error=>{if(error.code==='ENOENT')return [];throw error;});
+  let chosen=runDir,count=0;
+  for(const entry of entries.filter(e=>e.isDirectory()&&/^evidence-[a-f0-9]+$/u.test(e.name)).sort((a,b)=>a.name.localeCompare(b.name))){
+    const dir=path.join(home,entry.name),request=await read(path.join(dir,'frame-review-request.json')).catch(()=>null);
+    if(request?.source_sha256===sourceSha&&request.frames.length>count&&await fs.stat(path.join(dir,'combined-media-plan.json')).then(()=>true,()=>false)){
+      chosen=dir;count=request.frames.length;
+    }
+  }
+  return chosen;
+}
+
 export function bindDiagramReview(plan,review,ledger,part){
   const diagrams=plan.items.filter(item=>item.kind==='mermaid');
   if(review.items?.length!==diagrams.length||new Set(review.items.map(item=>item.diagram_index)).size!==diagrams.length)
@@ -38,8 +73,8 @@ export function bindDiagramReview(plan,review,ledger,part){
     if(!item||item.part!==part||!['keep','correct'].includes(item.status)||!item.reason?.trim())throw Error('board_diagram_review_invalid');
     if(item.status==='keep')continue;
     if(!item.evidence?.length||item.evidence.some(id=>!ledger.frames.some(frame=>frame.file===id)))throw Error('board_diagram_evidence_required');
-    const code=String(item.code||'').trim();
-    if(!/^(?:flowchart|graph)\s+(?:TD|TB|LR|RL|BT)\b/u.test(code)||/```|<|https?:|\bclick\b|%%\{/iu.test(code))throw Error('unsafe_reviewed_mermaid');
+    let code;
+    try{code=normalizeMermaidSource(item.code);}catch{throw Error('unsafe_reviewed_mermaid');}
     if(code!==original.code)changes.push({time:original.time,before:original.code,after:code,evidence:item.evidence,reason:item.reason});
   }
   return changes;
@@ -91,9 +126,18 @@ async function runAutomaticBoardCorrection({sourceDir,runDir,evidenceDir=runDir,
     const extracted=path.join(home,`extraction-${shard}`),reviewedDir=path.join(home,`source-review-${reviewKey}-${shard}`);
     await runJobs({inputFile:input,promptFile:path.join(root,'prompts/board-formula-correction-v1.md'),outputDir:extracted,config});
     const reviewInput=path.join(jobsDir,`review-${reviewKey}-${shard}.jsonl`);
-    await exact(reviewInput,reviewJobs(jobs,await rows(path.join(extracted,'results.jsonl'))).map(job=>JSON.stringify(job)).join('\n')+'\n');
-    await runJobs({inputFile:reviewInput,promptFile:reviewPrompt,outputDir:reviewedDir,config});
-    return path.join(reviewedDir,'results.jsonl');
+    const reviewAll=reviewJobs(jobs,await rows(path.join(extracted,'results.jsonl')));
+    const reused=await reusableSourceReviews(home,reviewAll,reviewKey,producerModel(config));
+    const pending=reviewAll.filter(job=>!reused.some(row=>String(row.id)===String(job.id)));
+    await exact(reviewInput,pending.map(job=>JSON.stringify(job)).join('\n')+'\n');
+    let fresh=[];
+    if(pending.length){
+      await runJobs({inputFile:reviewInput,promptFile:reviewPrompt,outputDir:reviewedDir,config});
+      fresh=await rows(path.join(reviewedDir,'results.jsonl'));
+    }
+    const combined=path.join(home,`review-results-${reviewKey}-${shard}.jsonl`);
+    await exact(combined,[...reused,...fresh].sort((a,b)=>String(a.id).localeCompare(String(b.id))).map(row=>JSON.stringify(row)).join('\n')+'\n');
+    return combined;
   }));
   await progress('compile_source_evidence');
   const candidate=path.join(home,`candidate-${reviewKey}.json`);
@@ -110,7 +154,7 @@ async function runAutomaticBoardCorrection({sourceDir,runDir,evidenceDir=runDir,
   const admittedKey=hash(await fs.readFile(candidate)).slice(0,16);
   const diagramKey=hash(json({candidate:admittedKey,plan})).slice(0,16);
   const diagramInput=path.join(home,`diagram-${diagramKey}-input.json`),diagramDir=path.join(home,`diagram-review-${diagramKey}`);
-  await exact(diagramInput,json({parts:[{part,transcript,observations:ledger.frames,formula_notes:ledger.formula_notes,
+  await exact(diagramInput,json({parts:[{part,transcript,observations:ledger.frames,formula_notes:ledger.formula_notes,source_conflicts:ledger.source_conflicts,
     diagrams:plan.items.filter(item=>item.kind==='mermaid').map((item,diagram_index)=>({diagram_index,time:item.time,code:item.code}))}]}));
   await python('review-board-diagrams.py',['--input',diagramInput,'--output',diagramDir]);
   const diagramChanges=bindDiagramReview(plan,await read(path.join(diagramDir,'review.json')),ledger,part);
@@ -147,8 +191,7 @@ export async function automateBoardCorrection(args){
         throw Error('accepted_board_source_changed');
       return {...receipt,replayed:true};
     }
-    let evidenceDir=args.runDir;
-    const extras=[];
+    let evidenceDir=await resumeBoardEvidence(args.runDir,hash(await fs.readFile(path.join(args.sourceDir,'transcript.json'))));
     for(let attempt=0;;attempt++){
       try{return await runAutomaticBoardCorrection({...args,evidenceDir});}
       catch(error){
@@ -181,10 +224,10 @@ export async function automateBoardCorrection(args){
         await exact(path.join(capture,'items.json'),json(items));
         await exact(path.join(capture,'capture-plan.json'),json({version:'video-frame-plan/v2',frames:items.map(item=>screenshotTiming(item,transcript))}));
         await args.captureEvidence({inputDir:source,outputDir:capture});
-        extras.push(capture);
         const {mergeBoardEvidence}=await import('./merge-board-evidence.mjs');
-        evidenceDir=path.join(args.runDir,'board-automation',`evidence-${hash(json(extras)).slice(0,12)}`);
-        await mergeBoardEvidence({inputDir:args.sourceDir,baseRun:args.runDir,extraRuns:extras,outputDir:evidenceDir});
+        const next=path.join(args.runDir,'board-automation',`evidence-${hash(json({base:evidenceDir,capture})).slice(0,12)}`);
+        await mergeBoardEvidence({inputDir:args.sourceDir,baseRun:evidenceDir,extraRuns:[capture],outputDir:next});
+        evidenceDir=next;
       }
     }
   }

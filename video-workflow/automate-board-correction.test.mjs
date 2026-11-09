@@ -5,7 +5,7 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {automateBoardCorrection,bindDiagramReview} from './automate-board-correction.mjs';
+import {automateBoardCorrection,bindDiagramReview,reusableSourceReviews,resumeBoardEvidence} from './automate-board-correction.mjs';
 import {runWatchedIllustrated,WATCH_MODEL} from './watch-illustrated.mjs';
 import {prepareBoardCorrection} from './board-correction.mjs';
 import {buildMediaBook} from './illustrated-strong.mjs';
@@ -14,6 +14,27 @@ const execute=promisify(execFile),json=value=>JSON.stringify(value,null,2)+'\n';
 const hash=data=>createHash('sha256').update(data).digest('hex');
 const config={AI_PRODUCER_PROVIDER:'codex_exec',AI_PRODUCER_CODEX_MODEL:'fixture-model'};
 const python='D:/Caches/ProgressiveReading/videobook-python/Scripts/python.exe';
+test('resume uses complete cached evidence and reuses only exact passed independent groups',async()=>{
+  const base=await fs.mkdtemp('D:/Artifacts/ProgressiveReading/source-resume-test-'),home=base+'/board-automation';
+  const job={id:'0',images:[{path:'controlled.png'}],input:'controlled raw input'};
+  const prompt='controlled review contract',key=hash(prompt).slice(0,12),dir=home+'/source-review-'+key+'-0';
+  await fs.mkdir(dir,{recursive:true});await fs.writeFile(dir+'/prompt.md',prompt);
+  const row={id:'0',input:job,provider:'codex_exec',image_count:1,output:JSON.stringify({review:{verdict:'pass',issues:[]},unresolved:[]})};
+  await fs.writeFile(dir+'/results.jsonl',JSON.stringify(row)+'\n');
+  assert.equal((await reusableSourceReviews(home,[job])).length,1);
+  assert.equal((await reusableSourceReviews(home,[{...job,input:'changed raw input'}])).length,0);
+  assert.equal((await reusableSourceReviews(home,[job],key)).length,0);
+  row.output=JSON.stringify({review:{verdict:'needs_more_evidence',issues:['gap']},unresolved:['gap']});
+  await fs.writeFile(dir+'/results.jsonl',JSON.stringify(row)+'\n');
+  assert.equal((await reusableSourceReviews(home,[job])).length,0);
+  for(const [suffix,source_sha256,count]of [['aaaa','raw',3],['bbbb','raw',7],['cccc','other',10]]){
+    const evidence=home+'/evidence-'+suffix;await fs.mkdir(evidence);
+    await fs.writeFile(evidence+'/frame-review-request.json',JSON.stringify({source_sha256,frames:Array(count).fill({})}));
+    await fs.writeFile(evidence+'/combined-media-plan.json','{}');
+  }
+  assert.equal(path.resolve(await resumeBoardEvidence(base,'raw')),path.resolve(home+'/evidence-bbbb'));
+  assert.equal(await resumeBoardEvidence(base,'missing'),base);
+});
 async function fixture(){
   const base=await fs.mkdtemp('D:/Artifacts/ProgressiveReading/automatic-board-test-');
   const sourceDir=base+'/source',runDir=base+'/run';
@@ -33,7 +54,7 @@ async function fixture(){
     {kind:'mermaid',time:'00:00:10',title:'合成方法',source_quote:'正数的和等于五',code:'flowchart TD\nA["定值"]-->B["取等"]'}]}}));
   return {sourceDir,runDir,config,pythonPath:python,transcript,bytes};
 }
-function models({fail=false,requireExtra=false}={}){
+function models({fail=false,requireExtra=false,sourceConflict=false}={}){
   let calls=0;
   return {get calls(){return calls;},runJobs:async({inputFile,promptFile,outputDir})=>{
     calls++;const jobs=(await fs.readFile(inputFile,'utf8')).trim().split('\n').map(JSON.parse);
@@ -44,6 +65,7 @@ function models({fail=false,requireExtra=false}={}){
       if(promptFile.endsWith('board-source-review.md')){
         const missing=fail||requireExtra&&input.images.length<2;
         value.review={verdict:missing?'needs_more_evidence':'pass',issues:missing?['合成证据缺失']:[]};
+        if(sourceConflict)value.source_conflicts=[{kind:'source_conflict',captions:[{segment_index:0,before:input.segments.find(c=>c.segment_index===0).text}],evidence:[id],observed:'受控画面中的另一处写法。',reason:'来源本身存在两种写法，均保留，不补算。'}];
       }
       return {id:job.id,input:job,output:JSON.stringify(value),provider:'codex_exec',image_count:job.images.length};
     });
@@ -68,6 +90,17 @@ test('background board stage requires independent image review and resumes witho
   assert.equal(await fs.readFile(f.sourceDir+'/transcript.json','utf8'),f.bytes);
   await automateBoardCorrection({...f,command,runJobs:model.runJobs});assert.equal(model.calls,2);
   assert.equal(await fs.stat(f.runDir+'/illustrated-receipt.json').then(()=>true,()=>false),false);
+});
+
+test('source conflicts survive admission, independent reconstruction and immutable body transport',async()=>{
+  const f=await fixture(),model=models({sourceConflict:true});
+  await automateBoardCorrection({...f,command,runJobs:model.runJobs});
+  const plan=JSON.parse(await fs.readFile(f.runDir+'/media-schedule.json','utf8')).effective_plan;
+  const corrected=await prepareBoardCorrection({inputDir:f.sourceDir,outputDir:f.runDir,transcript:f.transcript,plan,buildBook:buildMediaBook});
+  assert.match(corrected.transcript.segments[0].text,/```text\n原字幕/);
+  await execute(python,['video-workflow/verify-board-correction.py','--input',corrected.inputDir],{windowsHide:true});
+  const protectedResult=await execute(python,['-c',"import runpy,sys; m=runpy.run_path('standard-preprocessing/refine-full-text.py'); text=open(sys.argv[1],encoding='utf-8').read(); import json; text=json.loads(text)['segments'][0]['text']; protected,spans=m['protect_source'](text); assert any('原字幕' in s and '同段画面' in s for s in spans.values()); print('source_conflict_literal_protected')",corrected.inputDir+'/transcript.json'],{windowsHide:true});
+  assert.match(protectedResult.stdout,/literal_protected/);
 });
 
 test('unresolved independent review cannot admit the source or start body generation',async()=>{

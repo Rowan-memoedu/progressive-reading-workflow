@@ -9,7 +9,8 @@ async function exact(file,bytes){await fs.mkdir(path.dirname(file),{recursive:tr
 // PNGs stay immutable; new requests bind every frame to copied, hashed pixels.
 export async function mergeBoardEvidence({inputDir,baseRun,extraRuns=[],outputDir}){
  const sourceBytes=await fs.readFile(path.join(inputDir,'transcript.json')),transcript=JSON.parse(sourceBytes);
- const plan=(await read(path.join(baseRun,'media-schedule.json'))).effective_plan;
+ const schedule=await read(path.join(baseRun,'media-schedule.json')).catch(e=>{if(e.code==='ENOENT')return null;throw e;});
+ const plan=schedule?schedule.effective_plan:await read(path.join(baseRun,'combined-media-plan.json'));
  const requests=[await read(path.join(baseRun,'frame-review-request.json'))],lineage=[];
  for(const run of extraRuns){
   plan.items.push(...(await read(path.join(run,'items.json'))).map(item=>bindFollowupQuote(item,transcript)));requests.push(await read(path.join(run,'frame-review-request.json')));

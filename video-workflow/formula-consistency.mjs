@@ -15,12 +15,18 @@ const normalize=value=>{
   }
   return String(total+section+number);
 };
-export function checkFormulaConsistency(markdown,sourceMath){
+export function checkFormulaConsistency(markdown,sourceMath,{preservedSource=[]}={}){
   const pairs=new Set();
   const atomic=String.raw`(?:\{([a-zA-Z]|\d+)\}|([a-zA-Z]|\d))`;
   const fraction=new RegExp(String.raw`\\(?:dfrac|tfrac|frac)\s*`+atomic+String.raw`\s*`+atomic,'gu');
   for(const math of sourceMath){
     for(const m of math.matchAll(fraction))pairs.add(normalize(m[1]||m[2])+'/'+normalize(m[3]||m[4]));
+  }
+  // Independently attributed source conflicts may contain both orientations.
+  // Accept only orientations literally present there, never waive new claims.
+  for(const text of preservedSource){
+    for(const m of text.matchAll(/([a-zA-Z]|\d+|[零一二两三四五六七八九十百千万亿]+)\s*分之\s*([a-zA-Z]|\d+|[零一二两三四五六七八九十百千万亿]+)/gu))
+      pairs.add(normalize(m[2])+'/'+normalize(m[1]));
   }
   const issues=[];
   markdown.split('\n').forEach((line,index)=>{

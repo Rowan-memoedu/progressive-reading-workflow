@@ -1,5 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+test('only independently preserved spoken source variants are exempt from fraction inversion checks',()=>{
+  const source=['$\\frac{3}{7}$'];
+  assert.equal(checkFormulaConsistency('三分之七',source).status,'needs_review');
+  assert.equal(checkFormulaConsistency('三分之七',source,{preservedSource:['讲师说三分之七。']}).status,'passed');
+  assert.equal(checkFormulaConsistency('三分之七',source,{preservedSource:['讲师说三分之八。']}).status,'needs_review');
+});
 import {checkFormulaConsistency} from './formula-consistency.mjs';
 
 test('compound spoken denominators are not mistaken for atomic inverse fractions',()=>{

@@ -39,6 +39,17 @@ def verify(source):
     assert terminology==receipt.get('terminology_applications',[])
     for note in ledger['formula_notes']:
         expected['segments'][note['after_segment_index']]['text']+='\n'+note['text']
+    for item in ledger.get('source_conflicts',[]):
+        import re
+        quotes=[]
+        for caption in item['captions']:
+            index=caption['segment_index']
+            assert original['segments'][index]['text']==caption['before'] and index not in changed
+            quotes.append('原字幕（'+original['segments'][index]['start']+'）：'+caption['before'])
+        literal='\n'.join(quotes+['同段画面：'+item['observed'],'两者关系：'+item['reason']])
+        fence='`'*max([3]+[len(m.group())+1 for m in re.finditer(r'`+',literal)])
+        note='原视频此处的表述：\n'+fence+'text\n'+literal+'\n'+fence+'\n\n'
+        expected['segments'][item['captions'][0]['segment_index']]['text']+='\n'+note
     assert actual==expected, 'Unrecorded source edits or missing speech'
     assert [(s['start'],s['end']) for s in actual['segments']]==[(s['start'],s['end']) for s in original['segments']]
     raw_request=Path(receipt['raw_frame_request']) if receipt.get('raw_frame_request') else Path(receipt['run_dir']).parents[1]/'frame-review-request.json'

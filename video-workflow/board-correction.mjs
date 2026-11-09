@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import {sourceConflictNotes} from './source-conflicts.mjs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {checkFormulaConsistency} from './formula-consistency.mjs';
@@ -93,6 +94,7 @@ export async function prepareBoardCorrection({inputDir,outputDir,transcript,plan
   const terminology=[];
   for(const term of ledger.terminology_corrections||[]){
     if(!term.before?.trim()||!term.after?.trim()||term.before===term.after||!term.evidence?.length||!term.evidence.every(id=>evidence.has(id)))throw Error('board_terminology_not_bound');
+    if((ledger.source_conflicts||[]).some(item=>item.captions.some(c=>c.before.includes(term.before))))throw Error('source_conflict_was_modified');
     const indices=[];
     corrected.segments.forEach((segment,index)=>{
       if(segment.text.includes(term.before)){segment.text=segment.text.replaceAll(term.before,term.after);indices.push(index);}
@@ -104,6 +106,7 @@ export async function prepareBoardCorrection({inputDir,outputDir,transcript,plan
     if(!note.text?.trim())throw Error('board_formula_note_empty');
     corrected.segments[note.after_segment_index].text+='\n'+note.text;
   }
+  for(const note of sourceConflictNotes(ledger,transcript))corrected.segments[note.after_segment_index].text+='\n'+note.text;
   if(!ledger.patches.length&&!ledger.formula_notes.length&&ledger.no_correction_needed!==true)throw Error('board_review_conclusion_required');
   for(const change of ledger.diagram_corrections||[]){
     const original=effective.items.find(item=>item.kind==='mermaid'&&item.time===change.time);
