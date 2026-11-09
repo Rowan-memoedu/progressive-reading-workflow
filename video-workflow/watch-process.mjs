@@ -104,7 +104,7 @@ export async function prepareWatchSource(item,watch,artifactRoot,acquire=acquire
   return {sourceDir,jobDir};
 }
 
-export async function processWatchItem(item,watch,{artifactRoot=WATCH_ARTIFACTS,acquire,runFlow=runWatchedIllustrated,command=execute}={}){
+export async function processWatchItem(item,watch,{artifactRoot=WATCH_ARTIFACTS,acquire,runFlow=runWatchedIllustrated,command=execute,onProgress=async()=>{}}={}){
   assertIllustratedWatch(watch);
   const jobDir=watchJobDir(artifactRoot,item),runDir=jobDir+'/run';
   // Fail before any body/guide call if the post-publication renderer is absent.
@@ -122,7 +122,7 @@ export async function processWatchItem(item,watch,{artifactRoot=WATCH_ARTIFACTS,
     try{await fs.access(item.publish_path);throw Error('publication_already_exists_without_matching_receipt');}
     catch(error){if(error.code!=='ENOENT')throw error;}
     await verifyUpstream();
-    try{receipt=await runFlow({item,watch,sourceDir,runDir,processingOptions:PROCESSING_OPTIONS});}
+    try{receipt=await runFlow({item,watch,sourceDir,runDir,processingOptions:PROCESSING_OPTIONS,onProgress});}
     catch(error){
       if(error.message==='target_login_snapshot_unavailable')return {status:'waiting_source',reason:error.message};
       throw error;
@@ -135,6 +135,7 @@ export async function processWatchItem(item,watch,{artifactRoot=WATCH_ARTIFACTS,
   const actualRun=receipt.board_correction?.run_dir||runDir,actualSource=receipt.board_correction?.source_dir||sourceDir;
   const publication=await read(actualRun+'/video-receipt.json');
   if(publication.refinement?.mode!=='strong_structuring'||publication.reading_guide?.status!=='generated')throw Error('unexpected_video_watch_body_or_guide');
+  await onProgress({stage:'verify_publication',part:item.part});
   await command(VIDEO_PYTHON,[root+'/verify-publication.py','--input',actualSource,'--run',actualRun,'--report',jobDir+'/independent-verification.json'],{windowsHide:true,maxBuffer:4*1024*1024});
   await command(VIDEO_PYTHON,[root+'/verify-rendering.py','--markdown',receipt.publication.path,'--output',jobDir+'/rendering'],{windowsHide:true,maxBuffer:4*1024*1024});
   const rendered=await read(jobDir+'/rendering/render-verification.json');

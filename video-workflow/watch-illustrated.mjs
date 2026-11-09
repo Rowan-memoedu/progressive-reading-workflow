@@ -7,6 +7,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {LiveCookieSnapshot,defaultCookieDataRoot} from '../scripts/live-cookie-snapshot.mjs';
 import {scopedNetscapeCookies} from './run-authenticated.mjs';
 import {importIllustratedStrong} from './illustrated-strong.mjs';
+import {automateBoardCorrection} from './automate-board-correction.mjs';
 
 export const WATCH_WORKFLOW='illustrated';
 export const WATCH_MODEL='gpt-6.1-sol';
@@ -50,7 +51,7 @@ export async function captureAndReview({inputDir,outputDir,cookiesFile,command=e
 }
 
 export async function runWatchedIllustrated({item,watch,sourceDir,runDir,processingOptions,
-  importFlow=importIllustratedStrong,cookies=withCaptureCookies,capture=captureAndReview}){
+  importFlow=importIllustratedStrong,cookies=withCaptureCookies,capture=captureAndReview,completeBoard=automateBoardCorrection,onProgress=async()=>{}}){
   assertIllustratedWatch(watch);
   const prompt=await fs.readFile(path.join(root,'../standard-preprocessing/prompts/强结构化整理.md'));
   if(hash(prompt)!==hash(await fs.readFile('D:/Projects/AudioWorkflow/prompts/refine.md')))throw Error('original_strong_prompt_changed');
@@ -67,8 +68,18 @@ export async function runWatchedIllustrated({item,watch,sourceDir,runDir,process
   const old=Object.fromEntries(Object.keys(settings).map(key=>[key,process.env[key]]));
   Object.assign(process.env,settings);
   try{
-    return await cookies(item.url,cookiesFile=>importFlow({inputDir:sourceDir,outputDir:runDir,publishPath:item.publish_path,
-      cookiesFile,pythonPath:VIDEO_PYTHON,processingOptions,
-      captureFrames:()=>capture({inputDir:sourceDir,outputDir:runDir,cookiesFile})}));
+    return await cookies(item.url,async cookiesFile=>{
+      const args={inputDir:sourceDir,outputDir:runDir,publishPath:item.publish_path,
+        cookiesFile,pythonPath:VIDEO_PYTHON,processingOptions,
+        captureFrames:()=>capture({inputDir:sourceDir,outputDir:runDir,cookiesFile})};
+      let receipt=await importFlow(args);
+      if(receipt.status==='needs_board_correction'){
+        await completeBoard({sourceDir,runDir,part:item.part||1,pythonPath:VIDEO_PYTHON,onProgress,
+          captureEvidence:({inputDir,outputDir})=>capture({inputDir,outputDir,cookiesFile})});
+        await onProgress({stage:'generate_body_and_guide',part:item.part});
+        receipt=await importFlow(args);
+      }
+      return receipt;
+    });
   }finally{for(const [key,value]of Object.entries(old))if(value===undefined)delete process.env[key];else process.env[key]=value;}
 }

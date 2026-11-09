@@ -3,7 +3,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { codeRoot, loadConfig, saveSource, deleteSource } from './config.mjs';
-import { status, enqueue, launchWorker, resolveMode, JOB_KINDS } from './service.mjs';
+import { status, enqueue, enqueueVideoRequest, launchWorker, resolveMode, JOB_KINDS } from './service.mjs';
 
 const assets = new Map([['/subscriptions',['index.html','text/html']],['/subscriptions/',['index.html','text/html']],
   ['/subscriptions/app.mjs',['app.mjs','text/javascript']],['/subscriptions/style.css',['style.css','text/css']]]);
@@ -38,6 +38,11 @@ export async function handleSubscriptions(req,res,root=codeRoot) {
       json(res,200,result);
     } else if(url.pathname==='/api/subscriptions/source/delete') {
       json(res,200,await deleteSource(root,input.id,{expectedRevision:input.revision}));
+    } else if(url.pathname==='/api/subscriptions/import-video') {
+      if (!(await loadConfig(root))?.enabled) throw new Error('后台队列已暂停');
+      const job=await enqueueVideoRequest(root,input,{retry:input.retry===true});
+      json(res,202,{id:job.id,status:job.status,request:job.request});
+      launchWorker(root).catch(error=>console.error('subscription_worker_start',error.message));
     } else if(url.pathname==='/api/subscriptions/run') {
       if(!JOB_KINDS.includes(input.kind))throw new Error('任务类型无效');
       if (!(await loadConfig(root))?.enabled) throw new Error('订阅流程已暂停');

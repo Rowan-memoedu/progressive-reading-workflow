@@ -3,9 +3,11 @@ const kinds={rss:'RSS / Atom',bilibili_video:'B 站多 P 视频',bilibili_collec
 const modes={standard_preprocess:'标准流程，自动入库',original_text:'提取原文，自动入库',reports:'日报 / 周报，勾选后入库'};
 const states={queued:'排队中',pending:'待处理',processing:'处理中',running:'运行中',waiting_source:'等待来源',blocked:'处理受阻',source_blocked:'来源受限',verification_failed:'待重新核验',retry_wait:'等待下个周期重试',completed:'完成',completed_with_issues:'完成，部分待处理',failed:'失败',route_conflict:'需要选择模式',awaiting_review:'等待勾选',imported:'已入库',imported_with_warnings:'已入库，有提示'};
 let current=null,editing=null,refreshing=false;
-const jobNames={rss:'RSS 检查',bilibili:'B 站检查',zhihu:'知乎检查',daily:'日报',weekly:'周报',decisions:'勾选处理',retry:'堵塞项重试'};
+const jobNames={rss:'RSS 检查',bilibili:'B 站检查',zhihu:'知乎检查',daily:'日报',weekly:'周报',decisions:'勾选处理',retry:'堵塞项重试',video_import:'视频图文导入'};
 const stepNames={scan:'检查来源',previews:'处理材料',decisions:'处理勾选',report:'生成报告',activity:'写入入库动态',
-  'apply-source-scopes':'应用接收范围','retry-rss':'重试 RSS','retry-bilibili':'重试 B 站','retry-zhihu':'重试知乎','retry-selections':'重试勾选项'};
+  'apply-source-scopes':'应用接收范围','retry-rss':'重试 RSS','retry-bilibili':'重试 B 站','retry-zhihu':'重试知乎','retry-selections':'重试勾选项',
+  prepare_visual_jobs:'整理板书证据',extract_and_independently_review:'板书校订与独立审阅',compile_source_evidence:'核对来源证据',supplement_board_evidence:'补充板书证据',
+  review_generated_diagrams:'核对图示',admit_reviewed_source:'准入已核验的校订',generate_body_and_guide:'生成正文与导读',verify_publication:'验收图文产物',board_blocked:'来源证据需要补充'};
 const trackedRuns=new Map();
 const sourceGroupOpen=new Map();
 function element(tag,text,cls){const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(cls)node.className=cls;return node;}
@@ -48,7 +50,7 @@ function runStatus(id,text,state=''){
 function showJob(id,job){
   const status=states[job.status]||job.status;
   const reason=job.error||job.result?.faults?.[0]?.error||job.result?.faults?.[0]?.reason;
-  const step=stepNames[job.current_step];
+  const step=stepNames[job.current_step]||(/^video-P\d+$/u.test(job.current_step||'')?'处理 '+job.current_step.slice(6):undefined);
   runStatus(id,`${jobNames[job.kind]} · ${status}${step?' · '+step:''}${reason?'。'+readableError(reason):''}`,
     job.status==='failed'||job.status==='completed_with_issues'?'error':job.status==='completed'?'success':'');
 }
@@ -62,6 +64,13 @@ async function submitRun(kind,id){
     if(id==='retry-run-status')$('job-history').open=true;
     await refresh();
   } catch(error) {runStatus(id,error.message,'error');}
+}
+async function retryVideo(job){
+  const id='retry-run-status';
+  runStatus(id,'视频图文导入 · 正在提交…');
+  const queued=await api('/api/subscriptions/import-video',{...job.request,retry:true});
+  trackedRuns.set(id,queued.id);showJob(id,{...queued,kind:'video_import'});
+  await refresh();
 }
 function render(data){current=data;if(!data.initialized){$('health').textContent='订阅尚未初始化。';return;}
   const heartbeat=data.heartbeat,late=heartbeat&&Date.now()-Date.parse(heartbeat.at)>90000;
@@ -101,9 +110,14 @@ function render(data){current=data;if(!data.initialized){$('health').textContent
   $('jobs').replaceChildren();for(const job of data.jobs){
     const row=element('li',`${jobNames[job.kind]} · ${states[job.status]||job.status} · ${new Date(job.created_at).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}`);
     if(job.error)row.append(element('p',job.error,'error'));
-    if(['failed','completed_with_issues'].includes(job.status)){
+    if(job.kind==='video_import'){
+      row.append(element('p','分 P：'+job.request.parts.join('、'),'hint'));
+      if(job.status==='running'&&job.progress)row.append(element('p',`P${job.progress.part} · ${stepNames[job.progress.stage]||'处理中'}`,'hint'));
+      for(const item of job.result?.results||[])row.append(element('p',`P${item.part} ${item.title} · ${states[item.status]||item.status}${item.reason?'：'+readableError(item.reason):''}`,item.status==='completed'?'hint':'error'));
+    }
+    if(['failed','blocked','completed_with_issues'].includes(job.status)){
       const actions=element('div',undefined,'actions');
-      actions.append(button('重试此任务',()=>submitRun(job.kind,'retry-run-status')));
+      actions.append(button('重试此任务',()=>job.kind==='video_import'?retryVideo(job):submitRun(job.kind,'retry-run-status')));
       row.append(actions);
     }
     $('jobs').append(row);

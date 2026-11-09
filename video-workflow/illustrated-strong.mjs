@@ -147,6 +147,8 @@ export async function importIllustratedStrong({inputDir,outputDir,publishPath,co
       return pending;
     }
     await command(pythonPath,['-u',path.join(root,'admit-board-correction.py'),'--input',corrected.inputDir,'--run',corrected.outputDir]);
+    await command(pythonPath,['-u',path.join(root,'verify-board-correction.py'),'--input',corrected.inputDir,
+      '--report',path.join(corrected.outputDir,'independent-board-verification.json')]);
     const capture=await readJson(path.join(corrected.outputDir,'capture-receipt.json'));
     const correctedSegments=parseTranscript(corrected.transcript.segments.map(s=>'['+s.start+'] segment').join('\n'));
     correctedSegments.forEach((segment,index)=>segment.text=corrected.transcript.segments[index].text);

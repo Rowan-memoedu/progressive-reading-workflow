@@ -21,6 +21,8 @@ def main():
     parser.add_argument('--ocr-root', type=Path)
     parser.add_argument('--group-size', type=int, default=6)
     args = parser.parse_args()
+    if args.group_size < 1:
+        raise ValueError('positive_board_group_size_required')
     transcript = json.loads(args.transcript.read_text('utf-8'))
     request = json.loads(args.frame_request.read_text('utf-8'))
     frames = request['frames']
@@ -55,9 +57,13 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     for shard in range(2):
         target = args.output / f'jobs-{shard}.jsonl'
-        with target.open('x', encoding='utf-8') as handle:
-            for job in jobs[shard::2]:
-                handle.write(json.dumps(job, ensure_ascii=False) + '\n')
+        data = ''.join(json.dumps(job, ensure_ascii=False) + '\n' for job in jobs[shard::2]).encode('utf-8')
+        try:
+            with target.open('xb') as handle:
+                handle.write(data)
+        except FileExistsError:
+            if target.read_bytes() != data:
+                raise ValueError('frozen_board_jobs_changed')
     print(json.dumps({'jobs': len(jobs), 'actual_image_inputs': sum(len(j['images']) for j in jobs)}))
 
 

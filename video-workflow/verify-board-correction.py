@@ -41,7 +41,7 @@ def verify(source):
         expected['segments'][note['after_segment_index']]['text']+='\n'+note['text']
     assert actual==expected, 'Unrecorded source edits or missing speech'
     assert [(s['start'],s['end']) for s in actual['segments']]==[(s['start'],s['end']) for s in original['segments']]
-    raw_request=Path(receipt['run_dir']).parents[1]/'frame-review-request.json'
+    raw_request=Path(receipt['raw_frame_request']) if receipt.get('raw_frame_request') else Path(receipt['run_dir']).parents[1]/'frame-review-request.json'
     assert digest(raw_request)==ledger['frame_request_sha256']
     request=json.loads(raw_request.read_text('utf-8'))
     assert len(ledger['frames'])==len(request['frames'])==receipt['reviewed_frames']

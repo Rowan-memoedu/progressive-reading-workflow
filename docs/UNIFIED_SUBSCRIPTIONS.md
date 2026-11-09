@@ -14,6 +14,10 @@
 
 B 站订阅支持指定视频分 P 和合集。视频筛选卡使用完整字幕，选中后再运行现有截图、图文正文和标准导读。无字幕时保留等待，不把简介当作全文。
 
+一次性转换指定分 P 不需要添加订阅。调用 `node subscription-workflow/cli.mjs import-video --url "https://www.bilibili.com/video/BVxxxxxxxxxx/" --parts "38,39,40" --destination "视频"`，或向 `/api/subscriptions/import-video` 提交 JSON `{ "url": "视频链接", "parts": [38,39,40], "destination": "视频" }`。任务进入同一持久队列，由现有后台 worker 执行；只处理列出的分 P，不扩展到整个视频或合集。重复提交返回同一任务，已成功的分 P 不重做。队列页显示每 P 的结果，显式重试复用成功步骤；来源、板书校订或质量阻塞会保存到异常记录并通知，不冒充已发布。
+
+数学视频的后台任务会自动继续板书证据提取、独立实图审阅和校订准入，再进入正文与导读。队列显示当前分 P 和校订、生成、验收阶段；整批均受阻时直接标为“处理受阻”。真实来源关键条件仍无法核清、校订未通过或输出验收失败时保留现场并通知，不把后台进程启动或截图取得当作完整转换成功。
+
 知乎适配层支持指定作者的新回答、文章与指定专栏。列表和正文均按实际请求地址复用现有 Chrome 登录快照，不隐式退回匿名访问。专栏采集复用 [RSSHub 专栏路由](https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/zhuanlan.ts)使用的专栏域名 API，并保留置顶文章、分页完整性和日期校验。作者端点参考维护中的 [RSSHub 回答路由](https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/answers.ts)与[文章路由](https://github.com/DIYgod/RSSHub/blob/master/lib/routes/zhihu/posts.ts)，携带与现有正文抓取相同的请求标识。作者分页地址仅在域名、作者和接口路径一致时从 HTTP 升级到 HTTPS；鉴权失败、越界分页及无法继续的分页仍报错。作者列表唯一条目数与平台总数不符或采集期间总数变化时，只记录非阻断异常并保留两者数量，已获取内容继续进入渐进阅读及日报、周报流程，不宣称历史全量完整。列表发现与单篇正文获取分别核验，不能用列表请求失败推断正文无法获取。
 
 专栏订阅同时接收专栏内的文章和回答。订阅检查中的专栏数量差异沿用非阻断异常规则，已获取正文继续处理；单次专栏全量导入仍保持原有严格数量校验。

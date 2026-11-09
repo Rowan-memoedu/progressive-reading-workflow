@@ -32,7 +32,16 @@ export async function prepareBoardCorrection({inputDir,outputDir,transcript,plan
   const ledger=await read(ledgerFile).catch(error=>{if(error.code==='ENOENT')return null;throw error;});
   if(!ledger)return null;
   const rawBytes=await fs.readFile(path.join(inputDir,'transcript.json'));
-  const requestFile=path.join(outputDir,'frame-review-request.json'),requestBytes=await fs.readFile(requestFile);
+  let requestFile=path.join(outputDir,'frame-review-request.json');
+  if(ledger.evidence_bundle){
+    const bundle=ledger.evidence_bundle,allowed=path.resolve(outputDir,'board-automation')+path.sep;
+    for(const file of [bundle.request_file,bundle.plan_file])if(!path.resolve(file).startsWith(allowed))throw Error('board_evidence_bundle_outside_run');
+    requestFile=path.resolve(bundle.request_file);
+    const bytes=await fs.readFile(bundle.plan_file);
+    if(hash(bytes)!==bundle.plan_sha256)throw Error('board_evidence_plan_changed');
+    plan=JSON.parse(bytes);
+  }
+  const requestBytes=await fs.readFile(requestFile);
   const request=JSON.parse(requestBytes);
   if(request.source_sha256!==hash(rawBytes)||request.video_id!==transcript.video_id)throw Error('board_frame_request_not_for_source');
   if(ledger.version!=='video-board-correction/v1'||ledger.accepted!==true||ledger.unresolved?.length
@@ -51,7 +60,7 @@ export async function prepareBoardCorrection({inputDir,outputDir,transcript,plan
     if(!candidate||hash(await fs.readFile(candidate.path))!==row.sha256)throw Error('board_image_changed:'+frame.file);
     const actual=candidate.actual_seconds;
     if(!Number.isFinite(actual)||actual<seconds(frame.requested_time)-0.1||actual>seconds(frame.window_end)+0.1)throw Error('board_candidate_outside_window');
-    const relative=path.relative(path.join(outputDir,'frame-candidates'),path.resolve(candidate.path));
+    const relative=path.relative(path.join(path.dirname(requestFile),'frame-candidates'),path.resolve(candidate.path));
     if(relative.startsWith('..')||path.isAbsolute(relative))throw Error('board_candidate_path_escape');
     evidence.set(frame.file,{...row,actual_seconds:actual});
     if(!row.use){
@@ -119,6 +128,7 @@ export async function prepareBoardCorrection({inputDir,outputDir,transcript,plan
   await exact(path.join(run,'frame-review.json'),json({version:'video-frame-review/v1',request_sha256:hash(correctedRequestBytes),
     frames:selected.map(({frame,row})=>({file:frame.file,selected_time:row.selected_time,sha256:row.sha256,matches_expected:true,observed:row.observed}))}));
   const receipt={version:ledger.version,status:'passed',raw_input_dir:path.resolve(inputDir).replaceAll('\\','/'),source_dir:source,run_dir:run,
+    raw_frame_request:requestFile,
     raw_transcript_sha256:hash(rawBytes),corrected_transcript_sha256:hash(correctedBytes),ledger_sha256:ledgerHash,
     raw_segments:transcript.segments.length,corrected_segments:corrected.segments.length,patches:ledger.patches.length,
     formula_notes:ledger.formula_notes.length,reviewed_frames:ledger.frames.length,used_frames:selected.length,

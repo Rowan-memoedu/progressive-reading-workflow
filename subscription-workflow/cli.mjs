@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { codeRoot, initialize, paths, loadConfig, writeJson, withLock } from './config.mjs';
-import { JOB_KINDS, enqueue, drain, status, initializeActivity, localDate } from './service.mjs';
+import { JOB_KINDS, enqueue, enqueueVideoRequest, launchWorker, drain, status, initializeActivity, localDate } from './service.mjs';
 
 export async function main(argv=process.argv.slice(2)) {
   const command=argv[0],options={};
@@ -11,6 +11,13 @@ export async function main(argv=process.argv.slice(2)) {
   if(command==='activate')return withLock(paths(root).config+'.lock',async()=>{const config=await loadConfig(root);if(!config)throw new Error('请先初始化');await initializeActivity(root);config.enabled=true;config.revision++;await writeJson(paths(root).config,config);return {status:'active'};});
   if(command==='status')return status(root);
   if(command==='drain')return drain(root);
+  if(command==='import-video') {
+    if (!(await loadConfig(root))?.enabled) throw new Error('后台队列已暂停');
+    const parts=options.parts ? options.parts.split(',').map(Number) : undefined;
+    const job=await enqueueVideoRequest(root,{url:options.url,parts,destination:options.destination},{retry:options.retry==='true'});
+    await launchWorker(root);
+    return {id:job.id,status:job.status,request:job.request};
+  }
   if(command==='run'||command==='enqueue') {
     if(!JOB_KINDS.includes(options.kind))throw new Error('需要 --kind rss|bilibili|zhihu|daily|weekly|decisions|retry');
     const job=await enqueue(root,options.kind,options.key||localDate());

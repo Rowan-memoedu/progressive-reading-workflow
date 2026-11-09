@@ -2,6 +2,21 @@ import importlib.util,json,unittest,tempfile
 from pathlib import Path
 s=importlib.util.spec_from_file_location('ledger',Path(__file__).with_name('assemble-board-ledger.py'));m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
 class WireTests(unittest.TestCase):
+ def test_retained_uncertainty_must_preserve_exact_source_and_cannot_hide_a_patch(self):
+  transcript={'segments':[{'start':'00:00:00','text':'回顾刚才的术语。'}]}
+  value={'review':{'verdict':'pass','issues':[]},'observations':[],'patches':[],'formula_notes':[],'unresolved':[],
+    'retained_uncertainties':[{'segment_index':0,'before':'回顾刚才的术语。','kind':'lexical_or_context_only','reason':'不涉及本题条件或公式。'}]}
+  row={'provider':'codex_exec','image_count':1,'id':'fixture','input':{'input':json.dumps({'main_range':[0,0]})},'output':json.dumps(value)}
+  ledger=m.compile_ledger(transcript,b'raw',{'frames':[]},b'request',[row],True)
+  self.assertEqual(ledger['retained_uncertainties'][0]['before'],transcript['segments'][0]['text'])
+  value['patches']=[{'segment_index':0,'before':'回顾刚才的术语。','after':'擅自替换名称','evidence':[]}]
+  row['output']=json.dumps(value)
+  with self.assertRaisesRegex(ValueError,'uncertainty_was_modified'):m.compile_ledger(transcript,b'raw',{'frames':[]},b'request',[row],True)
+ def test_core_mathematical_uncertainty_remains_blocking_even_with_a_pass_label(self):
+  value={'review':{'verdict':'pass','issues':[]},'observations':[],'patches':[],'formula_notes':[],'unresolved':['变量定义域无法核清']}
+  row={'provider':'codex_exec','image_count':1,'id':'fixture','input':{'input':json.dumps({'main_range':[0,0]})},'output':json.dumps(value)}
+  ledger=m.compile_ledger({'segments':[{'start':'00:00:00','text':'原条件'}]},b'raw',{'frames':[]},b'request',[row],True)
+  self.assertTrue(ledger['unresolved']);self.assertFalse(ledger['accepted'])
  def test_inexact_source_proposals_are_retained_for_review_but_never_applied(self):
   with tempfile.TemporaryDirectory(dir=r'D:\Artifacts\ProgressiveReading',prefix='ledger-source-test-') as directory:
    image=Path(directory)/'fixture.png';image.write_bytes(b'controlled image bytes')

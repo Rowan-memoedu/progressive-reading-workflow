@@ -7,9 +7,10 @@ import { paths, codeRoot, loadConfig, readJson, writeJson, withLock, digest, pla
 import { scanRss, scanVideos, scanZhihu, advanceAuto, withAutoImporter } from './adapters.mjs';
 import { generateSummaries, prepareSubscriptionPreviews, processMarkdownDecisions } from '../rss-reading/core.mjs';
 import { publicationMetadata } from './publication-time.mjs';
+import { normalizeVideoRequest, runVideoRequest } from './video-request.mjs';
 
 const execute = promisify(execFile);
-export const JOB_KINDS = ['rss','bilibili','zhihu','daily','weekly','decisions','retry'];
+export const JOB_KINDS = ['rss','bilibili','zhihu','daily','weekly','decisions','retry','video_import'];
 export const localDate = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 export function weekKey(date=localDate()) {
   const day=new Date(date+'T00:00:00Z');day.setUTCDate(day.getUTCDate()+4-(day.getUTCDay()||7));
@@ -29,6 +30,7 @@ export async function jobList(root = codeRoot) {
 
 export async function enqueue(root, kind, key = localDate()) {
   if (!JOB_KINDS.includes(kind)) throw new Error('未知订阅任务');
+  if (kind === 'video_import') throw new Error('单次视频导入请提供链接和精确分 P 范围');
   const p = paths(root), id = digest(`${kind}:${key}`).slice(0,32), file = path.join(p.jobs,id+'.json');
   return withLock(path.join(p.home,'enqueue.lock'), async () => {
     if (key.startsWith('manual-')) {
@@ -38,6 +40,25 @@ export async function enqueue(root, kind, key = localDate()) {
     const existing = await readJson(file);
     if (existing) return existing;
     const job = { id, kind, cycle: key, status: 'queued', created_at: stamp(), steps: {} };
+    await writeJson(file,job); return job;
+  });
+}
+
+export async function enqueueVideoRequest(root, input, { retry = false } = {}) {
+  const request = normalizeVideoRequest(root,input), p = paths(root);
+  const id = digest('video_import:'+JSON.stringify(request)).slice(0,32);
+  return withLock(path.join(p.home,'enqueue.lock'),async()=>{
+    const file = path.join(p.jobs,id+'.json'), previous = await readJson(file);
+    if (previous) {
+      if (!retry || ['queued','running'].includes(previous.status)) return previous;
+      for (const [name,step] of Object.entries(previous.steps || {})) {
+        if (name.startsWith('video-P') && step.result?.status !== 'completed') delete previous.steps[name];
+      }
+      previous.status='queued'; previous.retried_at=stamp();
+      delete previous.completed_at; delete previous.error; delete previous.result; delete previous.current_step;
+      await writeJson(file,previous); return previous;
+    }
+    const job = { id, kind:'video_import', cycle:'one-off-'+id, request, status:'queued', created_at:stamp(), steps:{} };
     await writeJson(file,job); return job;
   });
 }
@@ -203,6 +224,14 @@ async function runJob(root, job, save) {
     console.log(JSON.stringify({ event:'subscription_step',kind:job.kind,step:name }));
     const result = await action(); job.steps[name] = { done:true, result }; await save(); return result;
   };
+  if (job.kind === 'video_import') {
+    const result = await runVideoRequest(root,job.request,step,{onProgress:async progress=>{
+      job.progress={...progress,at:stamp()};await save();
+    }});
+    await noticeFaults(root,'video_import',result.faults);
+    if (!result.faults.length) await notify(root,'video_import:'+job.id,'视频图文导入完成',`${result.results.length} 个分 P 已进入阅读区。`);
+    return result;
+  }
   if (job.kind === 'retry') {
     const config = await loadConfig(root);
     const kinds = new Set(config.subscriptions.filter(source=>source.enabled).map(platform));
