@@ -54,7 +54,7 @@ flowchart TD
 
 2026-10-06：两种正文方式共用 `lib/full-text-body.mjs` 与 `refine-full-text.py`，先完成全文正文，再进入原有翻译、导读和发布流程。`plan.body_mode` 记录本次实际采用 `preserve / spoken_to_written / strong_structuring`，与来源网站无关。
 
-- **强结构化整理**：[同名提示词](../prompts/强结构化整理.md)原样留存 AudioWorkflow 的 `prompts/refine.md`，SHA-256 为 `c996ee91a7e23aa3b98a1685cf90df7ff51e5655943416da434cea3fd26c9dc8`。只设置新名称，不改提示词正文；“录音”的原始措辞也保持原样。选择这一需求后，完整字幕或文字资料均作为素材处理。
+- **强结构化整理**：[同名提示词](../prompts/强结构化整理.md)对齐 AudioWorkflow 的 `prompts/refine-non-writing.md`，由 AsyncWorkflow 的共同保真与非写作规则组合。显式选择此模式后直接处理完整字幕或文字资料，不调用写作决策；保留讲解步骤、例子、副词及限定。副本通过 AudioWorkflow 的 `prompt_alignment.py` 核对，旧冻结输入与成功结果不改写。
 - **全文口语转书面**：[提示词](../prompts/spoken-to-written-fulltext-v1.md)保留原无损书面化的观点、例子、数字、限定、视角与保护语法要求，将全文一次输入，输出连贯段落。信息无损不等于逐字保留口语，需要重组句子、理顺指代并去掉现场互动。必须按内容生成 `##` / `###` 小标题，原有准确标题可以保留；不要求多层项目符号。响应缺少小标题时保存失败现场，不自动重跑。
 - 已有稿件仅缺少标题时，可用 `lib/restore-content-headings.mjs` 根据同一材料已有标题及顺序一致的文字证据做本地格式修复；无法确定位置的标题不猜放。只插入标题，逐字符验证其余正文不变，记录修复前后哈希，不调用模型。
 - 两者复用 AudioWorkflow 的单次非思考调用；强结构化同时复用原 `AI.outline_call`。代码、Mermaid、公式和文件引用以确定性标记保护并原位恢复，丢失标记时停止，不自动重生。

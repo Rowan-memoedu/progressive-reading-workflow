@@ -54,7 +54,7 @@ export async function runWatchedIllustrated({item,watch,sourceDir,runDir,process
   importFlow=importIllustratedStrong,cookies=withCaptureCookies,capture=captureAndReview,completeBoard=automateBoardCorrection,onProgress=async()=>{}}){
   assertIllustratedWatch(watch);
   const prompt=await fs.readFile(path.join(root,'../standard-preprocessing/prompts/强结构化整理.md'));
-  if(hash(prompt)!==hash(await fs.readFile('D:/Projects/AudioWorkflow/prompts/refine.md')))throw Error('original_strong_prompt_changed');
+  if(hash(prompt)!==hash(await fs.readFile('D:/Projects/AudioWorkflow/prompts/refine-non-writing.md')))throw Error('non_writing_prompt_alignment_mismatch');
   await fs.mkdir(runDir,{recursive:true});
   const identity={version:'video-watch-illustrated/v1',entry:'importIllustratedStrong',provider:'codex_exec',model:watch.model,
     source:'full_part_transcript',body_prompt_sha256:hash(prompt),media_policy:watch.media_policy,

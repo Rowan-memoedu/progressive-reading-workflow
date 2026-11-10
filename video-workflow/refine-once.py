@@ -1,4 +1,4 @@
-"""Use AudioWorkflow's unmodified prompt and single-call implementation."""
+"""Use the aligned non-writing prompt and single-call implementation; no classification."""
 import argparse
 import hashlib
 import importlib.util
@@ -28,7 +28,7 @@ def main():
     args = parser.parse_args()
     target = args.output.resolve()
     target.mkdir(parents=True, exist_ok=True)
-    prompt_path = args.audio_project / 'prompts/refine.md'
+    prompt_path = args.audio_project / 'prompts/refine-non-writing.md'
     module_path = args.audio_project / 'audio_workflow.py'
     prompt_bytes, input_bytes = prompt_path.read_bytes(), args.input.read_bytes()
     prompt, transcript = prompt_bytes.decode('utf-8'), input_bytes.decode('utf-8')

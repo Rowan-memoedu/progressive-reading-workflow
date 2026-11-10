@@ -14,9 +14,12 @@ function input(form,options) {
     processingOptions:standardWorkflowOptions({translate:false,include_reading_guide:false,...options})});
 }
 
-test('strong prompt is byte-identical to the retained original, with its new name',async()=>{
+test('strong prompt matches the shared non-writing contract without a classification stage',async()=>{
   const prompt=await fs.readFile(new URL('../prompts/强结构化整理.md',import.meta.url));
-  assert.equal(sha(prompt),'c996ee91a7e23aa3b98a1685cf90df7ff51e5655943416da434cea3fd26c9dc8');
+  // Product copy remains self-contained; local cross-project parity is checked
+  // by AudioWorkflow's prompt_alignment.py, not by a portable repository test.
+  assert.match(prompt.toString('utf8'),/保留中间步骤、不同方法/u);
+  assert.doesNotMatch(prompt.toString('utf8'),/decisions|writing：|non_writing：/u);
 });
 
 for(const form of ['written','spoken_transcript']) {

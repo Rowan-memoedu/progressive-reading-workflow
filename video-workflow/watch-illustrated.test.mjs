@@ -73,7 +73,7 @@ test('scheduler calls the shared illustrated entry with unchanged prompt and one
   assert.equal(receipt.status,'completed');assert.equal(calls,1);assert.equal(captures,1);assert.equal(process.env.AI_PRODUCER_CODEX_MODEL,before);
   const identity=JSON.parse(await fs.readFile(root+'/run/watch-pipeline.json','utf8'));
   assert.equal(identity.entry,'importIllustratedStrong');
-  assert.equal(identity.body_prompt_sha256,hash(await fs.readFile('D:/Projects/AudioWorkflow/prompts/refine.md')));
+  assert.equal(identity.body_prompt_sha256,hash(await fs.readFile('D:/Projects/AudioWorkflow/prompts/refine-non-writing.md')));
 });
 test('a prebuilt book is never selected for illustrated automation and exact cid is mandatory',async()=>{
   const root=await makeRoot(),item={bvid:'BV1234567890',cid:42,url:'https://www.bilibili.com/video/BV1234567890/'};
