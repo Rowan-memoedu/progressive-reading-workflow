@@ -81,7 +81,7 @@ async function organizeUnlocked(root,settings,collection,id,{broker,onProgress=a
   // A previous reader batch may have moved files before its client lost the
   // response. Reuse verified actual locations and finish reference repair.
   const actualPaths=new Set([...current.values()].map(row=>row.artifacts.find(a=>a.kind==='markdown').path));
-  for(const previous of await listRuns(root)){if(previous.source_id!==settings.id)continue;const old=await readJson(path.join(runPath(root,previous.id),'organization.json'));if(old?.status!=='running')continue;for(const move of old.moves||[])if(actualPaths.has(move.target)&&!await exists(move.source)&&await exists(move.target))mapping.set(move.source,mapping.get(move.target)||move.target);}
+  for(const previous of history){const old=await readJson(path.join(runPath(root,previous.id),'organization.json'));if(old?.status==='completed')break;if(old?.status!=='running')continue;for(const move of old.moves||[])if(actualPaths.has(move.target)&&!await exists(move.source)&&await exists(move.target))mapping.set(move.source,mapping.get(move.target)||move.target);}
   for(const move of moves){const text=await fs.readFile(move.source,'utf8');if(digest(text)!==move.sha256)throw new Error('文章已发生变更，未移动：'+move.source);move.expected=relocatedMarkdown(text,move.source,move.target,mapping,root);await fs.writeFile(path.join(recovery,digest(move.source)+'.md'),text);}
   saved={status:'running',moves:moves.map(({expected,...m})=>m),duplicates,mapping:[...mapping],recovery,ownedIndexes};await writeJson(journal,saved);
   await onProgress('同步阅读状态和引用链接');
@@ -98,6 +98,7 @@ async function executeOrganization(root,collection,journal,saved,broker){
     const sidecar=path.join(root,'.local-ir/browser-document-state',path.basename(duplicate.source)+'.browser-ir.json'),stateBackup=path.join(recovery,'duplicate-'+digest(duplicate.source)+'.state.json');if(await exists(stateBackup)&&!await exists(sidecar))await fs.rename(stateBackup,sidecar);
   }
   const duplicates=saved.duplicates.filter(d=>locationKey(d.source)!==locationKey(d.winner));
+  if(!saved.moves.length&&!duplicates.length&&!mapping.size){saved={...saved,status:'completed',same_location_restored:(saved.same_location_restored||0)+restored,mapping:[],hashes:[],host:{available:false},moved:0,duplicates_retired:0,groups:taxonomyGroups(collection.inventory.articles).map(g=>({kind:g.kind,name:g.name,folder:g.folder,count:g.articles.length}))};await writeJson(journal,saved);return saved;}
   for(const move of saved.moves){const before=await fs.readFile(path.join(recovery,digest(move.source)+'.md'),'utf8');moves.push({...move,expected:relocatedMarkdown(before,move.source,move.target,mapping,root)});}
   const host=await moveInReadingHost(root,moves.filter(m=>!m.done),recovery,duplicates.map(d=>d.source));
   for(const move of moves){if(await exists(move.source)){await fs.mkdir(path.dirname(move.target),{recursive:true});await replaceChecked(move.target,null,move.expected);if(digest(await fs.readFile(move.source))!==move.sha256)throw new Error('移动时文章发生变化');await fs.unlink(move.source);}let actual=await fs.readFile(move.target,'utf8');if(actual!==move.expected&&digest(actual)===move.sha256){await replaceChecked(move.target,actual,move.expected);actual=move.expected;}if(actual!==move.expected)throw new Error('移动后的正文与链接核验未通过：'+move.target);}
@@ -105,7 +106,7 @@ async function executeOrganization(root,collection,journal,saved,broker){
   const hashes=new Map();for(const target of new Set(mapping.values()))hashes.set(target,digest(await fs.readFile(target)));
   // Repair article/report links and persisted receipts; source text and model
   // caches are immutable inputs, so only active reading/runtime state is touched.
-  for(const zone of ['阅读区','待归档原文','已归档原文','摘要区'])for(const file of await walk(path.join(root,zone))){if(!file.endsWith('.md'))continue;const before=await fs.readFile(file,'utf8'),after=relocatedMarkdown(before,file,file,mapping,root);if(after!==before){await fs.writeFile(path.join(recovery,digest(file)+'.reference.md'),before);await replaceChecked(file,before,after);hashes.set(file,digest(after));}}
+  if(moves.length||duplicates.length)for(const zone of ['阅读区','待归档原文','已归档原文','摘要区'])for(const file of await walk(path.join(root,zone))){if(!file.endsWith('.md'))continue;const before=await fs.readFile(file,'utf8'),after=relocatedMarkdown(before,file,file,mapping,root);if(after!==before){await fs.writeFile(path.join(recovery,digest(file)+'.reference.md'),before);await replaceChecked(file,before,after);hashes.set(file,digest(after));}}
   const config=await loadConfig(root),metadata=new Set([path.join(root,'imports/rss-reading/review-ledger.v1.json')]);
   for(const file of await walk(path.join(root,'.local-ir/browser-document-state')))if(file.endsWith('.json'))metadata.add(file);
   if(config){metadata.add(path.join(config.rss_home,'state.json'));metadata.add(path.join(paths(root).home,'activity.json'));}

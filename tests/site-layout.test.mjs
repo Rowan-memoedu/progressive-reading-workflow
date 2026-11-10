@@ -67,7 +67,7 @@ test('a later completed migration prevents replaying an older obsolete move',asy
   const env=process.env.NODE_ENV;process.env.NODE_ENV='test';const root=await fs.mkdtemp('D:/Artifacts/ProgressiveReading/layout-obsolete-');
   try{const source={id:'resume',destination:'整站/Independent'},url='https://obsolete-layout.test/post',file=path.join(root,'已归档原文','article.md'),text='---\nsource_url: '+url+'\n---\n已读正文';await fs.mkdir(path.dirname(file),{recursive:true});await fs.writeFile(file,text);
     const old=runId('obsolete'),done=runId('done');await saveRun(root,{id:old,source_id:source.id,created_at:'2026-01-01',results:[]});await writeJson(path.join(runPath(root,old),'organization.json'),{status:'running',moves:[{source:'missing-old-reading-file',target:'missing-old-destination'}],recovery:'missing'});await saveRun(root,{id:done,source_id:source.id,created_at:'2026-01-02',results:[]});await writeJson(path.join(runPath(root,done),'organization.json'),{status:'completed'});
-    const collection={inventory:{articles:[{url,taxonomy:articleTaxonomy({tags:['Topic']})}]},results:[sourceReuseResult(url,await findSourcePublication(root,url))]};const report=await organizeSiteFiles(root,source,collection,runId('new'));assert.equal(report.moved,0);assert.equal(collection.results[0].artifacts[0].path,file);
+    const collection={inventory:{articles:[{url,taxonomy:articleTaxonomy({tags:['Topic']})}]},results:[sourceReuseResult(url,await findSourcePublication(root,url))]};const report=await organizeSiteFiles(root,source,collection,runId('new'));assert.equal(report.moved,0);assert.equal(report.mapping.length,0);assert.equal(collection.results[0].artifacts[0].path,file);
   }finally{if(env===undefined)delete process.env.NODE_ENV;else process.env.NODE_ENV=env;}
 });
 
