@@ -51,7 +51,7 @@ async function main() {
     const base = `http://127.0.0.1:${port}`;
     await waitFor(`${base}/api/learning/projects`);
     let page = await fetch(base);
-    assert.ok((await page.text()).includes("项目学习编排"));
+    assert.ok((await page.text()).includes("GitHub 项目学习"));
     let response = await fetch(`${base}/api/learning/projects`);
     let body = await response.json();
     assert.deepEqual(body.projects, []);

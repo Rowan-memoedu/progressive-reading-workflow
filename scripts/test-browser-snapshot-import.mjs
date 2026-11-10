@@ -28,6 +28,18 @@ try {
   assert.ok(markdown.includes("$a_1$"));
   assert.ok(markdown.includes("$$\n\\begin{pmatrix}a&b\\\\c&d\\end{pmatrix}\n$$"), "Chinese non-translation publication must preserve display math and matrix row separators");
   assert.equal(fixture.hits.length,0,"snapshot import must not refetch the URL");
+  const duplicate=await json('/api/highlights/import-local',{...payload,client_request_id:'snapshot-other-entry'});
+  let replay;
+  for(let i=0;i<100;i++){const request=await json('/api/browser-import/requests/'+duplicate.request_id);if(request.terminal){replay=request.results[0];break;}await new Promise(resolve=>setTimeout(resolve,100));}
+  assert.equal(replay?.status,'idempotent_replay');
+  assert.equal(replay.receipt.model_calls,0);
+  assert.equal(replay.artifacts[0].path,result.artifacts[0].path);
+  assert.equal(await fs.readFile(replay.artifacts[0].path,'utf8'),markdown,'ordinary snapshot import preserves existing content');
+  const legacyForce=await json('/api/highlights/import-local',{...payload,client_request_id:'snapshot-legacy-explicit-reimport',draft:{...draft,html:draft.html.replace('</article>','<p>用户明确重新导入时新增的来源内容。</p></article>'),locked:false,submittedAt:new Date().toISOString(),receipt:result,importJob:{clientRequestId:'legacy-explicit'}}});
+  let replaced;
+  for(let i=0;i<100;i++){const request=await json('/api/browser-import/requests/'+legacyForce.request_id);if(request.terminal){replaced=request.results[0];break;}await new Promise(resolve=>setTimeout(resolve,100));}
+  assert.equal(replaced?.status,'saved_locked','already-loaded extension workers retain explicit reimport support');
+  assert.match(await fs.readFile(replaced.artifacts[0].path,'utf8'),/用户明确重新导入时新增的来源内容/u);
   const brokerRoot=fixture.workflowRoot+"/.local-ir/browser-import-broker";
   // The runtime health describes the authoritative broker location.
   const health=await json("/api/highlights/health");

@@ -18,11 +18,14 @@ import { loadProducerConfig as loadUnifiedProducerConfig, requestProducerText } 
 import { classifyStandardImportQuality, readingDocumentPathCandidates } from "./standard-import-quality.mjs";
 import { htmlArticleToMarkdown } from "./browser-page-markdown.mjs";
 import { extractUrls, urlImportDedupeKey } from "./url-import-input.mjs";
+import { findSourcePublication, withSourcePublication, sourceReuseResult } from './reading-source-library.mjs';
 import { IMPORT_RULES, zhihuColumnIdentity } from "./import-rule-catalog.mjs";
 import { discoverZhihuColumn } from "./zhihu-column-import.mjs";
 import { assertLocalRequest, handleSubscriptions } from '../subscription-workflow/http.mjs';
 import { startSubscriptionWorker } from '../subscription-workflow/service.mjs';
 import { processCollectionTask } from "./collection-import.mjs";
+import { handleImportCenter } from '../site-import/http.mjs';
+import { processSiteTask, capturedArticle } from '../site-import/tasks.mjs';
 import { fetchYoutubeSubtitleDraft, youtubeVideoIdentity } from "./youtube-subtitle-import.mjs";
 import { LiveCookieSnapshot, defaultCookieDataRoot, COOKIE_SNAPSHOT_ENDPOINT, COOKIE_STATUS_ENDPOINT, safeError as safeCookieSnapshotError } from "./live-cookie-snapshot.mjs";
 import {
@@ -1079,6 +1082,7 @@ async function standardizeBrowserDraft(draft, parsedUrl, converted, onProgress) 
   const conversionMethod = `progressive_reading_preprocess/${processorVersion}`;
   const markdown = updateFrontmatterFields(rendered, {
     source_url: String(draft.sourceMetadata?.source_url || parsedUrl.href),
+    canonical_url: String(draft.sourceMetadata?.canonical_url || parsedUrl.href),
     source_title: converted.title || draft.title,
     import_method: draft.sourceMetadata?.source_type === 'youtube_video_transcript' ? 'youtube_subtitle_standard_preprocess' : "browser_standard_preprocess",
     highlight_mode: "virtual_metadata",
@@ -1401,10 +1405,25 @@ async function writeBrowserDraftCommit(rawBody, destination = "reading", options
   } catch {
     // Invalid input is still serialized under its raw value and rejected by the core validator.
   }
-  return withBrowserCommitLock(lockKey, () => writeBrowserDraftCommitUnlocked(rawBody, destination, options));
+  return withBrowserCommitLock(lockKey, () => withSourcePublication(workflowRoot, rawUrl, async () => {
+    if (destination === 'reading') {
+      const existing = await findSourcePublication(workflowRoot, rawUrl);
+      if (existing) {
+        const draft = rawBody?.draft || {};
+        const desiredRoot = draft.destinationFolder ? readingDestinationRoot(draft.destinationFolder) : browserHighlightRoot;
+        const explicitReimport = draft.importJob?.forceReimport === true
+          || (draft.importJob?.forceReimport === undefined && Boolean(draft.submittedAt && draft.receipt) && draft.locked === false);
+        // The current-page edit/reimport keeps its existing same-folder document.
+        // Other entry routes and all URL-only imports reuse the actual library path.
+        if (draft.sourceType === 'url_import' || (options.standardize !== false && (!explicitReimport
+          || path.dirname(existing.path) !== path.resolve(desiredRoot)))) return sourceReuseResult(rawUrl, existing);
+      }
+    }
+    return writeBrowserDraftCommitUnlocked(rawBody, destination, options);
+  }));
 }
 
-async function importUrlThroughStandardWorkflow(url, { userInstruction = "", destinationFolder = "", processingMode = 'standard_preprocess', processingOptions = {}, pendingInputPath = null, cachedRssDraft = null, onProgress } = {}) {
+async function importUrlThroughStandardWorkflow(url, { userInstruction = "", destinationFolder = "", processingMode = 'standard_preprocess', processingOptions = {}, pendingInputPath = null, cachedRssDraft = null, articleSource = null, onProgress } = {}) {
   if (!['standard_preprocess','original_text'].includes(processingMode)) throw new Error('unsupported_url_processing_mode');
   let fetched;
   if (pendingInputPath) {
@@ -1415,6 +1434,11 @@ async function importUrlThroughStandardWorkflow(url, { userInstruction = "", des
   } else if (cachedRssDraft) {
     fetched = { requestedUrl:url, finalUrl:url, redirectChain:[],
       draft:cachedRssDraft, fetchReceipt:{ source_reused:"retained_rss_fulltext", browser_tab_created:false } };
+  } else if (articleSource) {
+    const source=await capturedArticle(workflowRoot,articleSource,url);
+    fetched={requestedUrl:url,finalUrl:url,redirectChain:[],draft:{id:'site-'+shortHash(url),url,title:source.title,sourceType:'url_import',pageText:source.markdown,cachedRssMarkdown:source.markdown,
+      sourceMetadata:{source_url:url,canonical_url:url,input_form:'written',title:source.title,capture_agent:'verified_site_source',source_response:source.source_response,published_at:source.metadata?.published_at||null}},
+      fetchReceipt:{source_reused:'verified_site_capture',source_response:source.source_response,browser_tab_created:false}};
   } else fetched = await fetchUrlImportDraft(url);
   fetched.draft.userInstruction = String(userInstruction || "");
   fetched.draft.destinationFolder = normalizeRelativeDestinationFolder(destinationFolder);
@@ -1586,7 +1610,7 @@ async function processBackgroundImportWorker(requestId, workerIndex) {
     if (!task) {
       const request = await browserImportBroker.getRequest(requestId);
       if (!request || request.terminal) break;
-      await browserImportBroker.waitForTask(25000, { transport: BACKGROUND_FETCH_TRANSPORT });
+      await browserImportBroker.waitForTask(25000, { transport: BACKGROUND_FETCH_TRANSPORT, requestId });
       continue;
     }
     let currentStage = task.capture_mode === "page_snapshot" ? "capture_conversion" : "source_fetch";
@@ -1607,6 +1631,10 @@ async function processBackgroundImportWorker(requestId, workerIndex) {
           await browserImportBroker.completeTask(task.id, { ok: true, result, leaseToken: task.lease_token });
           return;
         }
+        if (task.site_import) {
+          await processSiteTask(workflowRoot,task,{broker:browserImportBroker,runRequest:processBackgroundImportRequest});
+          return;
+        }
         if (zhihuColumnIdentity(task.requested_url) && task.processing_mode !== 'original_text') {
           await processCollectionTask(task, {
             broker: browserImportBroker,
@@ -1615,7 +1643,12 @@ async function processBackgroundImportWorker(requestId, workerIndex) {
           });
           return;
         }
-        const existing = await browserImportBroker.findSuccessfulResultForUrl(task.requested_url, {
+        const libraryPublication = task.article_source ? null : await findSourcePublication(workflowRoot, task.requested_url);
+        if (libraryPublication) {
+          await browserImportBroker.completeTask(task.id, { ok: true, result: sourceReuseResult(task.requested_url, libraryPublication), leaseToken: task.lease_token });
+          return;
+        }
+        const existing = task.article_source ? null : await browserImportBroker.findSuccessfulResultForUrl(task.requested_url, {
           excludeTaskId: task.id
         }) || await findReadyDocumentStateImportForUrl(task.requested_url);
         const destinationFolder = importDestinationFolder({
@@ -1638,6 +1671,7 @@ async function processBackgroundImportWorker(requestId, workerIndex) {
             processingOptions: task.processing_options || {},
             pendingInputPath: task.pending_input_path || null,
             cachedRssDraft: retainedRss ? (await browserImportBroker.getTaskSnapshot(task.id)).draft : null,
+            articleSource: task.article_source || null,
             onProgress
           });
         await browserImportBroker.completeTask(task.id, {
@@ -2516,374 +2550,6 @@ function browserHighlightTestHtml() {
 </html>`;
 }
 
-function html() {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>渐进阅读导入</title>
-  <style>
-    :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; }
-    body { margin: 0; background: #f6f7f9; color: #1d2430; }
-    main { max-width: 1180px; margin: 0 auto; padding: 24px; }
-    h1 { font-size: 24px; line-height: 1.2; margin: 0 0 6px; font-weight: 650; letter-spacing: 0; }
-    .subtitle { margin: 0 0 18px; color: #667085; font-size: 14px; }
-    .layout { display: grid; grid-template-columns: minmax(0, 1.16fr) minmax(340px, .84fr); gap: 16px; align-items: start; }
-    section { background: #fff; border: 1px solid #d9dee7; border-radius: 8px; padding: 16px; }
-    .rss-panel, .learning-panel { grid-column: 1 / -1; }
-    label { display: block; font-size: 13px; font-weight: 650; margin-bottom: 8px; color: #384253; }
-    textarea, input, select { width: 100%; box-sizing: border-box; border: 1px solid #c9d0dc; border-radius: 6px; padding: 10px 12px; font: 14px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
-    input[type="checkbox"] { width: auto; }
-    textarea { min-height: 300px; resize: vertical; }
-    button { margin-top: 12px; min-height: 36px; border: 1px solid #1f5fbf; background: #1f5fbf; color: #fff; border-radius: 6px; padding: 0 14px; font-size: 14px; cursor: pointer; }
-    button.secondary { border-color: #c9d0dc; background: #fff; color: #1d2430; }
-    button:disabled { opacity: .55; cursor: wait; }
-    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-    .row { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 10px; align-items: end; margin-top: 10px; }
-    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
-    .hint { color: #667085; font-size: 13px; line-height: 1.55; margin: -2px 0 10px; }
-    .url-preview { margin-top: 12px; border: 1px solid #eef1f5; background: #fafbfc; border-radius: 8px; padding: 12px; }
-    .preview-title { display: flex; justify-content: space-between; gap: 12px; color: #384253; font-size: 13px; font-weight: 650; margin-bottom: 8px; }
-    .url-chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 26px; }
-    .chip { max-width: 100%; border: 1px solid #c9d0dc; background: #fff; border-radius: 999px; padding: 4px 9px; color: #344054; font-size: 12px; overflow-wrap: anywhere; }
-    .intent-box { margin-top: 12px; border: 1px solid #eef1f5; background: #fafbfc; border-radius: 8px; padding: 10px 12px; font-size: 13px; line-height: 1.55; color: #344054; }
-    .intent-box strong { color: #1d2430; }
-    .status { font-size: 14px; line-height: 1.6; }
-    .paths { display: grid; gap: 8px; margin-top: 12px; }
-    .item { border-top: 1px solid #eef1f5; padding-top: 8px; overflow-wrap: anywhere; }
-    .item a { color: inherit; }
-    .ok { color: #116329; }
-    .fail { color: #9b1c1c; }
-    .muted { color: #667085; font-size: 13px; }
-    pre { background: #101828; color: #e5e7eb; border-radius: 6px; padding: 12px; overflow: auto; min-height: 160px; max-height: 380px; font-size: 12px; line-height: 1.5; }
-    @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } main { padding: 16px; } }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>渐进阅读导入台</h1>
-    <p class="subtitle">粘贴网页、微信、知乎、RSS 文章链接，也可以同时写上导入要求；完成后会把可读 Markdown 放进阅读区。</p>
-    <div class="layout">
-      <section class="import-panel">
-        <label for="input">链接和导入要求</label>
-        <p class="hint">每行一个链接最稳，也可以把一段自然语言说明一起粘进来。系统会自动抽取链接，正文导入和导读卡仍由后端工作流处理。</p>
-        <textarea id="input" placeholder="例如：
-https://mp.weixin.qq.com/s/...
-https://example.com/article
-
-导入到渐进阅读区，生成阅读前置卡，保留原文。"></textarea>
-        <div class="toolbar">
-          <button id="run">导入到阅读区</button>
-          <button class="secondary" id="parseIntent">先解析要求</button>
-          <button class="secondary" id="clearInput">清空</button>
-        </div>
-        <div class="url-preview">
-          <div class="preview-title">
-            <span>识别到的链接</span>
-            <span id="urlCount">0</span>
-          </div>
-          <div class="url-chips" id="urlPreview"><span class="muted">还没有识别到链接。</span></div>
-        </div>
-      </section>
-      <section class="status-panel">
-        <label>任务结果</label>
-        <div class="status" id="status">空闲</div>
-        <div class="intent-box" id="intentBox">还没有解析导入意图。</div>
-        <div class="paths" id="paths"></div>
-        <pre id="logs"></pre>
-      </section>
-      <section class="learning-panel">
-        <label>项目学习编排</label>
-        <p class="hint">从 GitHub 仓库建立可恢复的学习项目：复用现有阅读导入，记录环境、先修关系、学习证据、下一任务与材料候选。</p>
-        <div class="row">
-          <div>
-            <label for="learningRepo">GitHub 仓库</label>
-            <input id="learningRepo" placeholder="https://github.com/owner/repo">
-          </div>
-          <div>
-            <label for="learningGoal">实际成果目标</label>
-            <input id="learningGoal" value="理解项目并完成一项可验证改动">
-          </div>
-        </div>
-        <div class="toolbar">
-          <label><input type="checkbox" id="learningClone" checked> 克隆可执行源码</label>
-          <label><input type="checkbox" id="learningReading" checked> 导入 Markdown 阅读材料</label>
-        </div>
-        <div class="actions">
-          <button id="learningCreate">创建学习项目</button>
-          <button class="secondary" id="learningRefresh">刷新项目</button>
-        </div>
-        <div class="paths" id="learningProjects"></div>
-        <pre id="learningOutput"></pre>
-      </section>
-      ${existsSync(path.join(workflowRoot, 'imports', 'subscriptions', 'active.json')) ? '<section class="rss-panel"><label>订阅管理</label><p><a href="/subscriptions">管理 RSS、B 站与知乎订阅</a></p><p class="hint">来源配置、队列和运行安排统一在订阅页；在 Markdown 日报、周报中勾选材料。</p></section>' : ''}
-      <section class="rss-panel" ${existsSync(path.join(workflowRoot, 'imports', 'subscriptions', 'active.json')) ? 'hidden' : ''}>
-        <label>RSS 运行状态</label>
-        <p class="hint">本页只查看运行状态和生成摘要，不提供审批。长文唯一审批入口是摘要区中的最新 RSS 长文周报；短文周报直接进入阅读区。</p>
-        <div class="actions">
-          <button class="secondary" id="rssStatus">状态</button>
-          <button class="secondary" id="rssQueue">刷新候选</button>
-          <button id="rssDaily">生成今日增量</button>
-          <button id="rssWeekly">生成本周周报</button>
-          <button class="secondary" id="rssCanary">运行 Canary</button>
-        </div>
-        <div class="paths" id="rssQueueList"></div>
-        <pre id="rssOutput"></pre>
-      </section>
-    </div>
-  </main>
-  <script>
-    const run = document.getElementById('run');
-    const parseIntentButton = document.getElementById('parseIntent');
-    const clearInput = document.getElementById('clearInput');
-    const input = document.getElementById('input');
-    const statusEl = document.getElementById('status');
-    const intentBox = document.getElementById('intentBox');
-    const pathsEl = document.getElementById('paths');
-    const logsEl = document.getElementById('logs');
-    const urlPreview = document.getElementById('urlPreview');
-    const urlCount = document.getElementById('urlCount');
-    const rssOutput = document.getElementById('rssOutput');
-    const rssQueueList = document.getElementById('rssQueueList');
-    const learningOutput = document.getElementById('learningOutput');
-    const learningProjects = document.getElementById('learningProjects');
-    const learningButtons = ['learningCreate', 'learningRefresh'].map(id => document.getElementById(id));
-    const rssButtons = ['rssStatus', 'rssQueue', 'rssDaily', 'rssWeekly', 'rssCanary'].map(id => document.getElementById(id));
-    let timer = null;
-
-    function extractClientUrls(text) {
-      return Array.from(new Set(String(text || '').match(/https?:\/\/[^\s<>"']+/g) || []))
-        .map(url => url.replace(/[),.;，。！？!?]+$/g, ''));
-    }
-
-    function renderInputPreview() {
-      const urls = extractClientUrls(input.value);
-      urlCount.textContent = String(urls.length);
-      if (!urls.length) {
-        urlPreview.innerHTML = '<span class="muted">还没有识别到链接。</span>';
-        return urls;
-      }
-      urlPreview.innerHTML = urls.map(url => '<span class="chip">' + escapeHtml(url) + '</span>').join('');
-      return urls;
-    }
-
-    function fileHref(target) {
-      return '/files/' + encodeURIComponent(target);
-    }
-
-    function outputLink(target) {
-      if (!target) return '';
-      return '<a href="' + fileHref(target) + '" target="_blank" rel="noreferrer">' + escapeHtml(target) + '</a>';
-    }
-
-    function renderIntent(intent) {
-      if (!intent) {
-        intentBox.textContent = '还没有解析导入意图。';
-        return;
-      }
-      const processing = intent.processing || {};
-      const rows = [
-        '<strong>理解来源：</strong>' + escapeHtml(intent.source || ''),
-        '<strong>输出位置：</strong>' + escapeHtml(intent.outputTarget || ''),
-        '<strong>导读卡：</strong>' + (processing.generateReadingGuide === false ? '关闭' : processing.generateReadingGuide === true ? '开启' : '按材料类型'),
-        '<strong>语言模式：</strong>' + escapeHtml(processing.languageMode || ''),
-        '<strong>外链策略：</strong>' + escapeHtml(processing.linkPolicy || '')
-      ];
-      if (intent.userNotes) rows.push('<strong>补充要求：</strong>' + escapeHtml(intent.userNotes));
-      if (Array.isArray(intent.warnings) && intent.warnings.length) rows.push('<strong>注意：</strong>' + escapeHtml(intent.warnings.join('；')));
-      intentBox.innerHTML = rows.map(row => '<div>' + row + '</div>').join('');
-    }
-
-    function render(job) {
-      statusEl.textContent = '状态：' + job.status + '｜链接：' + job.urls.length + '｜运行目录：' + (job.runDir || '');
-      renderIntent(job.intent);
-      logsEl.textContent = (job.logs || []).map(x => '[' + x.at + '] ' + x.message).join('\\n');
-      const rows = [];
-      for (const item of job.outputs || []) {
-        const main = item.target ? outputLink(item.target) : escapeHtml(item.url || '');
-        const parts = ['成功：' + main];
-        const details = outputDetails(item);
-        if (details) parts.push('<div class="muted">' + escapeHtml(details) + '</div>');
-        if (item.brief) parts.push('<div>导读：' + outputLink(item.brief) + '</div>');
-        if (item.report) parts.push('<div>报告：' + outputLink(item.report) + '</div>');
-        rows.push('<div class="item ok">' + parts.join('') + '</div>');
-      }
-      for (const item of job.failures || []) rows.push('<div class="item fail">失败：' + escapeHtml((item.reason || '') + ' ' + (item.target || item.url || '')) + '</div>');
-      pathsEl.innerHTML = rows.join('') || '<div class="item muted">还没有输出文件。</div>';
-      if (!['queued', 'running'].includes(job.status)) {
-        run.disabled = false;
-        if (timer) clearInterval(timer);
-      }
-    }
-
-    function renderRss(data) {
-      if (data && Array.isArray(data.items)) {
-        const ready = data.items.filter(item => item.review_preview && item.review_preview.status === 'ready').length;
-        const blocked = data.items.filter(item => item.route === 'blocked').length;
-        rssOutput.textContent = '长文候选 ' + data.items.length + ' 篇｜摘要卡就绪 ' + ready + ' 篇｜正文未就绪 ' + blocked + ' 篇。审批请前往摘要区最新 RSS 长文周报。';
-        rssQueueList.innerHTML = data.items.map(item => (
-          '<div class="item"><strong>' + escapeHtml(item.title || item.material_id) + '</strong>' +
-          '<div class="muted">' + escapeHtml(item.route === 'blocked' ? '正文尚未就绪' : '长文候选') + '｜' + escapeHtml(item.decision === 'selected' ? (item.publication && item.publication.status === 'published' ? '已正式入库' : (item.publication_authorized ? '正在自动发布' : '历史已选，等待本次确认')) : item.decision === 'deferred' ? ('已入库，Later 至 ' + ((item.later && item.later.defer_until || '').slice(0, 10))) : item.decision === 'dismissed' ? '不保留' : '未决') + '</div>' +
-          (item.review_preview && item.review_preview.core ? '<div><strong>一句话核心：</strong>' + escapeHtml(item.review_preview.core) + '</div>' : '') +
-          (item.review_preview && item.review_preview.value_reason ? '<div><strong>为什么值得读：</strong>' + escapeHtml(({ high: '高', medium: '中', low: '低' }[item.review_preview.value_level] || '待判断') + '；' + item.review_preview.value_reason) + '</div>' : '') +
-          (item.review_preview && item.review_preview.novelty ? '<div><strong>可能新增量：</strong>' + escapeHtml(item.review_preview.novelty) + '</div>' : '') +
-          (item.review_preview && item.review_preview.reading_cost ? '<div><strong>预计阅读成本：</strong>' + escapeHtml(item.review_preview.reading_cost) + '｜<strong>建议读法：</strong>' + escapeHtml(item.review_preview.suggested_route || '待判断') + '</div>' : '') +
-          (item.publication_failure ? '<div class="fail">自动发布失败：' + escapeHtml(item.publication_failure.message || item.publication_failure.error || '请在最新长文周报重新处理') + '</div>' : '') +
-          (item.item_url ? '<div><a href="' + escapeHtml(item.item_url) + '" target="_blank" rel="noreferrer">查看原文</a></div>' : '') +
-          '</div>'
-        )).join('');
-      } else if (data && data.outputs) {
-        const daily = data.outputs.daily && (data.outputs.daily.path || data.outputs.daily);
-        const longWeekly = data.outputs.long_weekly && (data.outputs.long_weekly.path || data.outputs.long_weekly);
-        const shortWeekly = data.outputs.short_weekly && (data.outputs.short_weekly.path || data.outputs.short_weekly);
-        rssOutput.textContent = 'RSS 产物已更新。\n长文日报：' + (daily || '本次无新增，不生成空文件') + '\n长文周报：' + (longWeekly || '本次未生成') + '\n短文周报：' + (shortWeekly || '本次无新增，不生成空文件');
-      } else if (data && data.status) {
-        rssOutput.textContent = data.status === 'passed' ? 'Canary 已通过。' : 'RSS 状态：' + data.status;
-      } else {
-        rssOutput.textContent = '操作已完成。';
-      }
-    }
-
-    async function rssCall(path, body) {
-      rssButtons.forEach(button => button.disabled = true);
-      try {
-        const res = await fetch(path, body ? {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        } : undefined);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'rss_failed');
-        renderRss(data);
-        return data;
-      } catch (error) {
-        rssOutput.textContent = error.message;
-      } finally {
-        rssButtons.forEach(button => button.disabled = false);
-      }
-      return null;
-    }
-
-    async function learningCall(path, body) {
-      learningButtons.forEach(button => button.disabled = true);
-      try {
-        const res = await fetch(path, body ? {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        } : undefined);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'learning_project_failed');
-        learningOutput.textContent = JSON.stringify(data, null, 2);
-        if (Array.isArray(data.projects)) {
-          learningProjects.innerHTML = data.projects.map(project => (
-            '<div class="item"><strong>' + escapeHtml(project.title || project.id) + '</strong>' +
-            '<div class="muted">' + escapeHtml((project.status || '') + ' / ' + (project.goal || '')) + '</div></div>'
-          )).join('') || '<div class="item muted">还没有学习项目。</div>';
-        }
-        return data;
-      } catch (error) {
-        learningOutput.textContent = error.message;
-      } finally {
-        learningButtons.forEach(button => button.disabled = false);
-      }
-      return null;
-    }
-
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-    }
-
-    async function poll(id) {
-      const res = await fetch('/api/jobs/' + id);
-      render(await res.json());
-    }
-
-    async function previewIntent() {
-      const urls = renderInputPreview();
-      if (!urls.length) {
-        statusEl.textContent = '没有识别到链接。';
-        return;
-      }
-      parseIntentButton.disabled = true;
-      intentBox.textContent = '正在解析导入意图。';
-      try {
-        const res = await fetch('/api/intent', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: input.value })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'intent_failed');
-        statusEl.textContent = '意图解析完成。';
-        renderIntent(data.intent);
-      } catch (error) {
-        statusEl.textContent = '意图解析失败：' + error.message;
-      } finally {
-        parseIntentButton.disabled = false;
-      }
-    }
-
-    run.addEventListener('click', async () => {
-      const urls = renderInputPreview();
-      if (!urls.length) {
-        statusEl.textContent = '没有识别到链接。';
-        return;
-      }
-      run.disabled = true;
-      statusEl.textContent = '提交中';
-      intentBox.textContent = '正在解析导入意图。';
-      pathsEl.innerHTML = '';
-      logsEl.textContent = '';
-      if (timer) clearInterval(timer);
-      try {
-        const res = await fetch('/api/import', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: input.value })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'submit_failed');
-        render(data);
-        timer = setInterval(() => poll(data.id).catch(console.error), 1200);
-      } catch (error) {
-        statusEl.textContent = '提交失败：' + error.message;
-        run.disabled = false;
-      }
-    });
-
-    input.addEventListener('input', renderInputPreview);
-    parseIntentButton.addEventListener('click', previewIntent);
-    clearInput.addEventListener('click', () => {
-      input.value = '';
-      renderInputPreview();
-      statusEl.textContent = '空闲';
-      intentBox.textContent = '还没有解析导入意图。';
-      pathsEl.innerHTML = '';
-      logsEl.textContent = '';
-    });
-
-    document.getElementById('rssStatus').addEventListener('click', () => rssCall('/api/rss-reading/status'));
-    document.getElementById('rssQueue').addEventListener('click', () => rssCall('/api/rss-reading/queue'));
-    document.getElementById('rssDaily').addEventListener('click', () => rssCall('/api/rss-reading/generate', { mode: 'daily' }).then(() => rssCall('/api/rss-reading/queue')));
-    document.getElementById('rssWeekly').addEventListener('click', () => rssCall('/api/rss-reading/generate', { mode: 'weekly' }).then(() => rssCall('/api/rss-reading/queue')));
-    document.getElementById('rssCanary').addEventListener('click', () => rssCall('/api/rss-reading/canary', {}));
-    document.getElementById('learningRefresh').addEventListener('click', () => learningCall('/api/learning/projects'));
-    document.getElementById('learningCreate').addEventListener('click', () => learningCall('/api/learning/projects', {
-      repoUrl: document.getElementById('learningRepo').value,
-      goal: document.getElementById('learningGoal').value,
-      clone: document.getElementById('learningClone').checked,
-      fetchReading: document.getElementById('learningReading').checked
-    }).then(() => learningCall('/api/learning/projects')));
-    renderInputPreview();
-    if (!${existsSync(path.join(workflowRoot, 'imports', 'subscriptions', 'active.json'))}) rssCall('/api/rss-reading/queue');
-    learningCall('/api/learning/projects');
-  </script>
-</body>
-</html>`;
-}
-
 async function handle(req, res) {
   const url = new URL(req.url || "/", "http://127.0.0.1");
   if (await handleSubscriptions(req, res, workflowRoot)) return;
@@ -2943,18 +2609,14 @@ async function handle(req, res) {
     res.end();
     return;
   }
-  if (req.method === "GET" && url.pathname === "/") {
-    res.writeHead(200, {
-      ...corsHeaders(),
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-store, max-age=0"
-    });
-    res.end(html());
+  if (await handleImportCenter(req,res,{root:workflowRoot,broker:browserImportBroker,runRequest:processBackgroundImportRequest,
+    legacyJobs:()=>[...jobs.values()].slice(-20).reverse().map(job=>({id:job.id,status:job.status,created_at:job.createdAt,outputs:job.outputs,failures:job.failures}))})) return;
+  if (req.method === "GET" && ['/', '/import', '/import/'].includes(url.pathname)) {
+    res.writeHead(302,{Location:'/imports'+(url.pathname.startsWith('/import')?'#links':''),'Cache-Control':'no-store'});
+    res.end();
     return;
   }
   const importWebAssets = {
-    "/import": ["browser-import-web/index.html", "text/html"],
-    "/import/": ["browser-import-web/index.html", "text/html"],
     "/import/app.mjs": ["browser-import-web/app.mjs", "text/javascript"],
     "/import/client.mjs": ["browser-import-web/client.mjs", "text/javascript"],
     "/url-import-input.mjs": ["url-import-input.mjs", "text/javascript"],
@@ -3025,6 +2687,8 @@ async function handle(req, res) {
         processingOptionsSupported: true,
         classificationResumeEndpoint: "/api/browser-import/requests/:requestId/classification",
         processorVersion: standardPreprocessProcessorVersion,
+        sourceLibrary: { identity: 'normalized_source_url', lifecycleZones: ['阅读区','待归档原文','已归档原文'], reuseBeforePreprocessing: true, crossProcessPublicationLock: true },
+        importCenter: {url:'/imports',siteImports:true,planner:'codex_exec',retiredPages:['/','/import']},
         guideCoverageVersion: GUIDE_COVERAGE_VERSION,
         transportMaxAttempts: 3,
         serializedBySourceUrl: true,

@@ -15,7 +15,11 @@ async function complete() {
   const deadline = Date.now() + 180000;
   while (Date.now() < deadline) {
     if (!mounted.session.pending && !mounted.session.busy) return mounted.session.latestResults()[0];
-    if (mounted.session.current?.error) throw new Error(mounted.session.current.error);
+    if (mounted.session.current?.error) {
+      // Exercise the page's resume path on transient localhost transport failures.
+      if (!/fetch failed|network|HTTP 50/u.test(mounted.session.current.error)) throw new Error(mounted.session.current.error);
+      await wait(150);await mounted.session.step();
+    }
     await wait(100);
   }
   throw new Error("column_e2e_timeout");

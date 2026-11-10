@@ -13,6 +13,7 @@ import { includesPublication } from "../subscription-workflow/history.mjs";
 import { appendShortReport, shortKey, rollShortReports, archiveSummaryReports } from "../subscription-workflow/report-archive.mjs";
 import { loadSubscriptionRegistry } from '../rss-source/subscriptions.mjs';
 import { active as unifiedActive, canonicalCatalog, mergeIdentity, findExistingPublication } from '../subscription-workflow/catalog.mjs';
+import { findSourcePublication, withSourcePublication } from '../scripts/reading-source-library.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_WORKFLOW_ROOT = path.resolve(__dirname, "..");
@@ -1153,6 +1154,22 @@ async function renderShortWeekly(target, week, items) {
 }
 
 async function deliverShortToWeek(paths, ledger, item, week) {
+  return withSourcePublication(paths.workflowRoot, item.item_url, async () => {
+    const existing = await findSourcePublication(paths.workflowRoot, item.item_url);
+    const owned = [item.delivery?.short_weekly_path, item.delivery?.short_archived_path].filter(Boolean).map(file => path.resolve(file));
+    if (existing && !owned.includes(path.resolve(existing.path))) {
+      item.publication = {...existing,status:'published',preserved_existing:true};
+      item.route = 'import_activity';
+      item.delivery ||= {};
+      item.delivery.active_review_path = null;
+      await writeJson(paths.ledgerPath, ledger);
+      return;
+    }
+    return deliverShortToWeekUnlocked(paths, ledger, item, week);
+  });
+}
+
+async function deliverShortToWeekUnlocked(paths, ledger, item, week) {
   const delivery = item.delivery ||= {};
   if (delivery.short_weekly_revision === item.source_revision) return;
   if (delivery.short_weekly_pending?.revision === item.source_revision
@@ -1650,22 +1667,23 @@ export async function publishSelected(workflowRoot, materialId, options = {}) {
   if (result.artifacts?.target_zone !== "local-ir-reading") throw new Error(`publication_target_zone_invalid:${result.artifacts?.target_zone}`);
   if (publication.status !== "published") throw new Error(`publication_status_invalid:${publication.status}`);
   if (publication.cleanliness?.valid !== true) throw new Error("publication_cleanliness_invalid");
-  if (path.resolve(publication.markdown?.path || "") !== path.resolve(publishPath)) throw new Error("publication_path_receipt_mismatch");
-  const actualHash = await fileSha256(publishPath);
+  if (!publication.preserved_existing && path.resolve(publication.markdown?.path || "") !== path.resolve(publishPath)) throw new Error("publication_path_receipt_mismatch");
+  const actualPublishPath = publication.markdown.path;
+  const actualHash = await fileSha256(actualPublishPath);
   if (actualHash !== publication.markdown?.sha256) throw new Error("publication_hash_mismatch");
   item.publication = {
     status: "published",
     published_at: nowIso(),
-    path: publishPath,
+    path: actualPublishPath,
     sha256: actualHash,
     result_path: resultPath,
     publication_path: publicationPath,
     result_status: result.status
   };
-  addHistory(item, { type: "published", path: publishPath, sha256: actualHash, source: item.publication_authorization_source });
+  addHistory(item, { type: "published", path: actualPublishPath, sha256: actualHash, source: item.publication_authorization_source });
   ledger.updated_at = nowIso();
   await writeJson(paths.ledgerPath, ledger);
-  return { status: "published", material_id: materialId, path: publishPath, sha256: actualHash, result_path: resultPath, publication_path: publicationPath };
+  return { status: "published", material_id: materialId, path: actualPublishPath, sha256: actualHash, result_path: resultPath, publication_path: publicationPath };
 }
 
 export async function writeLocalIrLaterHandoff(workflowRoot, materialId, options = {}) {

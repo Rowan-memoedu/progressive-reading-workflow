@@ -324,6 +324,7 @@ try {
   assert.equal(browserClaim.claim_enabled, false);
   assert.deepEqual(browserClaim.claimable_statuses, []);
 
+  const hitsBeforeReuse = observedCookies.length;
   const obsidianFirst = await postJson(`${appBase}/api/highlights/import-local-urls`, {
     urls: [`${sourceBase}/article`],
     source: "obsidian_local_ir",
@@ -332,7 +333,9 @@ try {
   });
   assert.equal(obsidianFirst.transport, "background_fetch");
   assert.equal(obsidianFirst.status, "completed", JSON.stringify(obsidianFirst.results));
-  assert.equal(obsidianFirst.results[0].status, "imported");
+  assert.equal(obsidianFirst.results[0].status, "idempotent_replay");
+  assert.equal(obsidianFirst.results[0].artifacts[0].path, completed.results[0].artifacts[0].path, 'the canonical URL must reuse the redirect import across entry routes');
+  assert.equal(obsidianFirst.results[0].receipt.model_calls, 0);
 
   const obsidianReplay = await postJson(`${appBase}/api/highlights/import-local-urls`, {
     urls: [`${sourceBase}/article`],
@@ -341,10 +344,11 @@ try {
     user_instruction: "只整理结构，保留作者原有视角"
   });
   assert.equal(obsidianReplay.results[0].status, "idempotent_replay");
-  assert.equal(obsidianReplay.results[0].receipt.idempotency_key, obsidianFirst.results[0].receipt.idempotency_key);
+  assert.equal(obsidianReplay.results[0].receipt.existing_article_preserved, true);
   assert.equal(obsidianReplay.results[0].artifacts[0].path, obsidianFirst.results[0].artifacts[0].path);
 
-  assert.ok(observedCookies.length >= 8);
+  assert.equal(observedCookies.length, hitsBeforeReuse, 'reuse must not fetch or process the source again');
+  assert.ok(observedCookies.length >= 6);
   assert.ok(observedCookies.every((value) => value === syntheticCookie), "the configured synthetic Cookie must apply only to its exact hostname");
   assert.ok(crossHostCookies.length >= 1 && crossHostCookies.every((value) => value === null), "redirects to another hostname must strip the source hostname Cookie");
   await verifyRetainedRss();

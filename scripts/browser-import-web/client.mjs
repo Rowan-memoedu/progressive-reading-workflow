@@ -36,15 +36,17 @@ export function resultView(result = {}) {
   const message = [result.error, ...(result.errors || []).map(item => item.message || item.code)].filter(Boolean).join("；");
   if (SUCCESS.has(status)) {
     const hash = artifact?.sha256 || receipt.final_markdown_sha256;
-    if (!artifact || !/^[a-f0-9]{64}$/iu.test(hash || "") || receipt.processing_mode !== "standard_preprocess"
+    const original=receipt.processing_mode==='original_text'&&receipt.llm_used===false;
+    const reused=status==='idempotent_replay'&&receipt.existing_article_preserved===true;
+    if (!artifact || !/^[a-f0-9]{64}$/iu.test(hash || "") || (!original && !reused && (receipt.processing_mode !== "standard_preprocess"
       || !["ready", "warning"].includes(receipt.quality_status)
-      || !["completed", "completed_with_warnings", "idempotent_replay"].includes(receipt.preprocess_status)) {
+      || !["completed", "completed_with_warnings", "idempotent_replay"].includes(receipt.preprocess_status)))) {
       return { kind: "unconfirmed", label: "落盘回执不完整", detail: "服务已返回结果，但缺少可核验的正式文件回执。", retryable: false };
     }
     const warning = status === "imported_with_warnings" || receipt.quality_status === "warning";
     return {
       kind: warning ? "warning" : "success",
-      label: warning ? "已导入 · 质量警告" : status === "idempotent_replay" ? "已在阅读区 · 复用" : "已导入",
+      label: warning ? "已导入 · 质量警告" : status === "idempotent_replay" ? "已入库 · 复用" : original ? '原文已入库' : "已导入",
       detail: warning ? (receipt.warning_codes || []).join("；") || "正文可读，部分加工未达到完整质量要求。" : "",
       path: artifact.path, hash, retryable: false
     };
@@ -92,16 +94,18 @@ export class ImportSession {
     this.onChange(this);
   }
 
-  setDraft(input, instruction, processingOptions = this.state.processingOptions || {}) {
+  setDraft(input, instruction, processingOptions = this.state.processingOptions || {}, settings={}) {
     this.state.input = input;
     this.state.instruction = instruction;
     this.state.processingOptions = structuredClone(processingOptions);
+    if(settings.processingMode)this.state.processingMode=settings.processingMode;
+    if(settings.destinationFolder!==undefined)this.state.destinationFolder=settings.destinationFolder;
     this.save();
   }
 
   addAttempt(urls, instruction, processingOptions = this.state.processingOptions || {}) {
     const id = `web-import-${this.makeId()}`;
-    this.state.attempts.push({ id, urls, instruction, processingOptions: structuredClone(processingOptions), requestId: null, snapshot: null, error: "" });
+    this.state.attempts.push({ id, urls, instruction, processingOptions: structuredClone(processingOptions),processingMode:this.state.processingMode||'standard_preprocess',destinationFolder:this.state.destinationFolder||'', requestId: null, snapshot: null, error: "" });
     this.state.activeAttemptId = id;
     // Persist the id before the first POST; an uncertain response must reuse it.
     this.save();
@@ -165,7 +169,7 @@ export class ImportSession {
         method: creating || resuming ? "POST" : "GET", cache: "no-store", signal: controller.signal,
         ...(creating || resuming ? {
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(resuming ? attempt.pendingResume : { urls: attempt.urls, source: "web_import_page", entry_route: "obsidian", client_request_id: attempt.id, user_instruction: attempt.instruction, processing_options: attempt.processingOptions || {} })
+          body: JSON.stringify(resuming ? attempt.pendingResume : { urls: attempt.urls, source: "web_import_page", entry_route: "obsidian", client_request_id: attempt.id, user_instruction: attempt.instruction, processing_mode:attempt.processingMode||'standard_preprocess',destination_folder:attempt.destinationFolder||'', processing_options: attempt.processingOptions || {} })
         } : {})
       });
       const value = await response.json();

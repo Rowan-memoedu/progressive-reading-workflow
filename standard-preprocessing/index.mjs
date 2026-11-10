@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { libraryRootForPath, sourceUrls, sourceIdentityUrl, findSourcePublication, withSourcePublication } from '../scripts/reading-source-library.mjs';
 import Ajv2020 from "ajv/dist/2020.js";
 import {
   CONTRACT_VERSION,
@@ -621,7 +622,30 @@ async function existingFileHash(filePath) {
   }
 }
 
-export async function publishReadingArtifact(result, {
+export async function publishReadingArtifact(result, options = {}) {
+  const root = options.publishPath ? libraryRootForPath(options.publishPath) : null;
+  const url = sourceIdentityUrl(result.source_metadata, sourceUrls(result.artifacts?.reading_markdown || '')[0]);
+  if (result.source_metadata?.source_parts?.length > 1) {
+    result = {...result,artifacts:{...result.artifacts,reading_markdown:result.artifacts.reading_markdown.replace(/^---\r?\n/u,'---\nsource_identity_url: '+JSON.stringify(url)+'\n')}};
+  }
+  return withSourcePublication(root, url, async () => {
+    if (root && url) {
+      const existing = await findSourcePublication(root, url);
+      if (existing && options.expectedExistingSha256 == null) {
+        const publication = { interface_version: CALLABLE_INTERFACE_VERSION, status: 'published',
+          published_at: options.now || new Date().toISOString(), preserved_existing: true,
+          quality_status: 'ready', warning_codes: [], material_id: result.material_id, idempotency_key: result.idempotency_key,
+          markdown: { path: existing.path, sha256: existing.sha256, bytes: (await fs.stat(existing.path)).size },
+          cleanliness: { valid: true, failures: [] }, assets: [], source_zone: existing.zone };
+        if (options.runDir) await writeJsonArtifact(path.join(path.resolve(options.runDir), 'publication.json'), publication);
+        return publication;
+      }
+    }
+    return publishReadingArtifactUnlocked(result, options);
+  });
+}
+
+async function publishReadingArtifactUnlocked(result, {
   publishPath,
   assetSourceDir = null,
   runDir = null,

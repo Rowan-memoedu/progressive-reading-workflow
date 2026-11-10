@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>导入管理 · 渐进阅读</title><link rel="stylesheet" href="/subscriptions/style.css"><link rel="stylesheet" href="/imports/style.css"><script type="module" src="/import/app.mjs"></script><script type="module" src="/imports/app.mjs"></script></head>
+<body><main>
+  <header><div><p class="eyebrow">渐进阅读 / 导入</p><h1>把一个网站，变成可读的文章。</h1><p class="intro">保存收录范围和处理方式，后台持续导入；已存在的正文直接复用。</p></div><nav aria-label="页面导航"><a href="#sites">整站导入</a><a href="#links">链接导入</a><a href="/subscriptions">订阅管理</a></nav></header>
+  <p id="site-health" class="notice" role="status">正在读取导入状态…</p><p id="site-message" class="hint" role="status" aria-live="polite"></p>
+  <section class="section" id="sites" aria-labelledby="sites-title">
+    <div class="section-head"><div><h2 id="sites-title">整站来源</h2><p class="hint">默认收录全部博客文章。编辑设置后，下次导入使用新设置；正在运行的任务保持原范围。</p></div><button id="site-add" type="button">添加整站</button></div>
+    <div id="site-sources" aria-live="polite"><p class="hint">正在加载…</p></div>
+  </section>
+  <section class="section editor" id="site-editor" aria-labelledby="site-editor-title" hidden>
+    <div class="section-head"><h2 id="site-editor-title">添加整站</h2><button id="site-cancel" class="secondary" type="button">取消</button></div>
+    <form id="site-form"><div class="form-grid">
+      <label>名称<input id="site-name" maxlength="160" autocomplete="off" placeholder="例如：某作者的博客"></label>
+      <label>网站或栏目链接<input id="site-url" type="url" required aria-required="true" placeholder="https://example.com/blog" autocomplete="off"></label>
+      <label>收录范围<select id="site-scope"><option value="blog">博客文章</option><option value="documents">文章与文档</option><option value="content">全部正文页面</option></select></label>
+      <label>导入方式<select id="site-mode"><option value="standard_preprocess">标准处理后入库</option><option value="original_text">原文直接入库</option></select></label>
+      <label class="wide">阅读区内的目录<input id="site-destination" required aria-required="true" placeholder="例如：整站/某作者"></label>
+      <label data-site-standard>翻译方式<select id="site-translation"><option value="terminology">最新翻译，保留原文术语</option><option value="plain">普通简体中文翻译</option></select></label>
+      <label data-site-standard>生成导读卡<select id="site-guide"><option value="false">不生成</option><option value="true">生成</option></select></label>
+      <p id="site-mode-hint" class="hint wide">标准处理复用现有翻译与校验流程。</p>
+      <label class="wide">范围说明与加工要求<textarea id="site-instruction" rows="3" maxlength="6000" placeholder="例如：只收录技术文章，不收录更新日志。"></textarea></label>
+    </div>
+    <details><summary>路径范围（可选）</summary><p class="hint">每行一项，支持 * 通配符；留空时由后台识别文章范围。</p><div class="form-grid"><label>只包含这些路径<textarea id="site-include" rows="3" placeholder="/blog/*"></textarea></label><label>排除这些路径<textarea id="site-exclude" rows="3" placeholder="/blog/search*"></textarea></label></div></details>
+    <label class="check"><input id="site-index" type="checkbox" checked>生成可打开文章的阅读目录</label>
+    <p id="site-form-error" class="error helper" role="alert"></p><div class="actions"><button id="site-save" type="submit">保存设置</button><span class="hint">保存后可点击“开始导入”。</span></div></form>
+  </section>
+  <section class="section" id="site-detail" aria-labelledby="site-detail-title" hidden><div class="section-head"><h2 id="site-detail-title">整站导入结果</h2><button id="site-detail-close" class="secondary" type="button">收起结果</button></div><p id="site-detail-summary" role="status"></p><p id="site-detail-error" class="error"></p><div id="site-detail-results"></div></section>
+  <section class="section" id="links" aria-labelledby="links-title"><div class="section-head"><div><h2 id="links-title">链接批量导入</h2><p class="hint">粘贴文字、Markdown 或多个链接，复用原有分类、去重、断线续查和失败重试。</p></div></div>
+    <p id="health" class="hint" role="status">正在连接本地服务…</p>
+    <div class="workspace"><section class="panel input-panel" aria-labelledby="input-title">
+      <div class="section-title"><h3 id="input-title">添加链接</h3><span class="hint">每批最多 50 个</span></div>
+      <label for="input">链接、文字或 Markdown</label><textarea id="input" rows="7" spellcheck="false" placeholder="https://example.com/article&#10;[另一篇文章](https://example.org/post)"></textarea>
+      <div class="form-grid"><label>导入方式<select id="link-mode"><option value="standard_preprocess">标准处理后入库</option><option value="original_text">原文直接入库</option></select></label><label>阅读区内的目录（可选）<input id="link-destination" placeholder="留空时按网站域名存放"></label></div>
+      <label for="instruction">加工要求（可选）</label><textarea id="instruction" rows="2" placeholder="例如：保留专业术语与代码块。"></textarea>
+      <div class="actions"><button id="parseIntent" class="secondary" type="button">识别输入中的要求</button></div><p id="intent-feedback" class="hint helper" role="status"></p>
+      <details class="processing-panel"><summary>分类与处理选择（可选）</summary><p class="hint">明确选择优先；原文模式不进行翻译、导读或模型改写。</p><div id="processing-options" class="processing-options"></div></details>
+      <details><summary>视频、微信等来源专用流程</summary><p class="hint">复用原导入台的专用来源识别和处理，后台任务与结果仍在这里查询。文字原文模式请使用普通链接导入。</p><button id="legacy-run" class="secondary" type="button">使用来源专用流程</button><p id="legacy-feedback" class="hint helper" role="status"></p></details>
+      <div class="actions"><button id="start" type="button">导入到阅读区</button><button id="clear" class="secondary" type="button">清空输入</button></div><p id="input-message" class="hint helper" role="status"></p>
+      <details id="preview"><summary id="preview-count">尚未识别到链接</summary><ol id="preview-list"></ol></details>
+    </section><section class="panel results-panel" aria-labelledby="results-title">
+      <div class="section-title"><h3 id="results-title">导入进度</h3><button id="retry-all" class="secondary" type="button" hidden>重试失败项</button></div><p id="summary" role="status" aria-live="polite">添加链接后，这里会逐篇显示结果。</p><progress id="progress" value="0" max="1" hidden aria-label="链接导入进度"></progress>
+      <div id="connection" role="status" hidden><p id="connection-message"></p><button id="resume" class="secondary" type="button">继续提交 / 查询</button></div><p id="storage-message" class="error" role="status"></p><ol id="results"></ol><details id="history" hidden><summary>本批请求与重试记录</summary><div id="history-list"></div></details>
+    </section></div>
+    <details><summary>导入规则与特殊来源</summary><div id="rules-list" class="hint">正在读取规则…</div></details>
+  </section>
+  <section class="section" aria-labelledby="saved-history-title"><div class="section-head"><h2 id="saved-history-title">最近的链接导入</h2><button id="history-refresh" class="secondary" type="button">刷新记录</button></div><p class="hint">后台保存请求与结果；刷新页面后仍可查看。旧导入台的运行中任务也保留查询入口。</p><div id="saved-history"></div></section>
+  <details class="section" id="learning"><summary><h2>GitHub 项目学习</h2></summary><p class="hint">保留原导入台的仓库学习入口，继续使用已有项目与阅读材料。</p><div class="form-grid"><label>GitHub 仓库<input id="learningRepo" type="url" placeholder="https://github.com/owner/repo"></label><label>实际成果目标<input id="learningGoal" value="理解项目并完成一项可验证改动"></label></div><label class="check"><input id="learningClone" type="checkbox" checked>克隆可执行源码</label><label class="check"><input id="learningReading" type="checkbox" checked>导入 Markdown 阅读材料</label><div class="actions"><button id="learningCreate" type="button">创建学习项目</button><button id="learningRefresh" class="secondary" type="button">刷新项目</button></div><p id="learningOutput" class="hint helper" role="status"></p><div id="learningProjects"></div></details>
+  <footer>同一来源在阅读区、待归档原文和已归档原文中只保留一份正文。重新导入会复用已有文件和批注；各网站的访问限制在结果中单独显示。</footer>
+</main></body></html>

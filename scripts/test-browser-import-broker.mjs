@@ -142,6 +142,19 @@ try {
   assert.equal(warningSummary.concurrency, 1);
   assert.equal((await broker.findSuccessfulResultForUrl(warningTask.requested_url)).status, "imported_with_warnings");
 
+  // An idle worker must yield when only another request has queued work.
+  const waitingRequest = await broker.createRequest(["https://waiting.test/article"], { source: "test" });
+  const claimedWaiting = await broker.claimTask("waiting-worker", null, { requestId: waitingRequest.request_id });
+  const otherRequest = await broker.createRequest(["https://other.test/article"], { source: "test" });
+  let timerRan = false;
+  const tick = new Promise(resolve => setTimeout(() => { timerRan = true; resolve(); }, 0));
+  await broker.waitForTask(20, { requestId: waitingRequest.request_id });
+  assert.equal(timerRan, true, "unrelated queued work must not create a busy microtask loop");
+  await tick;
+  await broker.completeTask(claimedWaiting.id, { ok: true, leaseToken: claimedWaiting.lease_token });
+  const otherTask = await broker.claimTask("other-worker", null, { requestId: otherRequest.request_id });
+  await broker.completeTask(otherTask.id, { ok: true, leaseToken: otherTask.lease_token });
+
   const reloaded = new BrowserImportBroker({ stateRoot: root });
   const persisted = await reloaded.getRequest(request.request_id);
   assert.equal(persisted.status, "completed_with_failures");

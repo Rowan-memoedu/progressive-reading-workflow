@@ -44,7 +44,7 @@ for (const producer of ["synthetic", "synthetic-invalid"]) {
       const asset = await fetch(`${fixture.baseUrl}${route}`);
       assert.equal(asset.status, 200); assert.match(asset.headers.get("Content-Type"), /text\/javascript/u);
     }
-    assert.match(await (await fetch(`${fixture.baseUrl}/`)).text(), /\/api\/import/u);
+    assert.match(await (await fetch(`${fixture.baseUrl}/`)).text(), /导入管理/u);
     const oversize = await fetch(`${fixture.baseUrl}/api/browser-import/requests`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ urls: Array.from({ length: 51 }, (_, i) => `${fixture.sourceUrl}/article/${i}`) }) });
     assert.equal(oversize.status, 400);
     evidence.checks.push("page_assets_and_legacy_root", "backend_50_limit");
@@ -146,8 +146,9 @@ for (const producer of ["synthetic", "synthetic-invalid"]) {
       let checked;
       const checkedDeadline = Date.now() + 60000;
       do { checked = await (await fetch(`${fixture.baseUrl}/api/browser-import/requests/${changedId}`)).json(); if (checked.terminal) break; await delay(100); } while (Date.now() < checkedDeadline);
-      assert.equal(checked.results[0].status, "failed");
-      assert.match(checked.results[0].error, /existing_article_changed_preserved/u);
+      assert.equal(checked.results[0].status, "idempotent_replay");
+      assert.equal(checked.results[0].receipt.existing_article_preserved, true);
+      assert.equal(checked.results[0].artifacts.find(item=>item.kind==='markdown').sha256,sha256(edited));
       assert.equal(await fs.readFile(evidence.files[0].path, "utf8"), edited);
       assert.deepEqual(await fs.readFile(sidecar), originalState);
       evidence.checks.push("manually_edited_body_and_sidecar_preserved");

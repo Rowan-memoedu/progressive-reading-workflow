@@ -434,8 +434,9 @@ test("active package, app, and docs reference the new consumer instead of the le
   assert.match(scriptsText, /rss-reading\/cli\.mjs/u);
   assert.doesNotMatch(scriptsText, /rss-workflow\.mjs/u);
   assert.match(app, /\/api\/rss-reading\/queue/u);
-  assert.match(app, /生成今日增量/u);
-  assert.match(app, /RSS 运行状态/u);
+  const center = await fs.readFile(path.join(projectRoot,'site-import','web','index.html'),'utf8');
+  assert.match(center, /href="\/subscriptions"/u);
+  assert.match(center, /导入管理/u);
   assert.doesNotMatch(app, /class="[^"]*rss-decision/u);
   assert.doesNotMatch(app, /class="[^"]*rss-publish/u);
   assert.doesNotMatch(`${readme}\n${docs}`, /应用筛选面板/u);

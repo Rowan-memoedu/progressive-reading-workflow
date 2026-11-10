@@ -13,6 +13,9 @@ export function mountImportPage(doc = document, { fetchImpl = globalThis.fetch.b
   if (storageUnavailable) session.storageError = "浏览器无法保存进度。请保持页面打开，并保留请求编号。";
   el("input").value = session.state.input;
   el("instruction").value = session.state.instruction;
+  if(el('link-mode'))el('link-mode').value=session.state.processingMode||'standard_preprocess';
+  if(el('link-destination'))el('link-destination').value=session.state.destinationFolder||'';
+  el('links')?.classList.toggle('mode-original',session.state.processingMode==='original_text');
   const controls = new Map();
   const choices = [
     ["content_profile", "材料类型", [["natural_language", "普通文章 / 技术文章"], ["math_lecture", "数理讲义"], ["literature", "文学"]]],
@@ -128,7 +131,9 @@ export function mountImportPage(doc = document, { fetchImpl = globalThis.fetch.b
   }
   const saveDraft = () => session.setDraft(el("input").value, el("instruction").value,
     Object.fromEntries([...controls].filter(([, select]) => select.value !== "").map(([key, select]) =>
-      [key, select.value === "true" ? true : select.value === "false" ? false : select.value])));
+      [key, select.value === "true" ? true : select.value === "false" ? false : select.value])),{processingMode:el('link-mode')?.value||'standard_preprocess',destinationFolder:el('link-destination')?.value||''});
+  el('link-mode')?.addEventListener('change',()=>{el('links')?.classList.toggle('mode-original',el('link-mode').value==='original_text');saveDraft();});
+  el('link-destination')?.addEventListener('input',saveDraft);
   el("input").addEventListener("input", saveDraft);
   el("instruction").addEventListener("input", saveDraft);
   el("start").addEventListener("click", () => perform(() => session.start()));

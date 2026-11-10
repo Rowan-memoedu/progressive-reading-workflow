@@ -6,6 +6,7 @@ import { urlImportDedupeKey } from '../scripts/url-import-input.mjs';
 import { buildPreprocessRequest } from '../rss-source/core.mjs';
 import { meaningfulLength } from './content-length.mjs';
 import { includesPublication } from './history.mjs';
+import { findSourcePublication, findSourcePublications } from '../scripts/reading-source-library.mjs';
 
 export const active = root => existsSync(paths(root).marker);
 export function materialKey(url) { return urlImportDedupeKey(url); }
@@ -87,6 +88,7 @@ export async function canonicalCatalog(root, rssItems) {
     if (!grouped.has(key)) grouped.set(key, []);
     grouped.get(key).push(item);
   }
+  const library = await findSourcePublications(root, records.map(item => item.itemUrl));
   const result = [];
   for (const [key, versions] of grouped) {
     versions.sort((a, b) => String(b.fetchedAt || '').localeCompare(String(a.fetchedAt || '')) || a.materialId.localeCompare(b.materialId));
@@ -101,8 +103,11 @@ export async function canonicalCatalog(root, rssItems) {
     const newRequest = latest.requestPath ? await readJson(latest.requestPath) : null;
     const sameBody = oldRequest?.material?.markdown && oldRequest.material.markdown === newRequest?.material?.markdown;
     const ids = [...new Set(versions.flatMap(item => item.subscriptionIds || config.subscriptions.filter(source => source.kind === 'rss' && source.url === item.feedUrl).map(source => source.id)))];
+    const libraryMatch = latest.itemUrl ? library.get(materialKey(latest.itemUrl)) : null;
+    const ownedPaths = [preserved?.publication?.path, preserved?.delivery?.short_weekly_path, preserved?.delivery?.short_archived_path].filter(Boolean).map(file => path.resolve(file));
+    const externalMatch = libraryMatch && !ownedPaths.includes(path.resolve(libraryMatch.path)) ? libraryMatch : null;
     result.push({ ...latest, materialId: preserved?.material_id || latest.materialId,
-      externallyPublished: latest.itemUrl ? published.get(materialKey(latest.itemUrl)) || null : null,
+      externallyPublished: externalMatch || (latest.itemUrl ? published.get(materialKey(latest.itemUrl)) || null : null),
       ...(sameBody ? { requestPath: preserved.preprocess_request_path, requestSha256: preserved.preprocess_request_sha256,
         preservedSourceRevision: preserved.source_revision } : {}),
       canonicalKey: key, aliasIds: [...new Set([...versions.map(item => item.materialId), ...previous.map(item => item.material_id)])],
@@ -131,24 +136,5 @@ export function mergeIdentity(ledger, current) {
 }
 
 export async function findExistingPublication(root, url) {
-  const target = materialKey(url), queue = [path.join(root, '阅读区')];
-  while (queue.length) {
-    const directory = queue.pop();
-    const entries = await fs.readdir(directory, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.isDirectory()) { if (!['_assets', 'images', '附件'].includes(entry.name)) queue.push(path.join(directory, entry.name)); continue; }
-      if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
-      const file = path.join(directory, entry.name), handle = await fs.open(file, 'r');
-      let front;
-      try { const buffer = Buffer.alloc(16384), result = await handle.read(buffer, 0, buffer.length, 0); front = buffer.subarray(0, result.bytesRead).toString('utf8'); }
-      finally { await handle.close(); }
-      if (!front.startsWith('---')) continue;
-      front = front.split(/\r?\n---\r?\n/u)[0];
-      const match = /^\s*(?:source_url|canonical_url):\s*["']?(https?:\/\/[^\s"']+)/mu.exec(front);
-      let same = false;
-      try { same = match && materialKey(match[1]) === target; } catch { /* Malformed unrelated metadata is not a match. */ }
-      if (same) return { path: file, sha256: digest(await fs.readFile(file)) };
-    }
-  }
-  return null;
+  return findSourcePublication(root, url);
 }

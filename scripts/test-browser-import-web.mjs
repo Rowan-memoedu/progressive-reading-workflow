@@ -112,7 +112,7 @@ test("a terminal batch containing queued results remains unconfirmed and queryab
   assert.match(session.current.error, /回执/u);
 });
 test("real page controls render safe text, disable >50, show quality warning and retry results", async () => {
-  const html = await fs.readFile(new URL("./browser-import-web/index.html", import.meta.url), "utf8");
+  const html = await fs.readFile(new URL("../site-import/web/index.html", import.meta.url), "utf8");
   const dom = new JSDOM(html, { url: "http://127.0.0.1/import" });
   const fetchImpl = async url => url.endsWith("health") ? response({ status: "ok", service: "local-ir-browser-highlight" }) : response(snapshot([a, b], [success(a, true), { requested_url: b, status: "failed", error: "<img src=x onerror=alert(1)>" }]));
   const mounted = mountImportPage(dom.window.document, { fetchImpl, storage: storage() });
@@ -130,7 +130,7 @@ test("real page controls render safe text, disable >50, show quality warning and
 });
 
 test("health text distinguishes broken service configuration from a stopped sync heartbeat", async () => {
-  const html = await fs.readFile(new URL("./browser-import-web/index.html", import.meta.url), "utf8");
+  const html = await fs.readFile(new URL("../site-import/web/index.html", import.meta.url), "utf8");
   for (const [auth, expected] of [
     [{ mode: "manual_snapshot", error: "snapshot_file_not_found" }, /修复服务启动配置/u],
     [{ mode: "chrome_live_sync", status: "stale" }, /使用这些登录态的来源/u]
@@ -175,7 +175,7 @@ test("explicit false survives submission; missing classification resumes the ori
 });
 
 test("page classification controls forward booleans and render waiting as incomplete", async () => {
-  const dom = new JSDOM(await fs.readFile(new URL("./browser-import-web/index.html", import.meta.url), "utf8"), { url: "http://127.0.0.1/import" });
+  const dom = new JSDOM(await fs.readFile(new URL("../site-import/web/index.html", import.meta.url), "utf8"), { url: "http://127.0.0.1/import" });
   let body;
   const mounted = mountImportPage(dom.window.document, { storage: storage(), fetchImpl: async (url, options) => {
     if (!options?.body) return response(url.endsWith("health") ? { status: "ok", service: "local-ir-browser-highlight" } : { schema: "local-ir.import-rules/v1", rules: [] });

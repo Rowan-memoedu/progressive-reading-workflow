@@ -45,8 +45,14 @@ export function urlImportDedupeKey(value) {
   try {
     const parsed = new URL(value);
     parsed.hash = "";
+    const bili = ['bilibili.com','www.bilibili.com'].includes(parsed.hostname) && /^\/video\/BV[0-9A-Za-z]{10}\/?$/u.test(parsed.pathname);
+    if (bili) {
+      parsed.protocol = 'https:';
+      parsed.hostname = 'www.bilibili.com';
+      if (parsed.searchParams.get('p') === '1') parsed.searchParams.delete('p');
+    }
     for (const key of [...parsed.searchParams.keys()]) {
-      if (/^utm_/iu.test(key) || /^(fbclid|gclid|mc_cid|mc_eid)$/iu.test(key)) parsed.searchParams.delete(key);
+      if (/^utm_/iu.test(key) || /^(fbclid|gclid|mc_cid|mc_eid|spm_id_from|vd_source|share_source|share_medium)$/iu.test(key)) parsed.searchParams.delete(key);
     }
     parsed.searchParams.sort();
     if (parsed.pathname.length > 1) parsed.pathname = parsed.pathname.replace(/\/+$/u, "");

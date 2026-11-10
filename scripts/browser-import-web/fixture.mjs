@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
-export async function startFixture({ producer = "synthetic", columnFixture = false, cookieDataRoot = "" } = {}) {
+export async function startFixture({ producer = "synthetic", columnFixture = false, cookieDataRoot = "", sitePlanPath = "" } = {}) {
   const artifactsRoot = process.env.WEB_IMPORT_TEST_ROOT || "D:/Artifacts/ProgressiveReading/web-import";
   await fs.mkdir(artifactsRoot, { recursive: true });
   const root = await fs.mkdtemp(path.join(artifactsRoot, "fixture-"));
@@ -30,7 +30,7 @@ export async function startFixture({ producer = "synthetic", columnFixture = fal
     if (req.url.startsWith("/fixture-fetch?")) {
       const requested = new URL(new URL(req.url, "http://127.0.0.1").searchParams.get("url"));
       titlePath = requested.pathname;
-      if (requested.pathname.startsWith("/api/v4/columns/")) {
+      if (/^\/api\/(?:v4\/)?columns\//u.test(requested.pathname)) {
         res.setHeader("Content-Type", "application/json");
         const article = id => ({ type: "article", id: String(id), title: `合成文章 ${id}` });
         if (requested.pathname.includes("c_incomplete")) { res.end(JSON.stringify({ data: [article(2000)], paging: { is_end: false, totals: 3 } })); return; }
@@ -38,7 +38,7 @@ export async function startFixture({ producer = "synthetic", columnFixture = fal
         const all = [...Array.from({ length: 53 }, (_, i) => article(2000 + i)), { type: "answer", id: "3000" }];
         const offset = Number(requested.searchParams.get("offset") || 0);
         res.end(JSON.stringify({ data: all.slice(offset, offset + 20), paging: { totals: all.length, is_end: offset + 20 >= all.length,
-          next: `https://www.zhihu.com${requested.pathname}?offset=${offset+20}&limit=20` } })); return;
+          next: `https://zhuanlan.zhihu.com${requested.pathname}?offset=${offset+20}&limit=20` } })); return;
       }
       if (requested.pathname === "/p/2001" && !recovered) { res.writeHead(503); res.end("fixture_article_unavailable"); return; }
     }
@@ -56,6 +56,7 @@ export async function startFixture({ producer = "synthetic", columnFixture = fal
   const env = { ...process.env, NODE_ENV: "test", PROGRESSIVE_READING_WORKFLOW_ROOT: workflowRoot,
     PROGRESSIVE_READING_APP_PORT: "0", PROGRESSIVE_READING_WRITE_SERVER_INFO: "false",
     PROGRESSIVE_READING_BROWSER_PREPROCESS_TEST_PRODUCER: producer,
+    PROGRESSIVE_READING_SITE_IMPORT_TEST_PLAN: sitePlanPath,
     PROGRESSIVE_READING_COOKIE_SNAPSHOT_PATH: columnFixture ? syntheticSnapshotPath : "", PROGRESSIVE_READING_URL_COOKIE_MAP_JSON: "",
     PROGRESSIVE_READING_COOKIE_DATA_ROOT: cookieDataRoot,
     PROGRESSIVE_READING_FIXTURE_ORIGIN: columnFixture ? sourceUrl : "",
@@ -79,6 +80,7 @@ export async function startFixture({ producer = "synthetic", columnFixture = fal
       await Promise.race([new Promise(resolve => child.once("exit", resolve)), wait(3000)]);
       source.closeAllConnections(); await new Promise(resolve => source.close(resolve));
       await fs.writeFile(path.join(root, "service.log"), stdout + stderr);
+      await fs.writeFile(path.join(root, "source-hits.json"), JSON.stringify(hits,null,2));
     }
   };
 }

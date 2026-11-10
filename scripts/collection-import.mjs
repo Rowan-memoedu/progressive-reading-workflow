@@ -21,25 +21,29 @@ function collectionResult(task, collection) {
 
 // A collection is a durable parent task inside the existing broker. Article batches
 // are ordinary broker requests, with stable ids and the existing worker/receipts.
-export async function processCollectionTask(task, { broker, discover, runRequest, pollMs = 1000 } = {}) {
-  const collection = task.collection || { rule_id: "zhihu-column-all-articles", phase: "discovering", inventory: null, batches: [], results: [] };
-  const progress = () => broker.updateTaskProgress(task.id, { collection }, task.lease_token);
+export async function processCollectionTask(task, { broker, discover, runRequest, pollMs = 1000, initialCollection, onProgress, verify } = {}) {
+  const collection = task.collection || initialCollection || { rule_id: "zhihu-column-all-articles", phase: "discovering", inventory: null, batches: [], results: [] };
+  const progress = async () => { await broker.updateTaskProgress(task.id, { collection }, task.lease_token); await onProgress?.(collection); };
   try {
     if (!collection.inventory?.complete) {
       collection.phase = "discovering";
       await progress();
-      collection.inventory = await discover(task.requested_url, async detail => { collection.discovery = detail; await progress(); });
+      collection.inventory = await discover(task.requested_url, async detail => { collection.discovery = detail;collection.phase=detail.phase || collection.phase; await progress(); });
       collection.phase = "importing";
       await progress();
     }
-    const urls = collection.inventory.articles.map(article => article.url);
+    const preserved = new Set(collection.results.filter(row=>SUCCESS.has(row.status)).map(row=>row.requested_url));
+    // Freeze batch membership: completed rows must not shift later batches on resume.
+    collection.batch_urls ||= collection.inventory.articles.map(article => article.url).filter(url=>collection.batches.length || !preserved.has(url));
+    const urls = collection.batch_urls;
     for (let offset = 0; offset < urls.length; offset += 50) {
       const index = offset / 50;
       if (collection.batches[index]?.terminal) continue;
       const request = collection.batches[index]?.request_id ? await broker.getRequest(collection.batches[index].request_id) : await broker.createRequest(urls.slice(offset, offset + 50), {
         source: task.source, clientRequestId: `${task.id}:articles:${index}`,
         userInstruction: task.user_instruction, entryRoute: task.entry_route, destinationFolder: task.destination_folder,
-        processingOptions: task.processing_options || {}, processingMode: task.processing_mode || "standard_preprocess"
+        processingOptions: task.processing_options || {}, processingMode: task.processing_mode || "standard_preprocess",
+        articleSource: collection.inventory.article_source || null
       });
       collection.batches[index] = { request_id: request.request_id, terminal: false };
       await progress();
@@ -63,13 +67,16 @@ export async function processCollectionTask(task, { broker, discover, runRequest
       collection.batches[index].terminal = true;
       await progress();
     }
+    if (verify) { collection.phase='verifying';await progress();collection.verification=await verify(collection); }
     collection.phase = "completed";
     const result = collectionResult(task, collection);
     const ok = SUCCESS.has(result.status);
     if (!ok) collection.phase = "completed_with_failures";
     if (result.status === "needs_classification") collection.phase = "needs_classification";
     await broker.completeTask(task.id, { ok, result, error: ok ? null : result.status === "needs_classification" ? "部分文章需要补充分类信息。" : "collection_articles_incomplete", degradedStatus: result.status === "needs_classification" ? "needs_classification" : null, leaseToken: task.lease_token });
+    await onProgress?.(collection);
   } catch (error) {
+    if(error.inventory)collection.inventory=error.inventory;
     collection.phase = "failed";
     collection.error = error.message;
     const result = collectionResult(task, collection);
@@ -78,5 +85,6 @@ export async function processCollectionTask(task, { broker, discover, runRequest
     await broker.completeTask(task.id, { ok: false, result, error: error.message,
       degradedStatus: error.status === "requires_browser_auth" || /zhihu_http_(401|403)|zhihu_cookie_not_synced|cookie_sync_stale_refresh_chrome/u.test(error.message) ? "requires_browser_auth" : null,
       leaseToken: task.lease_token });
+    await onProgress?.(collection);
   }
 }

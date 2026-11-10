@@ -114,6 +114,8 @@ function taskReceipt(task) {
     destination_folder: task.destinationFolder,
     processing_mode: task.processingMode || 'standard_preprocess',
     processing_options: structuredClone(task.processingOptions || {}),
+    ...(task.siteImport ? {site_import:structuredClone(task.siteImport)} : {}),
+    ...(task.articleSource ? {article_source:structuredClone(task.articleSource)} : {}),
     capture_mode: task.browserSnapshot ? "page_snapshot" : "url_fetch",
     ...(task.result?.receipt?.pending_input_path ? { pending_input_path: task.result.receipt.pending_input_path } : {}),
     ...(task.result?.collection ? { collection: sanitizePersistedValue(task.result.collection) } : {})
@@ -201,7 +203,9 @@ export class BrowserImportBroker {
     destinationFolder = "",
     processingMode = 'standard_preprocess',
     processingOptions = {},
-    browserSnapshot = null
+    browserSnapshot = null,
+    siteImport = null,
+    articleSource = null
   } = {}) {
     const normalizedMode = normalizeProcessingMode(processingMode);
     const normalizedOptions = await checkedProcessingOptions(processingOptions);
@@ -252,6 +256,8 @@ export class BrowserImportBroker {
           destinationFolder: String(destinationFolder || ""),
           processingMode: normalizedMode,
           processingOptions: normalizedOptions,
+          ...(siteImport ? {siteImport:structuredClone(siteImport)} : {}),
+          ...(articleSource ? {articleSource:structuredClone(articleSource)} : {}),
           status: "queued",
           attempts: 0,
           maxAttempts: this.maxAttempts,
@@ -352,7 +358,7 @@ export class BrowserImportBroker {
     return this.withLock(async () => {
       const task = this.state.tasks.find(item => item.id === taskId);
       if (!task || task.status !== "claimed" || task.leaseToken !== leaseToken) throw new Error("browser_import_task_stale_lease");
-      task.result = sanitizePersistedValue(result);
+      task.result = { ...(task.result || {}), ...sanitizePersistedValue(result) };
       task.claimedAt = nowIso(this.now);
       task.updatedAt = task.claimedAt;
       await this.save();
@@ -500,6 +506,10 @@ export class BrowserImportBroker {
     return this.withLock(async () => this.requestSummary(requestId));
   }
 
+  async listRequestSummaries({sources=null,limit=25}={}) {
+    return this.withLock(()=>this.state.requests.filter(request=>!sources||sources.includes(request.source)).slice(-limit).reverse().map(request=>this.requestSummary(request.id)));
+  }
+
   async findSuccessfulResultForUrl(requestedUrl, { excludeTaskId = null } = {}) {
     return this.withLock(async () => {
       const identity = normalizedUrlIdentity(requestedUrl);
@@ -524,12 +534,13 @@ export class BrowserImportBroker {
     });
   }
 
-  async waitForTask(timeoutMs = 20000, { transport = null } = {}) {
+  async waitForTask(timeoutMs = 20000, { transport = null, requestId = null } = {}) {
     await this.initialize();
     const now = this.now();
     if (transport && transport !== BACKGROUND_FETCH_TRANSPORT) throw new Error("browser_import_wait_transport_not_supported");
     const normalizedTransport = transport ? normalizeTransport(transport) : null;
-    const queued = this.state.tasks.filter((item) => item.status === "queued" && (!normalizedTransport || item.transport === normalizedTransport));
+    const queued = this.state.tasks.filter((item) => item.status === "queued" && (!normalizedTransport || item.transport === normalizedTransport)
+      && (!requestId || item.requestId === requestId));
     if (queued.some((item) => Date.parse(item.availableAt || 0) <= now)) return;
     const nextAvailableAt = queued.length
       ? Math.min(...queued.map((item) => Date.parse(item.availableAt || 0)).filter(Number.isFinite))
