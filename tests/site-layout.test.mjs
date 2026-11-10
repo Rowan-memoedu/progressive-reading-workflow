@@ -42,6 +42,12 @@ test('generated index ownership survives checked relocation and still protects h
   await fs.appendFile(file,'\nHandwritten note\n');const before=await fs.readFile(file,'utf8'),next=await writeSiteIndexes(root,settings,{articles:[]},[],runId('owned-edited'));assert.notEqual(next.index,file);assert.equal(await fs.readFile(file,'utf8'),before);
 });
 
+test('the exact legacy flat generator is upgraded after native URL-encoded link changes',async()=>{
+  const root=await fs.mkdtemp('D:/Artifacts/ProgressiveReading/index-legacy-'),settings={id:'legacy',name:'Independent',url:'https://legacy-index.test',destination:'整站/Independent'},old=runId('legacy'),id=runId('legacy-next'),base=path.join(root,'阅读区',settings.destination),file=path.join(base,'目录.md'),url='https://legacy-index.test/first';await fs.mkdir(base,{recursive:true});
+  const legacy='# Independent\n\n[网站](https://legacy-index.test)\n\n- [First](<标签/Topic%20Name/first.md>)\n';await fs.writeFile(file,legacy);await saveRun(root,{id:old,source_id:settings.id,created_at:'2026-01-01',results:[]});await writeJson(path.join(runPath(root,old),'index.json'),{path:file,sha256:digest('generated before native move')});
+  const result=await writeSiteIndexes(root,settings,{articles:[{url,title:'First',taxonomy:articleTaxonomy({tags:['Topic Name']})}]},[{url,path:path.join(base,'标签/Topic Name/first.md')}],id);assert.equal(result.index,file);assert.match(await fs.readFile(file,'utf8'),/## 标签/u);assert.equal(await fs.readFile(path.join(runPath(root,id),'recovery','legacy-index-'+digest(legacy)+'.md'),'utf8'),legacy);
+});
+
 test('Windows source tags with different casing do not move a file onto itself',{skip:process.platform!=='win32'},async()=>{
   const env=process.env.NODE_ENV;process.env.NODE_ENV='test';
   const root=await fs.mkdtemp('D:/Artifacts/ProgressiveReading/layout-case-');
