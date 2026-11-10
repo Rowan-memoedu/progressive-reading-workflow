@@ -20,10 +20,17 @@
     <form id="source-form">
       <div class="form-grid">
         <label>名称<input id="name" name="name" required maxlength="160" autocomplete="off"></label>
-        <label>来源类型<select id="kind" name="kind"><option value="rss">RSS / Atom</option><option value="bilibili_video">B 站多 P 视频</option><option value="bilibili_collection">B 站合集</option><option value="zhihu_author">知乎作者</option><option value="zhihu_column">知乎专栏</option></select></label>
+        <label>来源类型<select id="kind" name="kind"><option value="rss">RSS / Atom</option><option value="bilibili_video">B 站多 P 视频</option><option value="bilibili_collection">B 站合集</option><option value="zhihu_author">知乎作者</option><option value="zhihu_column">知乎专栏</option><option value="github_repository">GitHub Markdown 仓库</option></select></label>
         <label class="wide">来源链接<input id="url" name="url" type="url" required placeholder="https://" aria-describedby="url-hint" autocomplete="off"><span id="url-hint" class="hint">填写 RSS 或 Atom 订阅地址。</span></label>
-        <label>处理方式<select id="mode" name="mode"><option value="standard_preprocess">标准流程，自动入库</option><option value="original_text">提取原文，自动入库</option><option value="reports" selected>日报 / 周报，勾选后入库</option></select></label>
+        <label data-repository-setting hidden>分支<input id="repository-branch" value="main" autocomplete="off"></label>
+        <label data-repository-setting hidden>正文根目录<input id="repository-root" value="src" autocomplete="off"></label>
+        <label data-repository-setting hidden class="wide">对应网站<input id="repository-site" type="url" placeholder="https://作者.github.io/仓库/"></label>
+        <label>处理方式<select id="mode" name="mode"><option value="standard_preprocess">标准流程，自动入库</option><option value="original_text">提取原文，自动入库</option><option value="reports" selected>日报 / 周报与阅读操作</option></select></label>
         <label>阅读区内的目录<input id="destination" name="destination" value="RSS" required placeholder="例如：RSS 或 视频/某课程"></label>
+        <label data-text-setting>长文获取后的阅读方式<select id="direct_reading" name="direct_reading"><option value="true">直接进入阅读区</option><option value="false">先在日报周报勾选入库</option></select></label>
+        <label data-text-setting>翻译方式<select id="translation_mode" name="translation_mode"><option value="terminology">最新翻译，保留原文术语</option><option value="plain">普通翻译，译成简体中文</option></select></label>
+        <label data-text-setting>长文默认生成导读卡<select id="generate_guide" name="generate_guide"><option value="false">不生成</option><option value="true">生成导读卡</option></select></label>
+        <p class="hint wide" data-text-setting>简体中文正文保留原文。其他语言按所选方式翻译，繁体中文转为简体。短文继续逐篇追加到短文周报。</p>
         <label>接收范围<select id="history_mode" name="history_mode" aria-describedby="scope-hint"><option value="default">沿用现有范围</option><option value="since">设定最早时间</option><option value="all">不限时间</option></select></label>
         <label id="earliest-field" hidden>最早发布日期<input id="earliest_date" name="earliest_date" type="date" aria-describedby="scope-hint"></label>
         <p class="hint wide" id="scope-hint"></p>
@@ -39,7 +46,7 @@
     <section class="section" aria-labelledby="schedule-title"><h2 id="schedule-title">运行安排</h2><p class="hint">北京时间。每个来源周期会重试堵塞项。队列持续处理，不设每日篇数上限。</p><dl id="schedule"></dl><div class="actions" id="run-buttons"><button class="secondary" data-run="rss" type="button">检查 RSS</button><button class="secondary" data-run="bilibili" type="button">检查 B 站</button><button class="secondary" data-run="zhihu" type="button">检查知乎</button></div><p id="source-run-status" class="run-status hint" role="status" hidden></p><p class="hint">知乎作者与专栏使用现有登录快照，访问受限时在这里显示原因。</p></section>
     <section class="section" id="reports" aria-labelledby="reports-title"><div class="section-head"><h2 id="reports-title">日报与周报</h2></div><p class="hint">点击“编辑”会打开 Markdown 原文件。每条只勾选一项，保存后自动入队。未勾选或多选的条目会在新一期重新提供空白选框。</p><div class="actions"><button class="secondary" data-run="daily" type="button">生成日报</button><button class="secondary" data-run="weekly" type="button">生成周报</button></div><p id="report-run-status" class="run-status hint" role="status" hidden></p><ul id="report-list"></ul></section>
   </div>
-  <section class="section" aria-labelledby="queue-title"><div class="section-head"><h2 id="queue-title">队列与运行记录</h2><div class="actions"><button class="secondary" data-run="retry" type="button">重试堵塞项</button><button id="refresh" class="secondary" type="button">刷新状态</button></div></div><p id="retry-run-status" class="run-status hint" role="status" hidden></p><p id="queue-summary" class="hint"></p><div id="queue"></div><details id="job-history"><summary>最近的任务</summary><ol id="jobs"></ol></details></section>
+  <section class="section" aria-labelledby="queue-title"><div class="section-head"><h2 id="queue-title">队列与运行记录</h2><div class="actions"><button id="open-exceptions" class="secondary" type="button" hidden>异常记录</button><button class="secondary" data-run="retry" type="button">重试堵塞项</button><button id="refresh" class="secondary" type="button">刷新状态</button></div></div><p id="retry-run-status" class="run-status hint" role="status" hidden></p><p id="queue-summary" class="hint"></p><div id="queue"></div><details id="job-history"><summary>最近的任务</summary><ol id="jobs"></ol></details></section>
   <footer>停用订阅会停止接收新内容。删除已停用的订阅会移除订阅配置，已有正文、批注和选择记录保留。</footer>
 </main>
 </body></html>

@@ -3,6 +3,20 @@ import assert from "node:assert/strict";
 import { htmlArticleToMarkdown } from "./browser-page-markdown.mjs";
 
 const convert = content => htmlArticleToMarkdown({ sourceUrl: "https://example.org/lesson/intro", html: `<html><head><title>格式验收</title></head><body><article><h1>格式验收</h1><p>${"这是一篇包含数学、代码和引用的完整正文。".repeat(20)}</p>${content}</article></body></html>` });
+test("explicit article body retains short link sections and excludes surrounding navigation", () => {
+  const result = htmlArticleToMarkdown({ sourceUrl: "https://example.org/post", html: `<nav>Outside navigation</nav><article><header>Outside metadata</header><div itemprop="articleBody"><p>${"The research result is interesting. ".repeat(20)}</p><div><p>Further details:</p><ul><li><a href="/details">Technical write-up</a></li><li><a href="/code">Notebook</a></li></ul></div></div></article><footer>Outside footer</footer>` });
+  assert.equal(result.method, "semantic_article_body");
+  assert.ok(result.markdown.includes("Technical write-up"));
+  assert.ok(result.markdown.includes("https://example.org/code"));
+  assert.doesNotMatch(result.markdown, /Outside/);
+});
+test("microformat entry content preserves independent short material", () => {
+  const result = htmlArticleToMarkdown({ sourceUrl: "https://other.example/entry", html: '<div class="h-entry"><h1>Metadata title</h1><section class="e-content"><p>A short complete note.</p><ul><li><a href="/reference">Reference</a></li></ul></section></div><aside>Related entries</aside>' });
+  assert.equal(result.method, "semantic_article_body");
+  assert.ok(result.markdown.includes("A short complete note."));
+  assert.ok(result.markdown.includes("https://other.example/reference"));
+  assert.doesNotMatch(result.markdown, /Metadata title|Related entries/);
+});
 test("KaTeX, MathJax and math images preserve one TeX expression each", () => {
   const result = convert(String.raw`<p>内联 <span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>x</mi><mn>2</mn></mrow><annotation encoding="application/x-tex">x^2</annotation></semantics></math></span><span class="katex-html">x2</span></span>。</p><div class="MathJax_Display" id="eq-Frame">ab</div><script id="eq" type="math/tex; mode=display">\frac{a}{b}</script><p>图片公式 <img class="ztext-math" alt="\sqrt{x}" src="/formula.svg"></p>`);
   assert.ok(result.markdown.includes("$x^2$"));

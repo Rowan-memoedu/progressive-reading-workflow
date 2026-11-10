@@ -49,7 +49,7 @@ export async function reconcileInVault(absolutePaths, app, nodePath, nodeFs) {
   return {status:files.every(file=>file.status==='visible') ? 'visible' : 'pending',files};
 }
 
-export async function ensureObsidianVisible(artifacts, {run = execute, platform = process.platform} = {}) {
+export async function ensureObsidianVisible(artifacts, {run = execute, platform = process.platform, vault} = {}) {
   if (platform !== 'win32') return {status:'unsupported_platform'};
   const options = {windowsHide:true,timeout:15000,maxBuffer:1024*1024};
   try {
@@ -62,7 +62,7 @@ export async function ensureObsidianVisible(artifacts, {run = execute, platform 
     const quote = value => "'" + value.replaceAll("'", "''") + "'";
     // Obsidian.com needs the PowerShell console host on Windows; a direct
     // child_process invocation can wait indefinitely without dispatching the CLI.
-    const command = `& ${quote(cli)} eval ${quote(argument)}`;
+    const command = `& ${quote(cli)} ${vault ? quote('vault='+vault)+' ' : ''}eval ${quote(argument)}`;
     const {stdout} = await run('pwsh.exe',['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(command,'utf16le').toString('base64')],options);
     const payload = stdout.trim().replace(/^=>\s*/u,'');
     return JSON.parse(payload);

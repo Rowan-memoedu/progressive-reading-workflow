@@ -90,6 +90,7 @@
         "raw_feed_content": { "type": "string" },
         "raw_item_page": { "type": ["string", "null"] },
         "raw_item_page_response": { "type": ["string", "null"] },
+        "raw_original_article": { "type": "string" },
         "raw_feed_snapshot": { "type": "string" },
         "preprocess_request": { "type": ["string", "null"] }
       },

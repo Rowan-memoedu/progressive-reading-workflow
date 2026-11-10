@@ -3,15 +3,17 @@ import path from 'node:path';
 import { assertLocalRequest } from '../subscription-workflow/http.mjs';
 import { readSources, saveSiteSource, listRuns, readRun, CODE_ROOT } from './store.mjs';
 import { startSiteRun } from './tasks.mjs';
+import {resolveSourceRelation} from '../scripts/source-relations.mjs';
 
 const assets=new Map([['/imports',['index.html','text/html']],['/imports/',['index.html','text/html']],['/imports/app.mjs',['app.mjs','text/javascript']],['/imports/style.css',['style.css','text/css']]]);
 const send=(res,status,value)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(value));};
 function brief(run){if(!run)return null;const {collection,results,...rest}=run;return {...rest,result_count:results?.length||0,index:collection?.verification?.index||null,excluded_count:collection?.inventory?.excluded_count||0,error:collection?.error||null};}
 export async function handleImportCenter(req,res,{root,broker,runRequest,legacyJobs=()=>[]}={}) {
   const url=new URL(req.url,'http://127.0.0.1');
-  if(!assets.has(url.pathname)&&!url.pathname.startsWith('/api/site-imports')&&!url.pathname.startsWith('/api/import-center'))return false;
+  if(!assets.has(url.pathname)&&!url.pathname.startsWith('/api/site-imports')&&!url.pathname.startsWith('/api/import-center')&&url.pathname!=='/api/source-relations')return false;
   try{
     assertLocalRequest(req);
+    if(req.method==='GET'&&url.pathname==='/api/source-relations'){send(res,200,await resolveSourceRelation(root,url.searchParams.get('url')));return true;}
     if(assets.has(url.pathname)&&req.method==='GET'){
       const [file,type]=assets.get(url.pathname),content=await fs.readFile(path.join(CODE_ROOT,'site-import','web',file));
       res.writeHead(200,{'Content-Type':type+'; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer',

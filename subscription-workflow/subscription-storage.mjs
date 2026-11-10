@@ -6,6 +6,7 @@ import {renameWithRetry} from '../rss-source/core.mjs';
 import {materialKey} from './catalog.mjs';
 import {readingDestination} from './reading-options.mjs';
 import {moveReport,relocatedMarkdown,relocatedPath} from './report-archive.mjs';
+import {readSources as readSiteSources} from '../site-import/store.mjs';
 
 const zones=['阅读区','待归档原文','已归档原文'];
 const inside=(base,file)=>{const relative=path.relative(base,file);return relative!== '..'&&!relative.startsWith('..'+path.sep)&&!path.isAbsolute(relative);};
@@ -49,6 +50,7 @@ function rewriteMetadata(value,mapping,root,hashes,key=''){
 export async function planReadingOrganization(root,{onProgress=()=>{}}={}){
   root=path.resolve(root);
   const p=paths(root),config=await loadConfig(root);if(!config)throw new Error('subscription_configuration_missing');
+  const siteRoots=(await readSiteSources(root)).sources.flatMap(source=>zones.map(zone=>path.join(root,zone,source.destination)));
   const ledgerPath=path.join(root,'imports/rss-reading/review-ledger.v1.json'),autoPath=path.join(config.rss_home,'state.json'),videoPath=path.join(config.video_home,'state.json');
   const ledger=await readJson(ledgerPath,{items:{}}),auto=await readJson(autoPath,{items:{}}),video=await readJson(videoPath,{entries:{}});
   const ownersByPath=new Map(),ownersByUrl=new Map();
@@ -89,7 +91,7 @@ export async function planReadingOrganization(root,{onProgress=()=>{}}={}){
       if(owners&&!target){
         const owner=owners.find(s=>s.name&&relative.includes(s.name))||owners[0];owners=[owner,...owners.filter(s=>s!==owner)];
         const destinationRoot=path.join(root,zone,sourceDestination(owner));
-        target=inside(destinationRoot,file)?file:path.join(destinationRoot,path.basename(file));
+        target=inside(destinationRoot,file)||siteRoots.some(base=>inside(base,file))?file:path.join(destinationRoot,path.basename(file));
       }
     }
     if(!target||target===file)continue;

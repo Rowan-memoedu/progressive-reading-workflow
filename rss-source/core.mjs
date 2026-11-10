@@ -2,10 +2,10 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
 import Parser from "rss-parser";
-import TurndownService from "turndown";
+import {htmlArticleToMarkdown} from '../scripts/browser-page-markdown.mjs';
+import {ARTICLE_EXTRACTION_VERSION,originalArticleTarget} from './article-fetch.mjs';
 
 export const SOURCE_PACKAGE_SCHEMA = "progressive-reading.rss-source-package/v1";
 export const PREPROCESS_SCHEMA = "progressive-reading.preprocess.request/v1";
@@ -24,7 +24,6 @@ const parser = new Parser({
     ]
   }
 });
-const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
 
 export function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -88,11 +87,11 @@ function exactText(value) {
   return value == null ? "" : String(value);
 }
 
-function markdownFromHtmlOrText(value) {
+function markdownFromHtmlOrText(value,baseUrl) {
   const source = exactText(value).trim();
   if (!source) return "";
   if (!/<[A-Za-z!/][^>]*>/u.test(source)) return source.replace(/\r\n/gu, "\n").trim();
-  return turndown.turndown(source).replace(/\r\n/gu, "\n").trim();
+  return htmlArticleToMarkdown({html:source,sourceUrl:baseUrl,extractArticle:false}).markdown;
 }
 
 function looksLikeTeaser(raw, markdown) {
@@ -112,10 +111,10 @@ function restrictedPageReason(raw) {
   return "";
 }
 
-function chooseFeedContent(item, format) {
+function chooseFeedContent(item, format,baseUrl) {
   const encoded = exactText(item.contentEncoded || item["content:encoded"]);
   if (encoded.trim()) {
-    const markdown = markdownFromHtmlOrText(encoded);
+    const markdown = markdownFromHtmlOrText(encoded,baseUrl);
     if (looksLikeTeaser(encoded, markdown)) {
       return { raw: encoded, markdown, status: "summary_only", ref: "feed-content-encoded-truncated" };
     }
@@ -123,7 +122,7 @@ function chooseFeedContent(item, format) {
   }
   if (format === "atom" && exactText(item.content).trim()) {
     const content = exactText(item.content);
-    const markdown = markdownFromHtmlOrText(content);
+    const markdown = markdownFromHtmlOrText(content,baseUrl);
     if (looksLikeTeaser(content, markdown)) {
       return { raw: content, markdown, status: "summary_only", ref: "atom-content-truncated" };
     }
@@ -131,7 +130,7 @@ function chooseFeedContent(item, format) {
   }
   const summary = exactText(item.summary || item.content || item.description || item.contentSnippet);
   if (summary.trim()) {
-    return { raw: summary, markdown: markdownFromHtmlOrText(summary), status: "summary_only", ref: "feed-summary" };
+    return { raw: summary, markdown: markdownFromHtmlOrText(summary,baseUrl), status: "summary_only", ref: "feed-summary" };
   }
   return { raw: "", markdown: "", status: "summary_only", ref: "feed-empty" };
 }
@@ -147,7 +146,9 @@ export async function parseFeedDocument(xml, feedUrl) {
     throw new Error(`feed_parse_failed_${error.message}`, { cause: error });
   }
   const items = (feed.items || []).map((item, index) => {
-    const content = chooseFeedContent(item, format);
+    let contentBase=normalizedFeedUrl;
+    try {contentBase=new URL(item.link || item.url || normalizedFeedUrl,normalizedFeedUrl).href;}catch{/* Malformed item links are handled below. */}
+    const content = chooseFeedContent(item, format,contentBase);
     let itemUrl = "";
     try {
       itemUrl = normalizeUrl(item.link || item.url || "");
@@ -195,17 +196,7 @@ export async function validateFeedDocument(xml, feedUrl) {
 }
 
 export function extractArticleMarkdown(html, itemUrl) {
-  const dom = new JSDOM(String(html || ""), { url: normalizeUrl(itemUrl) });
-  const article = new Readability(dom.window.document).parse();
-  if (!article?.content) throw new Error("readability_no_article");
-  const markdown = markdownFromHtmlOrText(article.content);
-  if (!markdown.trim()) throw new Error("readability_empty_article");
-  return {
-    title: exactText(article.title).trim(),
-    byline: exactText(article.byline).trim(),
-    excerpt: exactText(article.excerpt).trim(),
-    markdown
-  };
+  return htmlArticleToMarkdown({html:String(html || ''),sourceUrl:normalizeUrl(itemUrl)});
 }
 
 function safeSegment(value, fallback = "item") {
@@ -270,8 +261,8 @@ export function buildPreprocessRequest({ markdown, metadata, userInstruction = "
     source_type: "rss",
     source_metadata: {
       source_url: metadata.item_url || metadata.feed_url,
-      canonical_url: metadata.item_url || metadata.feed_url,
-      original_url: metadata.item_url || metadata.feed_url,
+      canonical_url: metadata.original_url || metadata.item_url || metadata.feed_url,
+      original_url: metadata.original_url || metadata.item_url || metadata.feed_url,
       feed_url: metadata.feed_url,
       item_url: metadata.item_url,
       guid: metadata.guid,
@@ -425,18 +416,23 @@ export async function syncFeedDocument({
     let markdownBody = item.feed_content.markdown;
     let rawPageHtml = "";
     let itemPageResponse = null;
+    let originalArticle = null;
+    const refreshRichText=fetchFulltext && existingPackage?.content_status==='fulltext_ready'
+      && originalArticleTarget(item.item_url) && existingPackage.receipt?.fulltext_evidence?.extraction_version!==ARTICLE_EXTRACTION_VERSION;
     const errors = [];
 
-    if (contentStatus === "summary_only" && item.item_url) {
+    if ((contentStatus === "summary_only" || refreshRichText) && item.item_url) {
       statusHistory.push("fetch_required");
       contentStatus = "fetch_required";
-      if (fetchFulltext && existingPackage?.content_status !== "fulltext_ready") {
+      if (fetchFulltext && (existingPackage?.content_status !== "fulltext_ready" || refreshRichText)) {
         try {
           if (typeof articleFetcher !== "function") throw new Error("article_fetcher_missing");
           const page = await articleFetcher(item.item_url);
           rawPageHtml = exactText(page.html ?? page);
           itemPageResponse = page && typeof page === "object" ? page.response || null : null;
-          const article = extractArticleMarkdown(rawPageHtml, item.item_url);
+          const article = typeof page.markdown==='string' ? {markdown:page.markdown,title:page.title} : extractArticleMarkdown(rawPageHtml, item.item_url);
+          originalArticle=page.original || null;
+          if(originalArticleTarget(item.item_url) && !originalArticle)throw new Error('rss_reader_page_missing_original_markdown');
           const restriction = restrictedPageReason(rawPageHtml);
           if (restriction) throw new Error(restriction);
           if (looksLikeTeaser(rawPageHtml, article.markdown)) throw new Error("fetched_article_looks_truncated");
@@ -445,8 +441,8 @@ export async function syncFeedDocument({
             throw new Error(`fetched_article_too_short_${article.markdown.length}_required_${minimumFulltextLength}`);
           }
           markdownBody = article.markdown;
-          rawContent = rawPageHtml;
-          sourceRef = "item-page-readability";
+          rawContent = originalArticle?.raw || rawPageHtml;
+          sourceRef = originalArticle ? 'item-page-original-markdown' : "item-page-readability";
           contentStatus = "fulltext_ready";
           statusHistory.push("fulltext_ready");
         } catch (error) {
@@ -462,8 +458,8 @@ export async function syncFeedDocument({
     // second active package for the same GUID/item URL.
     const existingStatus = existingPackage?.content_status || null;
     const updatesExisting = Boolean(existingPackage
-      && existingStatus !== "fulltext_ready"
-      && ["fulltext_ready", "fetch_failed"].includes(contentStatus));
+      && ((existingStatus !== "fulltext_ready" && ["fulltext_ready", "fetch_failed"].includes(contentStatus))
+        || (refreshRichText && contentStatus==='fulltext_ready')));
     if (existingPackage && !updatesExisting) {
       if (state.materials[duplicate.material_id]) state.materials[duplicate.material_id].last_seen_at = fetchedAt;
       const occurrence = {
@@ -483,6 +479,10 @@ export async function syncFeedDocument({
     const previous = previousRecord(state, identity);
     const id = updatesExisting ? duplicate.material_id : materialId(identity);
     const sourceMarkdown = buildSourceMarkdown(item.title, markdownBody || item.feed_content.markdown);
+    const revisionRoot=refreshRichText ? `revisions/${sha256(sourceMarkdown)}` : '';
+    const sourceFile=revisionRoot ? `${revisionRoot}/source.md` : 'source.md';
+    const requestFile=revisionRoot ? `${revisionRoot}/preprocess-request.json` : 'preprocess-request.json';
+    const originalFile=originalArticle ? `${revisionRoot ? revisionRoot+'/' : ''}raw/original-article.json` : null;
     const metadata = {
       source_type: "rss",
       feed_url: normalizedFeedUrl,
@@ -494,6 +494,7 @@ export async function syncFeedDocument({
       fetched_at: fetchedAt,
       content_completeness: contentStatus,
       original_source_ref: sourceRef,
+      ...(originalArticle ? {original_url:originalArticle.url} : {}),
       user_instruction: userInstruction
     };
     const packageDir = updatesExisting ? duplicate.package_path : path.join(root, "packages", sourceId, safeSegment(id));
@@ -507,14 +508,15 @@ export async function syncFeedDocument({
       identity,
       source_metadata: metadata,
       artifacts: {
-        source_markdown: "source.md",
+        source_markdown: sourceFile,
         source_metadata: "source-metadata.json",
         raw_item: "raw/item.json",
         raw_feed_content: "raw/feed-content.txt",
         raw_item_page: rawPageHtml ? "raw/item-page.html" : null,
         raw_item_page_response: rawPageHtml ? "raw/item-page-response.json" : null,
+        ...(originalFile ? {raw_original_article:originalFile} : {}),
         raw_feed_snapshot: relativePath(packageDir, rawFeedPath),
-        preprocess_request: contentStatus === "fulltext_ready" ? "preprocess-request.json" : null
+        preprocess_request: contentStatus === "fulltext_ready" ? requestFile : null
       },
       hashes: {
         raw_feed_sha256: sha256(String(xml)),
@@ -530,6 +532,8 @@ export async function syncFeedDocument({
         update_from_status: updatesExisting ? existingStatus : null,
         fulltext_evidence: {
           source_ref: sourceRef,
+          ...(rawPageHtml ? {extraction_version:ARTICLE_EXTRACTION_VERSION} : {}),
+          ...(originalArticle ? {original_url:originalArticle.url,original_api:originalArticle.api,original_response:originalArticle.response} : {}),
           feed_markdown_length: item.feed_content.markdown.length,
           selected_markdown_length: markdownBody.length
         }
@@ -547,10 +551,11 @@ export async function syncFeedDocument({
           headers: {}
         });
       }
-      await writeTextAtomic(path.join(packageDir, "source.md"), sourceMarkdown);
+      if(originalFile)await writeTextAtomic(path.join(packageDir,originalFile),originalArticle.raw);
+      await writeTextAtomic(path.join(packageDir, sourceFile), sourceMarkdown);
       await writeJsonAtomic(path.join(packageDir, "source-metadata.json"), metadata);
       if (contentStatus === "fulltext_ready") {
-        await writeJsonAtomic(path.join(packageDir, "preprocess-request.json"), buildPreprocessRequest({
+        await writeJsonAtomic(path.join(packageDir, requestFile), buildPreprocessRequest({
           markdown: sourceMarkdown,
           metadata,
           userInstruction
@@ -627,10 +632,11 @@ export async function syncFeedDocument({
           headers: {}
         });
       }
-      await fs.writeFile(path.join(temporary, "source.md"), sourceMarkdown, "utf8");
+      if(originalFile)await writeTextAtomic(path.join(temporary,originalFile),originalArticle.raw);
+      await fs.writeFile(path.join(temporary, sourceFile), sourceMarkdown, "utf8");
       await writeJson(path.join(temporary, "source-metadata.json"), metadata);
       if (contentStatus === "fulltext_ready") {
-        await writeJson(path.join(temporary, "preprocess-request.json"), buildPreprocessRequest({
+        await writeJson(path.join(temporary, requestFile), buildPreprocessRequest({
           markdown: sourceMarkdown,
           metadata,
           userInstruction

@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { dataPath } from '../scripts/runtime-paths.mjs';
 import { readJson, writeJson, withLock, canonicalUrl, digest } from '../subscription-workflow/config.mjs';
 import { normalizeRelativeDestinationFolder } from '../scripts/import-destination-routing.mjs';
+import { repositoryConfig } from './repository-config.mjs';
 
 export const CODE_ROOT = path.resolve(import.meta.dirname,'..');
 export const now = () => new Date().toISOString();
@@ -38,7 +39,9 @@ export function normalizeSiteSource(value,previous={}) {
   return {...previous,id:previous.id || 'site-'+randomUUID(),name,url,scope,destination,processing_mode:mode,
     translation_mode:translation,generate_guide:value.generate_guide ?? previous.generate_guide ?? false,
     include_paths:patterns('include_paths'),exclude_paths:patterns('exclude_paths'),instruction,
-    generate_index:value.generate_index ?? previous.generate_index ?? true,created_at:previous.created_at || now(),updated_at:now()};
+    generate_index:value.generate_index ?? previous.generate_index ?? true,
+    ...((value.repository || previous.repository)?{repository:repositoryConfig(value.repository || previous.repository,url)}:{}),
+    created_at:previous.created_at || now(),updated_at:now()};
 }
 export async function saveSiteSource(root,value,revision) {
   const p=sitePaths(root);

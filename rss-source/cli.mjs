@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import {fetchArticleContent} from './article-fetch.mjs';
 import { configPath as subscriptionDocumentPath } from '../rss-import/config.mjs';
 import { fileURLToPath } from "node:url";
 
@@ -153,8 +154,7 @@ async function sync(options) {
   if (!Number.isInteger(maxItems) || maxItems < 0 || maxItems > 100) throw new Error("limit_must_be_integer_1_to_100");
   const articleFetcher = fetchFulltext
     ? async (itemUrl) => {
-        const page = await fetchText(itemUrl, { maxBytes: 12 * 1024 * 1024 });
-        return { html: page.text, response: responseMetadata(page.response, page.finalUrl) };
+        return fetchArticleContent(itemUrl,fetchText);
       }
     : null;
   return syncFeedDocument({

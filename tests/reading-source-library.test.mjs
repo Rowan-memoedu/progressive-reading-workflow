@@ -17,6 +17,23 @@ test('Bilibili share links preserve distinct parts while reusing the first-part 
   assert.equal(urlImportDedupeKey('http://bilibili.com/video/BV1234567890/?p=1&vd_source=tracking'),urlImportDedupeKey('https://www.bilibili.com/video/BV1234567890/'));
   assert.notEqual(urlImportDedupeKey('https://www.bilibili.com/video/BV1234567890/?p=2'),urlImportDedupeKey('https://www.bilibili.com/video/BV1234567890/'));
 });
+test('RSS reader URL and original page reuse proven extraction aliases in both orders',async t=>{
+  const root=await fixture(t),reader='https://independent.test/feed/read?id=0',page='https://independent.test/posts/zero';
+  const request=path.join(root,'rss-request.json');await writeJson(request,{source_metadata:{source_url:reader,canonical_url:reader,original_url:page,original_source_ref:'item-page-original-markdown'}});
+  await writeJson(path.join(root,'imports/rss-reading/review-ledger.v1.json'),{items:{rss:{item_url:reader,preprocess_request_path:request}}});
+  const file=await article(root,'阅读区',reader);
+  assert.equal((await findSourcePublication(root,page)).path,file);
+  await fs.unlink(file);const site=await article(root,'阅读区',page,'site.md');
+  assert.equal((await findSourcePublication(root,reader)).path,site);
+  const result=await resultForAlias(reader,page);
+  const publication=await publishReadingArtifact(result,{publishPath:path.join(root,'阅读区','rss-new.md')});assert.equal(publication.markdown.path,site);assert.equal(publication.preserved_existing,true);
+});
+test('a completed RSS article wins over a later site copy and stale reading receipt',async t=>{
+  const root=await fixture(t),url='https://state.test/post';const stale=await article(root,'阅读区',url,'later-copy.md'),completed=await article(root,'待归档原文',url,'completed.md');
+  await writeJson(path.join(root,'imports/rss-reading/review-ledger.v1.json'),{items:{rss:{item_url:url,publication:{path:stale}}}});
+  assert.equal((await findSourcePublication(root,url)).path,completed);
+});
+async function resultForAlias(reader,page){const value=await result(reader);value.source_metadata={...value.source_metadata,original_url:page,original_source_ref:'item-page-original-markdown'};return value;}
 async function fixture(t) {
   await fs.mkdir(base,{recursive:true});
   const root=await fs.mkdtemp(path.join(base,'case-'));

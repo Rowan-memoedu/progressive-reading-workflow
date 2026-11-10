@@ -52,7 +52,7 @@ export async function handleSubscriptions(req,res,root=codeRoot) {
     } else if(url.pathname==='/api/subscriptions/resolve') {
       json(res,200,await resolveMode(root,input.id,input.mode));
     } else if(url.pathname==='/api/subscriptions/open-report') {
-      const current=await status(root),target=current.reports.find(file=>file===input.path);
+      const current=await status(root),target=[...current.reports,current.exception_path].find(file=>file && file===input.path);
       if(!target)throw new Error('报告不存在或不属于订阅报告');
       await fs.access(target);
       const child=spawn('notepad.exe',[target],{windowsHide:false,stdio:'ignore'});

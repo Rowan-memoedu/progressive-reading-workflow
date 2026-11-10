@@ -5,12 +5,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import sanitizeFilename from "sanitize-filename";
-import {readingDestination} from "../subscription-workflow/reading-options.mjs";
 import { standardWorkflowOptions } from "../standard-preprocessing/index.mjs";
 import { renameWithRetry } from "../rss-source/core.mjs";
 import { publicationMetadata } from "../subscription-workflow/publication-time.mjs";
 import { includesPublication } from "../subscription-workflow/history.mjs";
-import { appendShortReport, shortKey, rollShortReports, archiveSummaryReports } from "../subscription-workflow/report-archive.mjs";
+import { appendShortReport, shortKey, rollShortReports, archiveSummaryReports, replaceChecked } from "../subscription-workflow/report-archive.mjs";
+import { directArticle, obsidianReadingLink, readingDestination } from '../subscription-workflow/reading-options.mjs';
+import { normalizeReportLocations, savedReviewCards, mergeReviewCard, weeklyFromPreviousReports, verifyReviewSources } from '../subscription-workflow/report-routing.mjs';
+import { deliverArticle, readingRequest, addReadingGuide, archiveArticle, readingCache } from '../subscription-workflow/reading-delivery.mjs';
+import { removeBlockedCards, recordBlockedArticles } from '../subscription-workflow/exception-log.mjs';
+import { refreshObsidianLinks } from '../subscription-workflow/obsidian-links.mjs';
 import { loadSubscriptionRegistry } from '../rss-source/subscriptions.mjs';
 import { active as unifiedActive, canonicalCatalog, mergeIdentity, findExistingPublication } from '../subscription-workflow/catalog.mjs';
 import { findSourcePublication, withSourcePublication } from '../scripts/reading-source-library.mjs';
@@ -381,6 +385,8 @@ export async function scanCatalog(workflowRoot = DEFAULT_WORKFLOW_ROOT) {
       sourceId: pkg.receipt?.source_id || "",
       errors: pkg.errors || [],
       sourceEvidence: {
+        raw_original_article:pkg.artifacts?.raw_original_article
+          ? path.resolve(packageDir,pkg.artifacts.raw_original_article) : null,
         raw_item_page: pkg.artifacts?.raw_item_page
           ? path.resolve(packageDir, pkg.artifacts.raw_item_page)
           : null,
@@ -470,8 +476,9 @@ export async function syncLedger(workflowRoot = DEFAULT_WORKFLOW_ROOT, catalog =
       history: []
     };
     const sourceRevision = current.preservedSourceRevision || sha256(`${current.packageSha256}:${current.requestSha256 || "blocked"}:${current.contentStatus}:${current.route}`);
-    if(current.subscriptionName)item.subscription_name=current.subscriptionName;
-    if(current.subscriptionKind)item.subscription_kind=current.subscriptionKind;
+    if (current.readingOptions) item.reading_options = current.readingOptions;
+    if (current.subscriptionName) item.subscription_name = current.subscriptionName;
+    if (current.subscriptionKind) item.subscription_kind = current.subscriptionKind;
     const observedAt = nowIso();
     item.published_at ||= current.publishedAt || null;
     if (current.externallyPublished && existsSync(current.externallyPublished.path)) {
@@ -578,6 +585,13 @@ function sourceLabel(item) {
 }
 
 function decisionLabel(item) {
+  if (directArticle(item)) {
+    if (item.publication_failure) return '所选动作处理失败，等待重试';
+    if (item.publication?.status === 'archived') return '已移出阅读区';
+    if (item.decision === 'deferred') return '已加入稍后读';
+    if (item.decision === 'selected' && item.reading_guide?.status === 'ready') return '导读卡已生成';
+    return item.publication?.status === 'published' ? '阅读区正文已就绪' : '正在翻译并接收正文';
+  }
   if (item.decision === "selected" && item.publication?.status === "published") return "已正式入库";
   if (item.decision === "deferred" && item.later?.status === "ready") return `已入库，Later 至 ${String(item.later.defer_until || "").slice(0, 10)}`;
   if (item.publication_failure) return "自动发布失败，等待重试";
@@ -604,6 +618,11 @@ function longReviewBlock(item, index, options = {}) {
   const ready = preview.status === "ready";
   const actions = options.active === false ? [
     historicalReviewNotice(item)
+  ] : directArticle(item) ? [
+    checkbox(item.decision === 'dismissed','移出阅读区'),
+    checkbox(item.decision === 'deferred','稍后读'),
+    checkbox(item.decision === 'selected' && item.publication_authorized,'生成导读卡'),
+    item.publication?.status === 'published' ? `[立刻阅读](${item.publication.obsidian_uri || obsidianReadingLink(item.publication.path)})` : '文章正在翻译并进入阅读区。'
   ] : [
     checkbox(item.decision === "selected" && item.publication_authorized, "正式入库（自动处理并发布）"),
     checkbox(item.decision === "deferred", "稍后再看（入库后 Later 7 天）"),
@@ -619,7 +638,7 @@ function longReviewBlock(item, index, options = {}) {
     "",
     `**当前状态**：${decisionLabel(item)}`,
     item.available_revision ? '> 来源有更新；当前卡片与已入库正文保持原版本。' : '',
-    `**一句话核心**：${ready ? firstSentence(preview.core, 180) : "预览处理尚未完成，暂不建议审批。"}`,
+    `**${directArticle(item) ? '内容概述' : '一句话核心'}**：${ready && preview.core ? firstSentence(preview.core, 360) : "概述正在生成。"}`,
     `**为什么值得读**：${ready ? `${humanValue(preview.value_level)}；${firstSentence(preview.value_reason, 180)}` : "待判断"}`,
     `**可能新增量**：${ready ? firstSentence(preview.novelty || preview.core, 180) : "待判断"}`,
     `**预计阅读成本**：${readingCost(item.meaningful_length)}`,
@@ -718,9 +737,9 @@ function parseSummaryDecisions(text, file, activeItem = null) {
       continue;
     }
     const actions = [
-      { decision: "selected", authorize: true, pattern: /^- \[([ xX])\] 正式入库（(?:通过并授权|自动处理并发布)）$/gmu },
-      { decision: "deferred", authorize: true, pattern: /^- \[([ xX])\] 稍后再看(?:（入库后 Later 7 天）)?$/gmu },
-      { decision: "dismissed", authorize: false, pattern: /^- \[([ xX])\] 不保留$/gmu }
+      { decision: "selected", authorize: true, pattern: /^- \[([ xX])\] (?:生成导读卡|正式入库（(?:通过并授权|自动处理并发布)）)$/gmu },
+      { decision: "deferred", authorize: true, pattern: /^- \[([ xX])\] (?:稍后读|稍后再看(?:（入库后 Later 7 天）)?)$/gmu },
+      { decision: "dismissed", authorize: false, pattern: /^- \[([ xX])\] (?:不保留|移出阅读区)$/gmu }
     ];
     const present = actions.map((action) => ({ ...action, matches: [...block.matchAll(action.pattern)] }));
     if (present.every((action) => action.matches.length === 0)) continue;
@@ -789,10 +808,14 @@ async function ingestExistingSummaries(paths, ledger) {
       publication_authorized: item.publication_authorized,
       source: change.file
     });
-    if (['selected', 'deferred'].includes(item.decision)) item.pending_markdown_action = item.decision;
+    if (['selected', 'deferred'].includes(item.decision) || (item.decision === 'dismissed' && directArticle(item))) item.pending_markdown_action = item.decision;
     else {
       delete item.pending_markdown_action;
-      if (paths.unified && item.decision === "dismissed") item.delivery.active_review_path = null;
+      if (paths.unified && item.decision === "dismissed") {
+        item.delivery.active_review_path = null;
+        delete item.publication_failure;
+        delete item.requested_action;
+      }
       if (item.decision === "unresolved") {
         delete item.publication_failure;
         delete item.requested_action;
@@ -825,14 +848,21 @@ function boundedScreeningExcerpt(markdown, maxLength = 6000) {
 async function buildConsumerRequest(item, mode) {
   const request = await readJson(item.preprocess_request_path);
   if (!request) throw new Error(`preview_request_missing:${item.material_id}`);
+  if(mode==='saved_reading') {
+    const saved=await fs.readFile(item.publication.path,'utf8');
+    const body=parseReadingSections(saved).translated;
+    if(!body)throw new Error(`saved_reading_body_missing:${item.material_id}`);
+    return {...request,material:{markdown:boundedScreeningExcerpt(body)},
+      source_metadata:{...request.source_metadata,language:'zh'},
+      user_instruction:consumerInstruction('long_review_excerpt',request.user_instruction),
+      processing_options:standardWorkflowOptions({workflow_mode:'single_stage',cleaning_mode:'source_voice_structuring',
+        input_form:'written',source_language:'zh',content_profile:'natural_language',
+        spoken_to_written:false,structure_body:false,translate:false,include_reading_guide:true,
+        insight_soft_min:1,insight_soft_max:3,insight_safety_cap:5})};
+  }
+  if (mode === 'publication' && item.reading_options) return readingRequest(request,item);
   if (mode === "short_aggregate") {
-    return {
-      ...request,
-      processing_options: standardWorkflowOptions({
-        ...request.processing_options,
-        workflow_mode: "standard"
-      })
-    };
+    return item.reading_options ? readingRequest(request,item,false) : {...request,processing_options:standardWorkflowOptions(request.processing_options)};
   }
   const workflowMode = mode === "long_review" ? "single_stage" : "standard";
   const material = mode === "long_review_excerpt"
@@ -859,7 +889,7 @@ function reviewPreviewFromResult(item, result, request, evidence) {
   const semantic = result.artifacts?.semantic;
   const firstInsight = semantic?.insights?.[0];
   const secondInsight = semantic?.insights?.[1];
-  if (!semantic?.judgments?.value || !firstInsight?.description) throw new Error(`preview_semantic_missing:${item.material_id}`);
+  if (item.route !== 'short_aggregate' && (!semantic?.judgments?.value || !firstInsight?.description)) throw new Error(`preview_semantic_missing:${item.material_id}`);
   const preview = {
     schema_version: "progressive-reading.rss-review-preview/v1",
     preview_version: REVIEW_PREVIEW_VERSION,
@@ -876,12 +906,12 @@ function reviewPreviewFromResult(item, result, request, evidence) {
     processor_version: result.receipt?.processor_version || null,
     prompt_version: result.receipt?.prompt_version || null,
     translation_state: result.translation_state,
-    core: firstSentence(firstInsight.description),
-    novelty: firstSentence(secondInsight?.description || firstInsight.description),
-    value_level: semantic.judgments.value.level,
-    value_reason: compactText(semantic.judgments.value.reason),
-    density_level: semantic.judgments.density?.level || null,
-    continue_reading: semantic.judgments.continue_reading || null
+    core: firstSentence(firstInsight?.description || ''),
+    novelty: firstSentence(secondInsight?.description || firstInsight?.description || ''),
+    value_level: semantic?.judgments?.value?.level || null,
+    value_reason: compactText(semantic?.judgments?.value?.reason),
+    density_level: semantic?.judgments?.density?.level || null,
+    continue_reading: semantic?.judgments?.continue_reading || null
   };
   if (item.route === "short_aggregate") {
     const sections = parseReadingSections(result.artifacts.reading_markdown);
@@ -905,20 +935,37 @@ async function defaultPreviewRunner({ paths, request, outputDir }) {
     "run",
     "--request", requestPath,
     "--output", outputDir,
+    ...(paths.unified ? ['--cache',readingCache,'--provider','codex_exec'] : []),
     "--strict"
   ], { cwd: paths.workflowRoot, timeoutMs: 1200000 });
   return { result: await readJson(path.join(outputDir, "result.json")) };
 }
 
 async function ensureReviewPreview(paths, item, options = {}) {
+  if (paths.unified && directArticle(item) && item.eligible_for_preprocess) {
+    await deliverArticle(paths,item,safeTitle(item.title,item.material_id),options);
+  }
   if (!item.eligible_for_preprocess || item.route === "blocked") {
     item.review_preview = { status: "blocked", reason: `source_not_ready_${item.content_status}` };
     return item.review_preview;
   }
   if (paths.unified && item.review_preview?.status === 'ready'
+    && (item.route!=='long_review' || item.review_preview.core)
     && item.review_preview.source_request_sha256 === item.preprocess_request_sha256
     && item.review_preview.result_path && existsSync(item.review_preview.result_path)) return item.review_preview;
-  const variants = item.route === "long_review" ? (item.platform === 'bilibili' ? ["long_review"] : ["long_review", "long_review_excerpt"]) : [item.route];
+  if(paths.unified && directArticle(item)) {
+    const folder=path.join(paths.previewsRoot,item.material_id);
+    for(const entry of await fs.readdir(folder,{withFileTypes:true}).catch(error=>{if(error.code==='ENOENT')return [];throw error;})) {
+      if(!entry.isDirectory())continue;
+      const cached=await readJson(path.join(folder,entry.name,'preview.json'));
+      if(cached?.status==='ready' && cached.core && cached.source_request_sha256===item.preprocess_request_sha256
+        && cached.result_path && existsSync(cached.result_path) && await fileSha256(cached.result_path)===cached.result_sha256) {
+        return item.review_preview=cached;
+      }
+    }
+  }
+  const variants = paths.unified && directArticle(item) ? ['saved_reading']
+    : item.route === "long_review" ? (item.platform === 'bilibili' ? ["long_review"] : ["long_review", "long_review_excerpt"]) : [item.route];
   const runner = options.previewRunner || defaultPreviewRunner;
   const errors = [];
   for (const variant of variants) {
@@ -991,8 +1038,11 @@ async function ensureReviewPreviews(paths, items, options = {}) {
         continue;
       }
       const completedCount = ++completed;
-      if (item.route === "short_aggregate" && options.deliverShort) {
-        const attempt = delivery.then(() => options.deliverShort(item));
+      if ((item.route === "short_aggregate" && options.deliverShort) || options.onArticleReady) {
+        const attempt = delivery.then(async () => {
+          if (item.route === 'short_aggregate') await options.deliverShort?.(item);
+          await options.onArticleReady?.(item);
+        });
         delivery = attempt.catch(() => {});
         try {
           await attempt;
@@ -1092,34 +1142,37 @@ function groupBySource(items) {
   return grouped;
 }
 
-async function writeSummary(target, content, itemCount) {
+async function writeSummary(target, content, itemCount, snapshots = null) {
   await fs.mkdir(path.dirname(target), { recursive: true });
   const normalized = `${String(content || "").trim()}\n`;
-  await fs.writeFile(target, normalized, "utf8");
+  if(snapshots) {
+    const expected=snapshots.has(target) ? snapshots.get(target) : await fs.readFile(target,'utf8').catch(error=>{if(error.code==='ENOENT')return null;throw error;});
+    await replaceChecked(target,expected,normalized);
+  } else await fs.writeFile(target, normalized, "utf8");
   return { path: target, sha256: sha256(normalized), item_count: itemCount };
 }
 
-async function renderDailySummary(target, date, longItems, blockedItems, shortCount) {
+async function renderDailySummary(target, date, longItems, blockedItems, shortCount, saved = new Map()) {
   const lines = [
     `# ${date} ${path.basename(path.dirname(target)) === '订阅' ? '订阅' : 'RSS'} 长文日报`,
     "",
     `本次增量有 ${longItems.length} 篇长文待筛选；${shortCount} 篇短文待收录；${blockedItems.length} 篇正文受来源限制或尚未就绪。`,
     "",
-    "审批方式：每篇最多勾选一个动作。不操作即维持未决；“正式入库”会自动执行标准预处理并发布；“稍后再看”会先发布，再进入 Local IR Later 7 天。",
+    "每篇最多勾选一个动作，保存后统一处理。未操作的篇目继续保留。立刻阅读链接在 Obsidian 新标签页中打开对应文章。",
     ""
   ];
   if (!longItems.length) lines.push("本日没有新的长文候选。", "");
   for (const [source, sourceItems] of groupBySource(longItems)) {
     lines.push(`## ${source}`, "");
-    sourceItems.forEach((item, index) => lines.push(longReviewBlock(item, index + 1, {
-      active: isActiveReviewAt(item, target)
-    }), ""));
+    sourceItems.forEach((item, index) => lines.push(mergeReviewCard(longReviewBlock(item, index + 1, {
+      active: saved.sourceSnapshots ? true : isActiveReviewAt(item, target)
+    }),saved.get(item.material_id)), ""));
   }
   if (blockedItems.length) {
     lines.push("## 正文受限或尚未就绪", "", "以下条目只保留可读的阻塞说明，不参与内容判断或审批。", "");
     blockedItems.forEach((item, index) => lines.push(blockedReviewBlock(item, index + 1), ""));
   }
-  return writeSummary(target, lines.join("\n"), longItems.length + blockedItems.length);
+  return writeSummary(target, lines.join("\n"), longItems.length + blockedItems.length,saved.sourceSnapshots);
 }
 
 async function renderShortWeekly(target, week, items) {
@@ -1207,25 +1260,25 @@ async function deliverShortToWeekUnlocked(paths, ledger, item, week) {
   await writeJson(paths.ledgerPath, ledger);
 }
 
-async function renderLongWeekly(target, week, items, blockedItems = []) {
+async function renderLongWeekly(target, week, items, blockedItems = [], saved = new Map()) {
   const lines = [
     `# ${week} ${path.basename(path.dirname(target)) === '订阅' ? '订阅' : 'RSS'} 长文周报`,
     "",
-    `本期汇总截至生成时仍未决定的 ${items.length} 篇长文。未操作条目会维持未决并滚入下一期。`,
+    `本期汇总此前日报与旧周报转来的 ${items.length} 篇未处理长文。新接收的内容优先在当天日报中处理。`,
     "",
-    "每篇最多勾选一个动作：“正式入库”自动处理并发布；“稍后再看”先发布再进入 Local IR Later 7 天；“不保留”退出活跃报告，但决定仍保留在 review ledger 中并可追溯恢复。",
+    "每篇最多勾选一个动作，保存后统一处理。未操作的篇目进入下一期。立刻阅读链接在 Obsidian 新标签页中打开对应文章。",
     ""
   ];
   if (!items.length) lines.push("本期没有活跃未决长文。", "");
   for (const [source, sourceItems] of groupBySource(items)) {
     lines.push(`## ${source}`, "");
-    sourceItems.forEach((item, index) => lines.push(longReviewBlock(item, index + 1, { active: true }), ""));
+    sourceItems.forEach((item, index) => lines.push(mergeReviewCard(longReviewBlock(item, index + 1, { active: true }),saved.get(item.material_id)), ""));
   }
   if (blockedItems.length) {
     lines.push("## 正文受限或尚未就绪", "", "以下未决条目继续等待来源层解除阻塞，当前不能审批入库。", "");
     blockedItems.forEach((item, index) => lines.push(blockedReviewBlock(item, index + 1), ""));
   }
-  return writeSummary(target, lines.join("\n"), items.length + blockedItems.length);
+  return writeSummary(target, lines.join("\n"), items.length + blockedItems.length,saved.sourceSnapshots);
 }
 
 async function refreshHistoricalReviewNotices(paths, ledger) {
@@ -1242,7 +1295,7 @@ async function refreshHistoricalReviewNotices(paths, ledger) {
         if (!original?.canonical_material_id && active && path.resolve(active) === path.resolve(file)) return block;
         const link = active ? path.relative(path.dirname(file),active).replaceAll('\\','/') : null;
         const notice = link ? `> 本条保留为历史记录；请在 [${path.basename(active)}](<${link}>) 操作。` : '> 本条保留为历史记录；目前没有待处理动作。';
-        const updated = block.replace(/^- \[[ xX]\] (?:正式入库|稍后再看|不保留)[^\r\n]*\r?\n?/gmu,'')
+        const updated = block.replace(/^- \[[ xX]\] (?:正式入库|稍后再看|不保留|移出阅读区|稍后读|生成导读卡)[^\r\n]*\r?\n?/gmu,'')
           .replace(/^\*\*当前状态\*\*：[^\r\n]*\r?\n?/gmu,'')
           .replace(/^> 本(?:页|条)[^\r\n]*(?:历史|当前|待处理)[^\r\n]*\r?\n?/gmu,'')
           .replace('<!-- rss-reading:end -->', notice+'\n<!-- rss-reading:end -->');
@@ -1285,12 +1338,17 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
   if (!/^\d{4}-W(?:0[1-9]|[1-4]\d|5[0-3])$/u.test(week) || !/^\d{4}-\d{2}-\d{2}$/u.test(date)) throw new Error("report_period_invalid");
   const mode = options.mode || "daily";
   if (!new Set(["daily", "weekly", "short-weekly", "all"]).has(mode)) throw new Error(`generation_mode_invalid:${mode}`);
-  const runDaily = mode === "daily" || mode === "all";
+  let runDaily = mode === "daily" || mode === "all";
   const runWeekly = mode === "weekly" || mode === "all";
   const shortOnly = mode === "short-weekly";
   const runShortWeekly = runWeekly || shortOnly;
   let synced = await syncLedger(workflowRoot);
   const { paths } = synced;
+  if(paths.unified && !shortOnly) {
+    runDaily=true;
+    await normalizeReportLocations(paths,synced.ledger);
+  }
+  if (paths.unified) await removeBlockedCards(paths,synced.ledger);
   const subscribedMaterialIds = new Set(synced.catalog.items.map(item=>item.materialId));
   let ledger = synced.ledger;
   ledger.report_runs ||= { daily: {}, weekly: {} };
@@ -1300,6 +1358,7 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
     ? await rollShortReports(paths, ledger, week, () => writeJson(paths.ledgerPath, ledger), sourceLabel)
     : [];
   const ingestedDecisions = !shortOnly && options.ingestSummaries !== false ? await ingestExistingSummaries(paths, ledger) : [];
+  const savedCards = paths.unified && !shortOnly ? await savedReviewCards(paths,ledger) : new Map();
   await writeJson(paths.ledgerPath, ledger);
   const decisionActions = { completed: [], failures: [] };
   if (options.executeDecisions !== false) {
@@ -1331,6 +1390,10 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
   const dailyPath = path.join(paths.summaryRoot, `${date} ${paths.reportLabel} 日报.md`);
   const longWeeklyPath = path.join(paths.summaryRoot, `${week} ${paths.reportLabel} 长文周报.md`);
   const shortWeeklyPath = path.join(paths.shortWeeklyRoot, `${week} ${paths.reportLabel} 短文周报.md`);
+  if(paths.unified && !shortOnly)for(const target of [dailyPath,...(runWeekly?[longWeeklyPath]:[])]) {
+    if(!savedCards.sourceSnapshots.has(target))savedCards.sourceSnapshots.set(target,
+      await fs.readFile(target,'utf8').catch(error=>{if(error.code==='ENOENT')return null;throw error;}));
+  }
 
   if (runDaily) {
     for (const item of items) {
@@ -1338,7 +1401,7 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
       if (item.route === "long_review" && delivery.long_daily_revision !== item.source_revision) {
         delivery.daily_report_key = date;
         delivery.daily_report_path = dailyPath;
-        delivery.active_review_path = dailyPath;
+        if(!paths.unified)delivery.active_review_path = dailyPath;
       } else if (item.route === "blocked" && delivery.blocked_daily_revision !== item.source_revision) {
         delivery.blocked_report_key = date;
         delivery.blocked_report_path = dailyPath;
@@ -1347,17 +1410,21 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
   }
 
   const dailyItems = runDaily ? items.filter((item) => item.route === "long_review" && item.delivery?.daily_report_key === date) : [];
-  const dailyBlocked = runDaily ? items.filter((item) => item.route === "blocked" && item.delivery?.blocked_report_key === date) : [];
+  const dailyBlocked = runDaily && !paths.unified ? items.filter((item) => item.route === "blocked" && item.delivery?.blocked_report_key === date) : [];
   const pendingShort = runShortWeekly ? items.filter((item) => item.route === "short_aggregate" && item.delivery?.short_weekly_revision !== item.source_revision) : [];
-  const weeklyLong = runWeekly ? items.filter((item) => item.route === "long_review" && item.decision === "unresolved" && item.eligible_for_preprocess) : [];
-  const weeklyBlocked = runWeekly ? items.filter((item) => item.route === "blocked" && item.decision !== "dismissed" && item.publication?.status !== "published") : [];
+  const weeklyLong = runWeekly ? paths.unified ? await weeklyFromPreviousReports(paths,ledger,items,date)
+    : items.filter((item) => item.route === "long_review" && item.decision === "unresolved" && item.eligible_for_preprocess) : [];
+  const weeklyBlocked = runWeekly && !paths.unified ? items.filter((item) => item.route === "blocked" && item.decision !== "dismissed" && item.publication?.status !== "published") : [];
   const previewTargets = uniqueItems([...dailyItems, ...pendingShort, ...weeklyLong]);
   const preview = await ensureReviewPreviews(paths, previewTargets, {
     ...options,
+    onArticleReady: paths.unified ? () => writeJson(paths.ledgerPath,ledger) : undefined,
     deliverShort: paths.unified
       ? item => deliverShortToWeek(paths, ledger, item, options.week || isoWeek())
       : undefined
   });
+  const obsidianLinks = paths.unified ? await refreshObsidianLinks(paths,items,options) : null;
+  if(paths.unified && !shortOnly)await verifyReviewSources(savedCards);
   const legacyCounts = ledger.legacy_import.counts;
   const batch = await latestBatch(paths);
   const legacyOutputMigration = await verifiedLegacyManifest(paths) || {
@@ -1371,8 +1438,11 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
   let longWeekly = null;
   let shortWeekly = null;
   if (runDaily && (dailyItems.length || dailyBlocked.length)) {
-    daily = await renderDailySummary(dailyPath, date, dailyItems, dailyBlocked, items.filter((item) => item.route === "short_aggregate" && item.delivery?.short_weekly_revision !== item.source_revision).length);
-    for (const item of dailyItems) item.delivery.long_daily_revision = item.source_revision;
+    daily = await renderDailySummary(dailyPath, date, dailyItems, dailyBlocked, items.filter((item) => item.route === "short_aggregate" && item.delivery?.short_weekly_revision !== item.source_revision).length,savedCards);
+    for (const item of dailyItems) {
+      item.delivery.long_daily_revision = item.source_revision;
+      item.delivery.active_review_path=dailyPath;
+    }
     for (const item of dailyBlocked) item.delivery.blocked_daily_revision = item.source_revision;
     ledger.report_runs.daily[date] = { path: daily.path, sha256: daily.sha256, generated_at: generatedAt };
   }
@@ -1408,7 +1478,7 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
         item.delivery.active_review_path = longWeeklyPath;
         item.delivery.long_weekly_key = week;
       }
-      longWeekly = await renderLongWeekly(longWeeklyPath, week, weeklyLong, weeklyBlocked);
+      longWeekly = await renderLongWeekly(longWeeklyPath, week, weeklyLong, weeklyBlocked,savedCards);
       for (const supersededPath of supersededDailyPaths) {
         const reportDate = /^(\d{4}-\d{2}-\d{2}) (?:RSS|订阅) 日报\.md$/u.exec(path.basename(supersededPath))?.[1];
         if (!reportDate) continue;
@@ -1424,6 +1494,7 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
       }
     }
     ledger.report_runs.weekly[week] = {
+      ...ledger.report_runs.weekly[week],
       generated_at: generatedAt,
       short_weekly: shortWeekly ? { path: shortWeekly.path, sha256: shortWeekly.sha256 } : null,
       long_weekly: longWeekly ? { path: longWeekly.path, sha256: longWeekly.sha256 } : null
@@ -1477,6 +1548,7 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
     historical_review_notice_refresh: historicalNoticeRefresh,
     short_weekly_rollover: shortRollover,
     archived_reports: archivedReports,
+    obsidian_links: obsidianLinks,
     mode,
     outputs: {
       daily,
@@ -1610,6 +1682,7 @@ async function defaultPreprocessRunner({ paths, item, outputDir, publishPath }) 
     "--request", requestPath,
     "--output", outputDir,
     "--publish", publishPath,
+    ...(paths.unified ? ['--cache',readingCache,'--provider','codex_exec'] : []),
     "--strict"
   ];
   return runProcess(process.execPath, args, { cwd: paths.workflowRoot, timeoutMs: 1200000 });
@@ -1756,6 +1829,43 @@ export async function writeLocalIrLaterHandoff(workflowRoot, materialId, options
 
 export async function applyDecision(workflowRoot, materialId, decision, options = {}) {
   if (!DECISIONS.has(decision)) throw new Error(`decision_invalid:${decision}`);
+  const current = await syncLedger(workflowRoot);
+  const direct = current.ledger.items[materialId];
+  if (directArticle(direct) && decision !== 'unresolved') {
+    let {paths,ledger} = current;
+    let item = direct;
+    const save = () => writeJson(paths.ledgerPath,ledger);
+    item.decision = decision;
+    item.publication_authorized = decision === 'selected';
+    item.requested_action = decision;
+    item.pending_markdown_action = decision;
+    await save();
+    try {
+      if (decision === 'dismissed') await archiveArticle(paths,item,save);
+      else {
+        if (item.publication?.status !== 'published') await deliverArticle(paths,item,safeTitle(item.title,materialId),options);
+        if (decision === 'selected') await addReadingGuide(paths,item,options);
+        await save();
+        if (decision === 'deferred') {
+          await writeLocalIrLaterHandoff(workflowRoot,materialId,options);
+          ledger = await loadLedger(workflowRoot);
+          item = ledger.items[materialId];
+        }
+      }
+      item.delivery.active_review_path = null;
+      delete item.pending_markdown_action;
+      delete item.requested_action;
+      delete item.publication_failure;
+      addHistory(item,{type:'reading_action_completed',decision,path:item.publication.path});
+      await save();
+      return {status:decision === 'dismissed' ? 'archived' : decision === 'deferred' ? 'later_handoff_ready' : 'reading_guide_ready',material_id:materialId,path:item.publication.path};
+    } catch(error) {
+      delete item.pending_markdown_action;
+      item.publication_failure = {at:nowIso(),error:error.message};
+      await save();
+      throw error;
+    }
+  }
   if (decision === "unresolved" || decision === "dismissed") {
     return setDecision(workflowRoot, materialId, decision, { source: options.source || "summary_panel" });
   }
@@ -1804,7 +1914,7 @@ export async function processMarkdownDecisions(workflowRoot = DEFAULT_WORKFLOW_R
     .map(item => ({ material_id: item.material_id, decision: item.pending_markdown_action }));
   if (options.enqueueOnly) return { changes: changes.length, queued: selected.length, completed: [], failures: [] };
   if (options.retry) for (const item of Object.values(synced.ledger.items)) {
-    if (activeIds.has(item.material_id) && item.publication_authorized && item.publication_failure
+    if (activeIds.has(item.material_id) && (item.publication_authorized || ['dismissed','deferred'].includes(item.requested_action)) && item.publication_failure
       && (!options.platform || (item.platform || 'rss') === options.platform)) selected.push({ material_id: item.material_id, decision: item.requested_action || 'selected' });
   }
   const completed = [], failures = [];
@@ -1826,13 +1936,15 @@ export async function prepareSubscriptionPreviews(workflowRoot = DEFAULT_WORKFLO
     synced.ledger.report_runs.daily ||= {};
     synced.ledger.report_runs.weekly ||= {};
     await rollShortReports(synced.paths, synced.ledger, options.week || isoWeek(), () => writeJson(synced.paths.ledgerPath, synced.ledger), sourceLabel);
+    await recordBlockedArticles(synced.paths,synced.ledger);
   }
   const activeIds = new Set(synced.catalog.items.map(item => item.materialId));
   const items = Object.values(synced.ledger.items).filter(item => activeIds.has(item.material_id) && item.eligible_for_preprocess
-    && item.decision === 'unresolved' && (!platform || (item.platform || 'rss') === platform)
+    && (item.decision === 'unresolved' || (directArticle(item) && item.decision === 'selected' && !item.publication)) && (!platform || (item.platform || 'rss') === platform)
     && (item.route === 'long_review' || item.route === 'short_aggregate'));
   const result = await ensureReviewPreviews(synced.paths, items, {
     ...options,
+    onArticleReady: synced.paths.unified ? () => writeJson(synced.paths.ledgerPath,synced.ledger) : undefined,
     deliverShort: synced.paths.unified
       ? item => deliverShortToWeek(synced.paths, synced.ledger, item, options.week || isoWeek())
       : undefined

@@ -2,6 +2,7 @@ import { JSDOM } from 'jsdom';
 import { unzipSync, gunzipSync } from 'node:zlib';
 import { htmlArticleToMarkdown } from '../scripts/browser-page-markdown.mjs';
 import { canonicalUrl, digest } from '../subscription-workflow/config.mjs';
+import {articleTaxonomy,taxonomyFromJson} from './taxonomy.mjs';
 
 export function scopedUrl(value,base) {
   const url=new URL(value,base),origin=new URL(base);
@@ -73,7 +74,7 @@ export async function captureArticle(url,recipe,{fetchPage=fetchSiteText}={}) {
     title=String(field(json,recipe.title_path)||'').trim();
     const body=decodeBody(field(json,recipe.content_path),recipe.encoding);
     markdown=recipe.content_format==='html'?htmlArticleToMarkdown({html:body,sourceUrl:url,title,extractArticle:false}).markdown:body;
-    metadata={published_at:recipe.published_at_path?field(json,recipe.published_at_path):null};
+    metadata={published_at:recipe.published_at_path?field(json,recipe.published_at_path):null,taxonomy:taxonomyFromJson(json,{collection_item_identity_path:recipe.identity_path?.split('.').at(-1),...recipe.taxonomy},field,recipe.identity_path?field(json,recipe.identity_path):null)};
   } else {
     let html=response.body;
     if(recipe?.body_selector){
@@ -84,5 +85,6 @@ export async function captureArticle(url,recipe,{fetchPage=fetchSiteText}={}) {
     if(/^(?:loading[. …]*|正在加载[. …]*)$/iu.test(markdown.trim()) || markdown.replace(/\s/gu,'').length<20)throw new Error('网页未提供可核验正文，需要站点正文接口');
   }
   if(!markdown.trim()||!title)throw new Error('来源缺少完整正文或文章标题');
+  if(!metadata.taxonomy){const dom=new JSDOM(response.body,{url});try{metadata.taxonomy=articleTaxonomy({categories:[...dom.window.document.querySelectorAll('a[rel~=category],meta[property="article:section"]')].map(n=>n.content||n.textContent.trim()),tags:[...dom.window.document.querySelectorAll('a[rel~=tag],meta[property="article:tag"]')].map(n=>n.content||n.textContent.trim())});}finally{dom.window.close();}}
   return {url,title,markdown,source_response:{url:response.url,sha256:response.sha256,bytes:response.bytes,content_type:response.content_type},metadata};
 }

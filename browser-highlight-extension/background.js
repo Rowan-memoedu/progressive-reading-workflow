@@ -254,7 +254,7 @@ async function submitDraft(url, destination = "reading", options = {}) {
   draft = Core.markPending(draft);
   draft.status = "submitting";
   if (submitMode === "standard_preprocess") {
-    draft.importJob = { clientRequestId: `snapshot-${crypto.randomUUID()}`, requestId: null, stage: "queued", terminal: false };
+    draft.importJob = { clientRequestId: `snapshot-${crypto.randomUUID()}`, requestId: null, stage: "queued", terminal: false, forceReimport: options.force === true };
   }
   settings.drafts[url] = draft;
   await saveDraftMap(settings.drafts);

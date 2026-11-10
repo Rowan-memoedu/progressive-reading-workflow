@@ -1,4 +1,4 @@
-export const TRANSLATION_UNIT_VERSION = "semantic-continuous-v13-anchored-bibliographies";
+export const TRANSLATION_UNIT_VERSION = "semantic-continuous-v14-bibliography-section-labels";
 
 // Headings define semantic sections; list runs stay with their introducing prose.
 export function chunkTranslationUnits(blocks, { maxChars = 12000 } = {}) {

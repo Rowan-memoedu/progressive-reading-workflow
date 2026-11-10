@@ -184,10 +184,11 @@ export function validateRequest(request) {
       const allowed = new Set([
         "workflow_mode", "include_reading_guide", "spoken_to_written", "structure_body", "translate", "input_form", "content_profile", "source_language", "original_placement",
         "cleaning_mode", "preserve_source_voice", "forbid_visible_timestamps", "require_content_headings", "attribute_unverified_claims",
-        "translation_target_language", "normalize_semantic_containers", "insight_soft_min", "insight_soft_max", "insight_safety_cap"
+        "translation_target_language", "translation_mode", "normalize_semantic_containers", "insight_soft_min", "insight_soft_max", "insight_safety_cap"
       ]);
       const unknown = Object.keys(processing).filter((key) => !allowed.has(key));
       if (unknown.length) errors.push(errorItem("unknown_processing_options", "request", `unknown processing options: ${unknown.join(", ")}`));
+      if (processing.translation_mode !== undefined && !['terminology','plain'].includes(processing.translation_mode)) errors.push(errorItem('invalid_translation_mode','request','translation_mode must be terminology or plain'));
       if (processing.workflow_mode !== undefined && !new Set(["standard", "single_stage"]).has(processing.workflow_mode)) {
         errors.push(errorItem("invalid_workflow_mode", "request", "workflow_mode must be standard or single_stage"));
       }
@@ -242,6 +243,8 @@ function cleaningPolicyFor(request) {
     mode: request.processing_options?.cleaning_mode || "source_voice_structuring",
     preserve_source_voice: request.processing_options?.preserve_source_voice !== false,
     forbid_visible_timestamps: request.processing_options?.forbid_visible_timestamps === true,
+    preserve_source_clock_times: request.processing_options?.input_form === 'written'
+      && request.processing_options?.spoken_to_written === false,
     require_content_headings: request.processing_options?.require_content_headings === true,
     attribute_unverified_claims: request.processing_options?.attribute_unverified_claims === true,
     translation_target_language: request.processing_options?.translation_target_language || null,
@@ -630,7 +633,7 @@ function validateProducerOutput(output, blocks, safetyCap, cleaningPolicy, proce
     for (const url of sourceUrls) {
       if (!candidate.markdown.includes(url)) failures.push(`url_removed:${source.source_block_key}`);
     }
-    if (cleaningPolicy.forbid_visible_timestamps && (cleaningPolicy.mode === 'source_translation'
+    if (cleaningPolicy.forbid_visible_timestamps && (cleaningPolicy.mode === 'source_translation' || cleaningPolicy.preserve_source_clock_times
         ? hasIntroducedTranslationTime(source.markdown,candidate.markdown)
         : /(?:^|[\[(（\s])\d{1,2}:\d{2}(?::\d{2})?(?:[\])）\s]|$)/mu.test(candidate.markdown))) {
       failures.push(`visible_timestamp_introduced:${source.source_block_key}`);
@@ -1239,7 +1242,7 @@ export async function processMaterial(request, options = {}) {
   };
   const materialId = materialIdFor(request, hashes.input, metadata);
   const translationPolicy = request.processing_options?.cleaning_mode === "source_translation"
-    ? await loadTranslationPolicy() : null;
+    ? await loadTranslationPolicy(undefined,request.processing_options?.translation_mode || 'terminology') : null;
   const spokenPolicyHash = request.processing_options?.cleaning_mode === "lossless_spoken_to_written"
     ? sha256((await Promise.all(['lossless-spoken-to-written-v1.md', 'spoken-quality-audit-v1.md'].map(name =>
       fs.readFile(new URL(`../prompts/${name}`, import.meta.url), 'utf8')))).join('\n')) : null;

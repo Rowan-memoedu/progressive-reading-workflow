@@ -16,11 +16,13 @@ import { discoverZhihuColumn } from '../scripts/zhihu-column-import.mjs';
 import { requestZhihuJson } from '../scripts/zhihu-social-archive.mjs';
 import { defaultCookieDataRoot } from '../scripts/live-cookie-snapshot.mjs';
 import { fetchUrlWithoutBrowser } from '../scripts/url-background-fetch.mjs';
+import { readingDestination } from './reading-options.mjs';
 import { htmlArticleToMarkdown } from '../scripts/browser-page-markdown.mjs';
-import {readingDestination} from './reading-options.mjs';
+import {fetchArticleContent} from '../rss-source/article-fetch.mjs';
+import {scanRepositories} from './repositories.mjs';
 
 export function autoConfig(config, onlyRss = false) {
-  const subscriptions = config.subscriptions.filter(s => s.enabled && !s.kind.startsWith('bilibili_') && s.mode !== 'reports' && (!onlyRss || s.kind === 'rss'))
+  const subscriptions = config.subscriptions.filter(s => s.enabled && s.kind!=='github_repository' && !s.kind.startsWith('bilibili_') && s.mode !== 'reports' && (!onlyRss || s.kind === 'rss'))
     .map(s => ({ url: s.url, name: s.name, route: s.mode, destination: readingDestination({platform:s.kind==='rss'?'rss':s.kind,destination:s.destination,subscription_name:s.name}), subscription_id: s.id,
       history_mode: s.history_mode, earliest_date: s.earliest_date }));
   return { ...config.rss_defaults, enabled: config.enabled, subscriptions, feeds: subscriptions.map(s => s.url),
@@ -61,9 +63,10 @@ export async function retryAuto(root, kind, cycle) {
 }
 
 export async function scanRss(root, cycle, { retryOnly = false } = {}) {
+  const repositories=await scanRepositories(root,cycle);
   if (retryOnly) {
     const sourceRetries = await retryBlockedReportSources(root, cycle);
-    return { sourceRetries, retry:await retryAuto(root,'rss',cycle) };
+    return { repositories,errors:repositories.errors,sourceRetries, retry:await retryAuto(root,'rss',cycle) };
   }
   const scanned = await withAutoImporter(root, async (importer, config) => {
     await importer.scan(autoConfig(config, true), { force: true }); return importer.summary(autoConfig(config, true));
@@ -75,7 +78,7 @@ export async function scanRss(root, cycle, { retryOnly = false } = {}) {
     results: [...reports.results, ...history.filter(item => item.result).map(item => ({result:item.result}))]
   })];
   const retry = await retryAuto(root, 'rss', cycle);
-  return { auto: scanned, reports, retry, sourceRetries };
+  return { repositories,errors:repositories.errors,auto: scanned, reports, retry, sourceRetries };
 }
 
 export async function replayRssHistory(root, config, reports, fetchPage = fetchText) {
@@ -100,10 +103,7 @@ export async function replayRssHistory(root, config, reports, fetchPage = fetchT
         const result = await syncFeedDocument({
           feedUrl:source.url, xml, outputRoot:path.join(root,'imports','rss','source-v1'), onlyItemUrls:urls,
           preserveFeedState:true, fetchFulltext:true,
-          articleFetcher:async url => {
-            const page = await fetchPage(url,{maxBytes:12*1024*1024});
-            return {html:page.text,response:{status:page.response.status,final_url:page.finalUrl}};
-          }
+          articleFetcher:url=>fetchArticleContent(url,fetchPage)
         });
         urls.forEach(url => known.add(materialKey(url)));
         results.push({urls,status:result.status,run_dir:result.run_dir,result});
@@ -132,7 +132,7 @@ export async function retryBlockedReportSources(root, cycle, reports = {}, fetch
   for(const group of groups.values()) {
     try {
       const result=await syncFeedDocument({feedUrl:group.feedUrl,xml:await fs.readFile(group.snapshot,'utf8'),outputRoot:path.join(root,'imports','rss','source-v1'),
-        fetchFulltext:true,onlyItemUrls:group.urls,preserveFeedState:true,articleFetcher:async url=>{const page=await fetchPage(url,{maxBytes:12*1024*1024});return {html:page.text,response:{status:page.response.status,final_url:page.finalUrl}};}});
+        fetchFulltext:true,onlyItemUrls:group.urls,preserveFeedState:true,articleFetcher:url=>fetchArticleContent(url,fetchPage)});
       results.push({urls:group.urls,status:result.status,run_dir:result.run_dir});
     } catch(error){results.push({urls:group.urls,error:error.message});}
   }

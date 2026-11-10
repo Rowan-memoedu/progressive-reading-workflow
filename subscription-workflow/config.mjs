@@ -3,12 +3,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { dataPath, artifactPath } from '../scripts/runtime-paths.mjs';
-import {readingDestination} from './reading-options.mjs';
+import { renameWithRetry } from '../rss-source/core.mjs';
+import { readingDestination } from './reading-options.mjs';
+import {repositoryConfig} from '../site-import/repository-config.mjs';
 
 export const HOME = dataPath('ProgressiveReading', 'Subscriptions');
 export const SCHEMA = 'progressive-reading.subscriptions/v1';
 export const MODES = ['standard_preprocess', 'original_text', 'reports'];
-export const KINDS = ['rss', 'bilibili_video', 'bilibili_collection', 'zhihu_author', 'zhihu_column'];
+export const KINDS = ['rss', 'bilibili_video', 'bilibili_collection', 'zhihu_author', 'zhihu_column', 'github_repository'];
 export const SCHEDULE = Object.freeze({ rss: '06:00', zhihu: '07:00', bilibili: '08:00', daily: '09:00', weekly: '21:00', weekly_day: 0, timezone: 'Asia/Shanghai' });
 export const digest = value => createHash('sha256').update(value).digest('hex');
 export const codeRoot = path.resolve(import.meta.dirname, '..');
@@ -34,7 +36,7 @@ export async function writeJson(file, value) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const temporary = `${file}.${randomUUID()}.tmp`;
   await fs.writeFile(temporary, JSON.stringify(value, null, 2) + '\n', 'utf8');
-  await fs.rename(temporary, file);
+  await renameWithRetry(temporary, file);
 }
 
 export async function withLock(file, action) {
@@ -71,6 +73,8 @@ export function normalizeSource(value, previous = null) {
   const mode = String(value.mode || previous?.mode || 'reports');
   if (!KINDS.includes(kind) || !MODES.includes(mode)) throw new Error('来源类型或处理模式无效');
   const url = new URL(canonicalUrl(value.url ?? previous?.url));
+  const repository=kind==='github_repository'?repositoryConfig(value.repository || previous?.repository || {url:url.href}):null;
+  if(repository&&(mode!=='original_text'||(value.history_mode ?? previous?.history_mode)==='since'))throw new Error('仓库订阅保留现有 Markdown，接收完整目录；请选择原文直接导入和不限时间');
   if (kind.startsWith('bilibili_')) {
     if (mode === 'original_text') throw new Error('视频不提供原文直接导入模式');
     if (!['www.bilibili.com', 'bilibili.com'].includes(url.hostname) || !/^\/video\/BV[0-9A-Za-z]{10}\/?$/u.test(url.pathname)) throw new Error('请填写 B 站视频链接；订阅合集时可填写合集内任意视频链接');
@@ -99,11 +103,16 @@ export function normalizeSource(value, previous = null) {
       throw new Error('请选择有效的最早日期');
     }
   }
+  const directReading = value.direct_reading ?? previous?.direct_reading ?? (previous ? false : kind === 'rss');
+  const generateGuide = value.generate_guide ?? previous?.generate_guide ?? false;
+  const translationMode = value.translation_mode ?? previous?.translation_mode ?? 'terminology';
+  if (typeof directReading !== 'boolean' || typeof generateGuide !== 'boolean' || !['terminology','plain'].includes(translationMode)) throw new Error('阅读与翻译设置无效');
   return { ...previous, id: previous?.id || 'sub-' + randomUUID(), kind, name, url: url.href,
+    direct_reading: directReading, generate_guide: generateGuide, translation_mode: translationMode,
     mode, destination: readingDestination({subscription_kind:kind,subscription_name:name,destination:folder}), enabled: value.enabled ?? previous?.enabled ?? true,
     history_mode: historyMode, earliest_date: historyMode === 'since' ? earliest : null,
     added_at: previous?.added_at || new Date().toISOString(), updated_at: new Date().toISOString(),
-    initial_policy: kind === 'rss' ? 'current_feed' : 'new_only' };
+    initial_policy: kind === 'rss' ? 'current_feed' : kind==='github_repository'?'full_repository':'new_only',...(repository?{repository}:{}) };
 }
 
 export function validateConfig(config) {
@@ -159,7 +168,7 @@ export async function deleteSource(workflowRoot, id, { home, expectedRevision } 
   });
 }
 
-export function platform(source) { return source.kind.split('_')[0]; }
+export function platform(source) { return source.kind==='github_repository'?'rss':source.kind.split('_')[0]; }
 
 export async function initialize(workflowRoot = codeRoot, { home, rssHome = process.env.RSS_IMPORT_HOME || dataPath('RSSImport'), videoHome = process.env.PROGRESSIVE_READING_VIDEO_HOME || dataPath('ProgressiveReading', 'VideoWatch') } = {}) {
   const p = paths(workflowRoot, home);

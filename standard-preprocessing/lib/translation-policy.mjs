@@ -3,7 +3,12 @@ import fs from "node:fs/promises";
 
 export const DEFAULT_TRANSLATION_PROMPT_PATH = "D:/Artifacts/TranslationPrompts/general-translation.txt";
 
-export async function loadTranslationPolicy(promptPath = process.env.PR_TRANSLATION_PROMPT_PATH || DEFAULT_TRANSLATION_PROMPT_PATH) {
+export async function loadTranslationPolicy(promptPath = process.env.PR_TRANSLATION_PROMPT_PATH || DEFAULT_TRANSLATION_PROMPT_PATH, mode = 'terminology') {
+  if (mode === 'plain') {
+    const text = 'Translate the complete source accurately into natural Simplified Chinese. Use conventional Chinese translations for terminology when available. Preserve meaning, paragraph order, code, formulas, URLs, quantities and Markdown structure. Do not summarize, add commentary or omit content.';
+    return { path:null, mode, text, sha256:createHash('sha256').update(text).digest('hex') };
+  }
+  if (mode !== 'terminology') throw new Error('translation_mode_invalid');
   const text = await fs.readFile(promptPath, "utf8");
   if (!text.trim()) throw new Error("translation_prompt_empty");
   return { path: promptPath, text, sha256: createHash("sha256").update(text).digest("hex") };

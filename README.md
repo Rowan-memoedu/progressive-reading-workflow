@@ -2,7 +2,6 @@
 
 协作开发、Agent 提交与合并规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-
 将网页、文档和字幕导入本地 Markdown 阅读区，经过阅读、批注与加工后，按需导出到 RemNote。
 
 本仓库包含导入后端、Chrome 高亮扩展、共享文档核心、标准预处理、订阅与归档模块。Obsidian 阅读端见 [ObsidianLocalIR](https://github.com/Rowan-memoedu/ObsidianLocalIR)，持续同步浏览器登录态的扩展见 [ChromeCookieSync](https://github.com/Rowan-memoedu/ChromeCookieSync)。

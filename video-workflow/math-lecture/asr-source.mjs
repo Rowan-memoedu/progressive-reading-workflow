@@ -52,7 +52,9 @@ export async function prepareAudioSource(item,output){
     if(await exists(stateFile))state=await read(stateFile);
     else{
       const cli=path.join(process.env.USERPROFILE,'.codex','skills','global-transcription','scripts','transcribe.py');
-      const status=await command('python',[cli,'provider','status'],{json:true}),provider=status.default_provider;
+      const status=await command('python',[cli,'provider','status'],{json:true});
+      // This workflow retains its original ASR backend when the global default migrates.
+      const provider=status.default_provider==='openai'?'bailian':status.default_provider;
       if(!['bailian','doubao','tingwu','funasr'].includes(provider))throw Error('timestamped_asr_provider_required');
       const doctor=await command('python',[cli,'doctor','--provider',provider],{json:true});
       if(doctor.providers?.[provider]?.callable!==true)throw Error('configured_asr_provider_unavailable');

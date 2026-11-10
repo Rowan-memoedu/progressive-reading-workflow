@@ -18,7 +18,7 @@ import { loadProducerConfig as loadUnifiedProducerConfig, requestProducerText } 
 import { classifyStandardImportQuality, readingDocumentPathCandidates } from "./standard-import-quality.mjs";
 import { htmlArticleToMarkdown } from "./browser-page-markdown.mjs";
 import { extractUrls, urlImportDedupeKey } from "./url-import-input.mjs";
-import { findSourcePublication, withSourcePublication, sourceReuseResult } from './reading-source-library.mjs';
+import { findSourcePublication, withSourcePublication, sourceReuseResult,sourceAliasEvidence,sourceIdentityUrl } from './reading-source-library.mjs';
 import { IMPORT_RULES, zhihuColumnIdentity } from "./import-rule-catalog.mjs";
 import { discoverZhihuColumn } from "./zhihu-column-import.mjs";
 import { assertLocalRequest, handleSubscriptions } from '../subscription-workflow/http.mjs';
@@ -26,6 +26,7 @@ import { startSubscriptionWorker } from '../subscription-workflow/service.mjs';
 import { processCollectionTask } from "./collection-import.mjs";
 import { handleImportCenter } from '../site-import/http.mjs';
 import { processSiteTask, capturedArticle } from '../site-import/tasks.mjs';
+import { taxonomyFolder } from '../site-import/taxonomy.mjs';
 import { fetchYoutubeSubtitleDraft, youtubeVideoIdentity } from "./youtube-subtitle-import.mjs";
 import { LiveCookieSnapshot, defaultCookieDataRoot, COOKIE_SNAPSHOT_ENDPOINT, COOKIE_STATUS_ENDPOINT, safeError as safeCookieSnapshotError } from "./live-cookie-snapshot.mjs";
 import {
@@ -995,6 +996,12 @@ function browserDraftDocument({ draft, converted, documentStatus }) {
   return [
     "---",
     `source_url: ${yamlString(draft.url)}`,
+    ...(draft.sourceMetadata?.original_link_evidence?.status==='verified' ? [
+      `original_url: ${yamlString(draft.sourceMetadata.original_url)}`,
+      `fact_source_url: ${yamlString(draft.sourceMetadata.fact_source_url)}`,
+      ...(draft.sourceMetadata.original_document_path?[`original_document_path: ${yamlString(draft.sourceMetadata.original_document_path)}`]:[])
+    ]:[]),
+    ...(sourceAliasEvidence(draft.sourceMetadata,draft.url).aliases.length>1?[`canonical_url: ${yamlString(sourceAliasEvidence(draft.sourceMetadata,draft.url).canonical || draft.url)}`,`source_url_aliases: ${JSON.stringify(sourceAliasEvidence(draft.sourceMetadata,draft.url).aliases)}`]:[]),
     `source_title: ${yamlString(title)}`,
     `imported_at: ${yamlString(now)}`,
     `updated_at: ${yamlString(now)}`,
@@ -1405,9 +1412,10 @@ async function writeBrowserDraftCommit(rawBody, destination = "reading", options
   } catch {
     // Invalid input is still serialized under its raw value and rejected by the core validator.
   }
-  return withBrowserCommitLock(lockKey, () => withSourcePublication(workflowRoot, rawUrl, async () => {
+  const identity=sourceIdentityUrl(rawBody?.draft?.sourceMetadata,rawUrl);
+  return withBrowserCommitLock(lockKey, () => withSourcePublication(workflowRoot, identity, async () => {
     if (destination === 'reading') {
-      const existing = await findSourcePublication(workflowRoot, rawUrl);
+      const existing = await findSourcePublication(workflowRoot, identity);
       if (existing) {
         const draft = rawBody?.draft || {};
         const desiredRoot = draft.destinationFolder ? readingDestinationRoot(draft.destinationFolder) : browserHighlightRoot;
@@ -1436,8 +1444,9 @@ async function importUrlThroughStandardWorkflow(url, { userInstruction = "", des
       draft:cachedRssDraft, fetchReceipt:{ source_reused:"retained_rss_fulltext", browser_tab_created:false } };
   } else if (articleSource) {
     const source=await capturedArticle(workflowRoot,articleSource,url);
+    destinationFolder=taxonomyFolder(destinationFolder,source.metadata?.taxonomy);
     fetched={requestedUrl:url,finalUrl:url,redirectChain:[],draft:{id:'site-'+shortHash(url),url,title:source.title,sourceType:'url_import',pageText:source.markdown,cachedRssMarkdown:source.markdown,
-      sourceMetadata:{source_url:url,canonical_url:url,input_form:'written',title:source.title,capture_agent:'verified_site_source',source_response:source.source_response,published_at:source.metadata?.published_at||null}},
+      sourceMetadata:{...source.metadata,source_url:url,canonical_url:url,input_form:'written',title:source.title,capture_agent:'verified_site_source',source_response:source.source_response,published_at:source.metadata?.published_at||null}},
       fetchReceipt:{source_reused:'verified_site_capture',source_response:source.source_response,browser_tab_created:false}};
   } else fetched = await fetchUrlImportDraft(url);
   fetched.draft.userInstruction = String(userInstruction || "");

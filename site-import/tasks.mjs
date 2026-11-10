@@ -6,6 +6,10 @@ import { urlImportDedupeKey } from '../scripts/url-import-input.mjs';
 import { processCollectionTask } from '../scripts/collection-import.mjs';
 import { discoverSite } from './discovery.mjs';
 import { readSources, readRun, saveRun, listRuns, runPath, runId, siteCounts, now } from './store.mjs';
+import {organizeSiteFiles} from './organization.mjs';
+import {writeSiteIndexes} from './indexes.mjs';
+import {bindRepositoryRelations} from '../scripts/source-relations.mjs';
+import {writeRepositoryIndexes} from './repository-indexes.mjs';
 
 const SUCCESS=new Set(['imported','imported_with_warnings','idempotent_replay']);
 export async function startSiteRun(root,{source_id,client_request_id,retry_run_id},broker,runRequest) {
@@ -40,8 +44,14 @@ export async function capturedArticle(root,articleSource,url) {
   return captured;
 }
 
-export async function verifySiteCollection(root,settings,collection,runId) {
+export async function verifySiteCollection(root,settings,collection,runId,{broker}={}) {
   const expected=collection.inventory.articles;
+  // A user may complete/archive or edit an article while discovery is running.
+  // Refresh physical locations before planning moves; frozen receipts are not
+  // authority to resurrect or overwrite a newer reading state.
+  const live=await findSourcePublications(root,expected.map(article=>article.url));
+  collection.results=collection.results.map(row=>{const current=live.get(urlImportDedupeKey(row.requested_url)),artifact=row.artifacts?.find(a=>a.kind==='markdown');return current&&(artifact?.path!==current.path||artifact.sha256!==current.sha256)?sourceReuseResult(row.requested_url,current):row;});
+  const organization=expected.every(article=>collection.results.some(row=>row.requested_url===article.url&&SUCCESS.has(row.status)))?await organizeSiteFiles(root,settings,collection,runId,{broker}):{};
   const rows=new Map(collection.results.map(row=>[row.requested_url,row]));
   const records=[];
   for(const article of expected){
@@ -60,25 +70,14 @@ export async function verifySiteCollection(root,settings,collection,runId) {
     }
     records.push({url:article.url,path:artifact.path,sha256:hash,reused,verified:true});
   }
-  let index=null;
-  if(settings.generate_index && records.every(row=>row.verified)){
-    const directory=path.join(root,'阅读区',...settings.destination.split(/[\\/]/u));
-    await fs.mkdir(directory,{recursive:true});
-    const escaped=value=>value.replace(/[\[\]]/gu,'\\$&');
-    const body=['# '+settings.name,'','[网站]('+settings.url+')','',...expected.map(article=>{
-      const record=records.find(row=>row.url===article.url),relative=path.relative(directory,record.path).replaceAll('\\','/');
-      return '- ['+escaped(article.title)+'](<'+relative+'>)';
-    })].join('\n')+'\n';
-    const target=path.join(directory,'目录.md'),previous=await fs.readFile(target,'utf8').catch(e=>{if(e.code==='ENOENT')return null;throw e;});
-    const lastIndex=await readJson(path.join(runPath(root,runId),'index.json'));
-    if(previous!==null&&previous!==body&&(!lastIndex||digest(previous)!==lastIndex.sha256)){
-      // A user-edited catalog is preserved; a run-scoped catalog keeps the new links reachable.
-      index=path.join(directory,'目录-'+runId.slice(-8)+'.md');
-    }else index=target;
-    if(index!==target || previous!==body)await fs.writeFile(index,body,'utf8');
-    await writeJson(path.join(runPath(root,runId),'index.json'),{path:index,sha256:digest(body)});
+  let index=null,groups=[];
+  if(settings.generate_index&&records.every(row=>row.verified)){const written=await writeSiteIndexes(root,settings,collection.inventory,records,runId,organization);index=written.index;groups=written.groups;}
+  const verification={expected:expected.length,verified:records.filter(row=>row.verified).length,records,index,groups,organization:{moved:organization.moved||0,duplicates_retired:organization.duplicates_retired||0,host:organization.host}};
+  if(settings.repository&&records.every(row=>row.verified)){
+    const captures=await Promise.all(expected.map(article=>capturedArticle(root,collection.inventory.article_source,article.url)));
+    verification.source_relations=await bindRepositoryRelations(root,captures,records);
+    verification.repository_indexes=await writeRepositoryIndexes(root,settings,captures,records);
   }
-  const verification={expected:expected.length,verified:records.filter(row=>row.verified).length,records,index};
   await writeJson(path.join(runPath(root,runId),'verification.json'),verification);return verification;
 }
 
@@ -104,5 +103,5 @@ export async function processSiteTask(root,task,{broker,runRequest,planner,fetch
       initial.results=inventory.articles.filter(article=>existing.has(urlImportDedupeKey(article.url))).map(article=>sourceReuseResult(article.url,existing.get(urlImportDedupeKey(article.url))));
       return inventory;
     },
-    verify:collection=>verifySiteCollection(root,settings,collection,id)});
+    verify:collection=>verifySiteCollection(root,settings,collection,id,{broker})});
 }
