@@ -10,6 +10,8 @@ B 站元数据、分 P 列表和字幕默认使用现有用户登录快照；登
 
 函数曲线、水平线交点等几何关系无法由分类流程图完整表达时，复用 `MathTopicPipeline/diagrams` 的参数化科学绘图能力。`reconstruct-diagram.mjs --source-image ... --source-id ... --plan ... --output ...` 校验原图身份、数值约束、曲线特殊点并生成独立 PNG/SVG。绘图计划保留原图哈希，不修改原始像素或讲义候选。通过运行目录的 `diagram-reconstructions.json` 注册 `{ "images": [{ "source_image_id": "img0000", "receipt": "绝对回执路径", "receipt_sha256": "回执哈希" }] }`；只有对应单元增加新图输入并重新生成，独立审核同时比较原图与重建图。其他单元保持缓存。依赖路径可用 `MATH_LECTURE_DIAGRAMS_ROOT` 指定。
 
+原先可直接保留的图若仍有含参坐标或对称轴公式，也可以在同一注册入口提供干净重建图。该单元只允许引用新图，旧图继续作为审核来源；必要位置改用点名，参数表达式在正文用 LaTeX 定义。
+
 ## 输入准备
 
 ```powershell

@@ -670,7 +670,11 @@ class Engine:
             ids = [r["source_image_id"] for r in rows]
             if len(ids) != len(set(ids)) or set(ids) - {i["id"] for i in material["images"]}:
                 raise ValueError("diagram_reconstruction_scope_invalid")
-            for image in mixed:
+            for original_image in owned_images:
+                image = next((i for i in mixed if i["id"] == original_image["id"]), None)
+                if image is None:
+                    image = {**original_image, "diagram_required": True,
+                             "diagram_description": "保留原示意关系，图内参数表达式移入正文。"}
                 row = next((r for r in rows if r["source_image_id"] == image["id"]), None)
                 if row is None:
                     continue
@@ -692,6 +696,9 @@ class Engine:
                          "link": "images/reconstructed-" + image["id"] + ".png",
                          "source_image_id": image["id"], "plan_sha256": receipt["plan_sha256"],
                          "receipt_sha256": row["receipt_sha256"]}
+                allowed = [i for i in allowed if i["id"] != image["id"]]
+                if not any(i["id"] == image["id"] for i in mixed):
+                    mixed.append(image)
                 allowed.append(asset)
                 reconstructed.append(asset)
                 image["reconstructed_diagram"] = {"id": asset["id"], "link": asset["link"]}

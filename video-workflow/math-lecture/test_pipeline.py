@@ -277,6 +277,12 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(requires_mermaid(payload))
         self.assertEqual(len(payload['allowed_images']),1)
         self.assertEqual(visual[-1]['sha256'],digest(generated.read_bytes()))
+        kept_media=[{'id':'img0000','action':'keep_diagram','diagram_required':True}]
+        replacement,_=self.engine.unit_payload(material,plan,plan['units'][0],kept_media)
+        self.assertEqual([i['id'] for i in replacement['allowed_images']],['reconstructed-img0000'])
+        self.assertEqual(replacement['mixed_images'][0]['id'],'img0000')
+        with self.assertRaisesRegex(ValueError,'unapproved'):
+            validate_body('- ![](images/source.png)',{i['link'] for i in replacement['allowed_images']})
         with self.assertRaisesRegex(ValueError,'required_source_diagram_missing'):
             validate_body('- 只有一段分类文字。',{i['link'] for i in payload['allowed_images']})
         generated.write_bytes(b'changed')
