@@ -308,6 +308,7 @@
         "mode": { "enum": ["semantic_only", "source_voice_structuring", "lossless_spoken_to_written", "source_translation"] },
         "preserve_source_voice": { "type": "boolean" },
         "forbid_visible_timestamps": { "type": "boolean" },
+        "preserve_source_clock_times": { "type": "boolean" },
         "require_content_headings": { "type": "boolean" },
         "attribute_unverified_claims": { "type": "boolean" },
         "translation_target_language": { "type": ["string", "null"] },

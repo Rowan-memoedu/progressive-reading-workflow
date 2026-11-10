@@ -453,7 +453,9 @@ function buildUserPrompt(payload, validationFeedback = [], spokenContract = "") 
       : payload.cleaning_policy?.mode === 'semantic_only'
       ? "不得输出 cleaned_blocks 字段或完整正文；insights 可以采用原文句子，但须保留其观点归属和完整含义。"
       : "不得输出 cleaned_blocks 字段，不得在任何字段中回显原文段落。",
-    payload.cleaning_policy?.forbid_visible_timestamps ? "最终清洗正文不得出现任何可见时间戳或时间码。" : "",
+    payload.cleaning_policy?.forbid_visible_timestamps ? payload.cleaning_policy?.preserve_source_clock_times
+      ? "保留书面原文中作为事实的钟点时间；不得新增、重复时间或时间码。"
+      : "最终清洗正文不得出现任何可见时间戳或时间码。" : "",
     payload.cleaning_policy?.attribute_unverified_claims
       ? "核心洞察属于导读编辑层，必须直接陈述洞察内容，不得加‘说话者认为／主张／建议’‘作者指出’‘材料呈现’等转述前缀。保留原文中的可能、倾向、预测、估计等认知限定，不得把数字、因果、预测和强评价升级成已核实事实；文档级元数据会统一标记未做事实核查。"
       : "",
@@ -894,7 +896,8 @@ export function bibliographicReferenceBlockKeys(blocks) {
     if (heading) {
       const headingLevel = heading[1].length;
       const headingText = heading[2].replace(/^[-*+]\s+/u, "").trim();
-      const startsBibliography = /(?:\bbibliograph(?:y|ies)\b|\breferences?\b|\breference\s+books?\b|\b(?:main\s+)?textbooks?\b|\brecommended\s+readings?\b|\bfurther\s+readings?\b|\breading\s+list\b|参考文献|参考书(?:目)?|教材|推荐阅读|延伸阅读|书目)/iu.test(headingText);
+      const sectionLabel = headingText.replace(/^(?:(?:chapter|section|appendix)\s+(?:[A-Z]|\d+(?:\.\d+)*)[:.)–—-]?\s+|(?:\d+(?:\.\d+)*[.)]?|[A-Z][.)])\s+)/iu,'').replace(/[*_`]/gu,'').trim();
+      const startsBibliography = /^(?:bibliograph(?:y|ies)|references?|reference\s+books?|(?:main\s+)?textbooks?|recommended\s+readings?|further\s+readings?|reading\s+list|参考文献|参考书(?:目)?|教材|推荐阅读|延伸阅读|书目)(?:\s*[:：])?$/iu.test(sectionLabel);
       if (startsBibliography) activeHeadingLevel = activeHeadingLevel === null ? headingLevel : Math.min(activeHeadingLevel, headingLevel);
       else if (activeHeadingLevel !== null && headingLevel <= activeHeadingLevel) activeHeadingLevel = null;
       continue;

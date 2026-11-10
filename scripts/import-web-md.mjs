@@ -11,6 +11,7 @@ import sanitize from "sanitize-filename";
 import { preprocessNetworkMarkdown } from "../standard-preprocessing/integrations/network-import.mjs";
 import { publishReadingArtifact } from "../standard-preprocessing/index.mjs";
 import { sha256 } from "../standard-preprocessing/lib/core.mjs";
+import { findSourcePublication, sourceReuseResult } from './reading-source-library.mjs';
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -440,6 +441,8 @@ function wechatHtmlToMarkdown(html, url) {
 }
 
 async function writeMarkdown(url, result, options = processingOptions) {
+  const existingSource = await findSourcePublication(workflowRoot, url);
+  if (existingSource) return { ...sourceReuseResult(url, existingSource), target: existingSource.path };
   await fs.mkdir(outDir, { recursive: true });
   const parsed = new URL(url);
   const title = result.title || result.markdown.match(/^#\s+(.+)$/m)?.[1] || parsed.hostname;
@@ -475,7 +478,7 @@ async function writeMarkdown(url, result, options = processingOptions) {
   };
   if (run.result.status === "needs_classification") return { status: "needs_classification", target: null, receipt };
   const publication = await publishReadingArtifact(run.result, { publishPath: target, runDir: outputDir });
-  return { target, status: publication.quality_status === "warning" ? "imported_with_warnings" : "imported",
+  return { target: publication.markdown.path, status: publication.preserved_existing ? 'idempotent_replay' : publication.quality_status === "warning" ? "imported_with_warnings" : "imported",
     artifacts: [{ kind: "markdown", ...publication.markdown }],
     receipt: { ...receipt, quality_status: publication.quality_status, final_markdown_sha256: publication.markdown.sha256 } };
 }

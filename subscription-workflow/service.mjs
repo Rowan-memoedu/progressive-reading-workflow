@@ -7,6 +7,7 @@ import { paths, codeRoot, loadConfig, readJson, writeJson, withLock, digest, pla
 import { scanRss, scanVideos, scanZhihu, advanceAuto, withAutoImporter } from './adapters.mjs';
 import { generateSummaries, prepareSubscriptionPreviews, processMarkdownDecisions } from '../rss-reading/core.mjs';
 import { publicationMetadata } from './publication-time.mjs';
+import { recordExceptions, acknowledgeExceptions, exceptionFile } from './exception-log.mjs';
 import { normalizeVideoRequest, runVideoRequest } from './video-request.mjs';
 
 const execute = promisify(execFile);
@@ -107,14 +108,15 @@ export async function appendActivity(root, receipt) {
   const p = paths(root), events = await collectActivity(root), config = await loadConfig(root);
   const ledger = await readJson(path.join(root,'imports','rss-reading','review-ledger.v1.json'), { items: {} });
   let targets = [receipt.outputs.daily, receipt.outputs.long_weekly].filter(Boolean);
-  if (!targets.length) {
-    const file = path.join(p.summaryRoot, receipt.mode === 'weekly' ? `${weekKey()} 订阅 长文周报.md` : `${localDate()} 订阅 日报.md`);
+  if (!targets.length && receipt.mode !== 'weekly') {
+    const file = path.join(p.summaryRoot, `${localDate()} 订阅 日报.md`);
     await fs.mkdir(path.dirname(file), { recursive:true });
     if (!existsSync(file)) await fs.writeFile(file, `# ${localDate()} 订阅${receipt.mode === 'weekly' ? '周报' : '日报'}\n\n本期没有新的长文候选。\n`);
-    targets = [{ path:file, item_count:0 }]; receipt.outputs[receipt.mode === 'weekly' ? 'long_weekly' : 'daily'] = targets[0];
+    targets = [{ path:file, item_count:0 }]; receipt.outputs.daily = targets[0];
   }
   for (const target of targets) {
-    const cutoff = receipt.mode === 'weekly' ? Date.now()-7*86400000 : Date.parse(localDate()+'T00:00:00+08:00');
+    const isWeekly=target===receipt.outputs.long_weekly;
+    const cutoff = isWeekly ? Date.now()-7*86400000 : Date.parse(localDate()+'T00:00:00+08:00');
     const recent = events.filter(e => Date.parse(e.observed_at) >= cutoff);
     const lines = ['<!-- subscriptions:activity -->','## 本期新增入库',''];
     if (!recent.length) lines.push('本期暂无新增入库。');
@@ -137,7 +139,7 @@ export async function appendActivity(root, receipt) {
     const content = before.replace(/\n*<!-- subscriptions:activity -->[\s\S]*?<!-- subscriptions:activity:end -->/gu,'').trimEnd()+'\n\n'+lines.join('\n')+'\n';
     await fs.writeFile(target.path,content); target.sha256 = digest(content);
     ledger.report_runs ||= {daily:{},weekly:{}};
-    if (receipt.mode === 'weekly') {
+    if (isWeekly) {
       ledger.report_runs.weekly[weekKey()] ||= {generated_at:stamp()};
       ledger.report_runs.weekly[weekKey()].long_weekly = {path:target.path,sha256:target.sha256};
     } else ledger.report_runs.daily[localDate()] = {path:target.path,sha256:target.sha256,generated_at:stamp()};
@@ -169,7 +171,15 @@ async function noticeFaults(root, kind, faults) {
   const file = path.join(paths(root).home,`faults-${kind}.json`), previous = await readJson(file, { signature:null });
   const messages = faults.map(f => cleanError(f.error || f.reason || f)).sort();
   const signature = digest(JSON.stringify(messages));
-  if (messages.length && signature !== previous.signature) await notify(root,`fault:${kind}:${signature}:${previous.changed_at || ''}`,'订阅处理需要关注',`${kind}：${messages.length} 项等待处理。请查看本地订阅页。`);
+  const ledger = await readJson(path.join(root,'imports','rss-reading','review-ledger.v1.json'),{items:{}});
+  const blocked = Object.values(ledger.items).filter(item=>!item.canonical_material_id && item.route==='blocked')
+    .map(item=>({...item,error:item.source_errors?.map(error=>error.message).join('; ') || '正文尚未就绪'}));
+  const individualFaults = faults.filter(fault=>!blocked.length || !/RSS 正文仍未就绪|排队条目正文仍受来源限制|RSS 正文仍受来源限制/u.test(String(fault.error || '')));
+  const pending = await recordExceptions(root,[...individualFaults,...blocked],kind);
+  if (pending.length) {
+    await notify(root,'exceptions:'+digest(pending.sort().join(',')),'订阅处理需要关注',`${pending.length} 项新异常已记录到订阅异常记录。`);
+    await acknowledgeExceptions(root,pending);
+  }
   await writeJson(file,{ signature, faults, changed_at: signature === previous.signature ? previous.changed_at : stamp(), checked_at:stamp() });
 }
 
@@ -274,7 +284,14 @@ async function runJob(root, job, save) {
   await step('decisions',()=>processMarkdownDecisions(root));
   const receipt = await step('report',()=>generateSummaries(root,{ mode:job.kind, executeDecisions:false, ingestSummaries:false, onPreviewProgress:progress }));
   const result = await step('activity',()=>appendActivity(root,receipt));
-  await step('notify',async()=>{ const version=digest(JSON.stringify(Object.entries(result.outputs).filter(([key,value])=>key!=='ledger'&&value?.sha256).map(([key,value])=>[key,value.sha256])));await notify(root,'report:'+job.kind+':'+version,'订阅报告已生成',`${job.kind === 'daily' ? '日报' : '周报'}已更新，可在 Markdown 中勾选内容。`); return { done:true }; });
+  await step('notify',async()=>{
+    const outputs=Object.entries(result.outputs).filter(([key,value])=>key!=='ledger'&&value?.sha256);
+    if(!outputs.length)return {done:true,skipped:'no_report_content'};
+    const version=digest(JSON.stringify(outputs.map(([key,value])=>[key,value.sha256])));
+    const reportName=result.outputs.long_weekly ? '周报' : result.outputs.daily ? '日报' : '短文周报';
+    await notify(root,'report:'+job.kind+':'+version,'订阅报告已生成',`${reportName}已更新，可在 Markdown 中勾选内容。`);
+    return {done:true};
+  });
   return { status:receipt.status === 'completed' && !scopeFaults.length ? 'completed' : 'completed_with_issues',
     faults:scopeFaults, receipt:result.receipt_path, outputs:result.outputs };
 }
@@ -382,6 +399,7 @@ export async function status(root = codeRoot) {
   const failures=reportRows.filter(i=>i.route!=='import_activity'&&(i.publication_failure||i.review_preview?.status==='failed'||(!i.eligible_for_preprocess&&i.decision==='unresolved')))
     .map(i=>({id:i.material_id,title:i.title,error:i.publication_failure?.error||i.review_preview?.error||i.review_preview?.reason||i.source_errors?.[0]?.message||i.content_status,status:'blocked'}));
   return {initialized:true,enabled:config.enabled,revision:config.revision,schedule:config.schedule,
+    exception_path:existsSync(exceptionFile(root)) ? exceptionFile(root) : null,
     subscriptions:config.subscriptions.map(({watch,...s})=>s), heartbeat:await readJson(path.join(p.home,'heartbeat.json')),
     notifications:await readJson(path.join(p.home,'notifications.json')),
     pending_job_count:jobs.filter(j=>['running','queued'].includes(j.status)).length,

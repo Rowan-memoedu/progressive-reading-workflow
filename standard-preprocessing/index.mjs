@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { libraryRootForPath, sourceUrls, sourceIdentityUrl, findSourcePublication, withSourcePublication } from '../scripts/reading-source-library.mjs';
+import { libraryRootForPath, sourceUrls, sourceIdentityUrl, sourceAliasEvidence,findSourcePublication, withSourcePublication } from '../scripts/reading-source-library.mjs';
 import Ajv2020 from "ajv/dist/2020.js";
 import {
   CONTRACT_VERSION,
@@ -625,6 +625,11 @@ async function existingFileHash(filePath) {
 export async function publishReadingArtifact(result, options = {}) {
   const root = options.publishPath ? libraryRootForPath(options.publishPath) : null;
   const url = sourceIdentityUrl(result.source_metadata, sourceUrls(result.artifacts?.reading_markdown || '')[0]);
+  const evidence=sourceAliasEvidence(result.source_metadata);
+  if(evidence.canonical&&evidence.aliases.length>1&&result.artifacts?.reading_markdown?.startsWith('---')){
+    const markdown=result.artifacts.reading_markdown.replace(/^canonical_url:.*\r?\n|^source_url_aliases:.*\r?\n/gmu,'').replace(/^---\r?\n/u,'---\ncanonical_url: '+JSON.stringify(evidence.canonical)+'\nsource_url_aliases: '+JSON.stringify(evidence.aliases)+'\n');
+    result={...result,artifacts:{...result.artifacts,reading_markdown:markdown}};
+  }
   if (result.source_metadata?.source_parts?.length > 1) {
     result = {...result,artifacts:{...result.artifacts,reading_markdown:result.artifacts.reading_markdown.replace(/^---\r?\n/u,'---\nsource_identity_url: '+JSON.stringify(url)+'\n')}};
   }
@@ -898,7 +903,7 @@ export async function runStandardPreprocessingWorkflow(request, options = {}) {
   const choices = route.plan.choices;
   const supplied = request.processing_options || {};
   const common = {};
-  for (const key of ["preserve_source_voice", "attribute_unverified_claims", "normalize_semantic_containers", "insight_soft_min", "insight_soft_max", "insight_safety_cap"]) {
+  for (const key of ["translation_mode", "preserve_source_voice", "attribute_unverified_claims", "normalize_semantic_containers", "insight_soft_min", "insight_soft_max", "insight_safety_cap"]) {
     if (supplied[key] !== undefined) common[key] = supplied[key];
   }
   const sourceMetadata = { ...request.source_metadata };

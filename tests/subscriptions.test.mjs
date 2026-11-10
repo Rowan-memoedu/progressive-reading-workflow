@@ -13,9 +13,36 @@ import { processPending, discover, observe } from '../video-workflow/watch-core.
 import { RssImporter } from '../rss-import/core.mjs';
 import { syncFeedDocument } from '../rss-source/core.mjs';
 import { shortKey, rollShortReports } from '../subscription-workflow/report-archive.mjs';
+import { applyDecision } from '../rss-reading/core.mjs';
+import { recordExceptions, acknowledgeExceptions, exceptionFile } from '../subscription-workflow/exception-log.mjs';
+import { readingRequest, attachGuideAnchors, deliverArticle, subscriptionProducer } from '../subscription-workflow/reading-delivery.mjs';
+import { readingDestination } from '../subscription-workflow/reading-options.mjs';
+import { organizeReadingSubscriptions } from '../subscription-workflow/reading-organization.mjs';
+import { mergeReviewCard } from '../subscription-workflow/report-routing.mjs';
+import { loadTranslationPolicy } from '../standard-preprocessing/lib/translation-policy.mjs';
+import { resolveProcessingPlan } from '../standard-preprocessing/lib/workflow-plan.mjs';
+import { validateRequestContract, buildPreprocessRequest } from '../standard-preprocessing/index.mjs';
+import { resolveVaultLocation, refreshObsidianLinks } from '../subscription-workflow/obsidian-links.mjs';
 
 const artifact='D:/Artifacts/ProgressiveReading/subscriptions-20261106/tests';
 const previousRssHome=process.env.RSS_IMPORT_HOME;
+test('subscription production pins Codex Exec while preserving the chosen Codex model and caller config',async()=>{
+  const config={AI_PRODUCER_PROVIDER:'deepseek',AI_PRODUCER_BASE_URL:'https://api.example.test',AI_PRODUCER_MODEL:'old-api-model',AI_PRODUCER_CODEX_MODEL:'fixture-codex-model'};
+  const producer=await subscriptionProducer(config);
+  assert.equal(producer.config.AI_PRODUCER_PROVIDER,'codex_exec');
+  assert.equal(producer.config.AI_PRODUCER_CODEX_MODEL,'fixture-codex-model');
+  assert.equal(config.AI_PRODUCER_PROVIDER,'deepseek');
+});
+
+test('a completed overview replaces a pending placeholder and preserves reading notes',()=>{
+  const marker='<!-- rss-reading:end -->';
+  const saved='**当前状态**：已保存\n**内容概述**：概述正在生成。\n**为什么值得读**：待判断\n> 阅读批注。\n'+marker;
+  const generated='**当前状态**：已保存\n**内容概述**：给出具体机制和实例。\n**为什么值得读**：包含完整推导。\n'+marker;
+  const merged=mergeReviewCard(generated,saved);
+  assert.match(merged,/内容概述\*\*：给出具体机制和实例。/u);
+  assert.match(merged,/为什么值得读\*\*：包含完整推导。/u);
+  assert.match(merged,/> 阅读批注。/u);assert.doesNotMatch(merged,/正在生成|待判断/u);
+});
 test.afterEach(()=>{if(previousRssHome===undefined)delete process.env.RSS_IMPORT_HOME;else process.env.RSS_IMPORT_HOME=previousRssHome;});
 async function fixture(){
   await fs.mkdir(artifact,{recursive:true});const root=await fs.mkdtemp(path.join(artifact,'case-')),home=path.join(root,'home'),rssHome=path.join(root,'rss-home'),videoHome=path.join(root,'video-home');
@@ -34,6 +61,160 @@ async function addText(f,{url='https://zhuanlan.zhihu.com/p/123',markdown='完�
   return saveSourceMaterial(f.root,source,{url,title:'测试文章',published_at:'2026-11-05T00:00:00Z'},markdown);
 }
 async function previewRunner({item,request}){return {result:{status:'completed',processing_state:'rendered',translation_state:'not_translation',artifacts:{target_zone:'local-ir-reading',semantic:{judgments:{value:{level:'high',reason:'有完整推导'},density:{level:'high'},continue_reading:{level:'yes'}},insights:[{description:'核心命题与推导。'}]},reading_markdown:`# 中文标题\n\n## 阅读前置卡\n\n提示\n\n---\n\n## 正文\n\n${request.material.markdown}\n\n---\n\n## 原文\n\n${request.material.markdown}`}}};}
+
+async function directReadingRunner(request,{publishPath,outputDir}){
+  const url=request.source_metadata.original_url || request.source_metadata.source_url;
+  const markdown=`---\nsource_url: ${url}\n---\n# 已接收文章\n\n## 正文\n\n${request.material.markdown}\n\n## 原文\n\n${request.material.markdown}\n`;
+  const result={status:'completed',processing_state:'rendered',artifacts:{target_zone:'local-ir-reading',reading_markdown:markdown,semantic:{judgments:null,insights:[]}}};
+  const publication={status:'published',cleanliness:{valid:true},markdown:{path:publishPath,sha256:digest(markdown)}};
+  await fs.mkdir(path.dirname(publishPath),{recursive:true});
+  await fs.writeFile(publishPath,markdown);
+  await writeJson(path.join(outputDir,'result.json'),result);
+  await writeJson(path.join(outputDir,'publication.json'),publication);
+  return {result,publication};
+}
+
+test('new RSS sources default to direct terminology reading without guides and edits persist all three settings',async()=>{
+  const source=normalizeSource({name:'新 RSS',kind:'rss',url:'https://settings.test/feed',mode:'reports'});
+  assert.equal(source.direct_reading,true);
+  assert.equal(source.translation_mode,'terminology');
+  assert.equal(source.generate_guide,false);
+  const f=await fixture();
+  await saveSource(f.root,{id:f.source.id,direct_reading:true,translation_mode:'plain',generate_guide:true},{expectedRevision:f.config.revision});
+  const configured=(await loadConfig(f.root)).subscriptions.find(item=>item.id===f.source.id);
+  assert.equal(configured.direct_reading,true);
+  assert.equal(configured.translation_mode,'plain');
+  assert.equal(configured.generate_guide,true);
+  const request=readingRequest(buildPreprocessRequest({markdown:'來源原文',sourceType:'web',sourceMetadata:{source_url:'https://settings.test/article',source_is_original:true}}),{reading_options:configured});
+  assert.equal((await validateRequestContract(request)).valid,true);
+  assert.equal(request.processing_options.translation_mode,'plain');
+  assert.equal(request.processing_options.include_reading_guide,true);
+  assert.equal(request.processing_options.spoken_to_written,false);
+  assert.equal(request.processing_options.structure_body,false);
+  const plain=await loadTranslationPolicy('must-not-read-custom-prompt','plain');
+  assert.equal(plain.path,null);
+  assert.match(plain.text,/conventional Chinese translations/u);
+  assert.equal(resolveProcessingPlan({}, {source_language:'zh'}).choices.translate.enabled,false);
+  assert.equal(resolveProcessingPlan({}, {source_language:'other'}).choices.translate.enabled,true);
+});
+
+test('direct reading publishes before choosing and its archive action moves the edited file once',async()=>{
+  const f=await fixture();
+  await saveSource(f.root,{id:f.source.id,direct_reading:true});
+  const record=await addText(f);
+  let calls=0;
+  const runner=async(request,settings)=>{
+    calls++;
+    assert.equal(request.processing_options.include_reading_guide,false);
+    return directReadingRunner(request,settings);
+  };
+  const prepared=await prepareSubscriptionPreviews(f.root,null,{readingRunner:runner,previewRunner});
+  assert.equal(prepared.failures.length,0);
+  let ledger=await loadLedger(f.root);
+  const file=ledger.items[record.material_id].publication.path;
+  assert.equal(ledger.items[record.material_id].decision,'unresolved');
+  assert.doesNotMatch(await fs.readFile(file,'utf8'),/^## 阅读前置卡/mu);
+  const daily=await generateSummaries(f.root,{date:'2026-11-08',mode:'daily',readingRunner:runner,previewRunner});
+  const report=await fs.readFile(daily.outputs.daily.path,'utf8');
+  assert.match(report,/- \[ \] 移出阅读区/u);
+  assert.match(report,/- \[ \] 稍后读/u);
+  assert.match(report,/- \[ \] 生成导读卡/u);
+  assert.match(report,/\*\*内容概述\*\*：核心命题与推导。/u);
+  assert.match(report,/\[立刻阅读\]\(obsidian:\/\/open\?path=.+&paneType=tab\)/u);
+  await fs.appendFile(file,'\n> 本人批注不能丢。\n');
+  const edited=await fs.readFile(file,'utf8');
+  await fs.writeFile(daily.outputs.daily.path,report.replace('- [ ] 移出阅读区','- [x] 移出阅读区'));
+  const completed=await processMarkdownDecisions(f.root,{date:'2026-11-08'});
+  assert.equal(completed.failures.length,0);
+  assert.equal(completed.completed[0].status,'archived');
+  ledger=await loadLedger(f.root);
+  assert.equal(ledger.items[record.material_id].publication.status,'archived');
+  assert.equal(await fs.readFile(ledger.items[record.material_id].publication.path,'utf8'),edited);
+  await assert.rejects(fs.access(file),{code:'ENOENT'});
+  await prepareSubscriptionPreviews(f.root,null,{readingRunner:runner,previewRunner});
+  assert.equal(calls,1);
+  assert.equal((await processMarkdownDecisions(f.root)).completed.length,0);
+});
+
+test('guide generation uses the saved article and preserves every byte outside the added guide',async()=>{
+  const f=await fixture();
+  await saveSource(f.root,{id:f.source.id,direct_reading:true});
+  const record=await addText(f);
+  await prepareSubscriptionPreviews(f.root,null,{readingRunner:directReadingRunner,previewRunner});
+  const item=(await loadLedger(f.root)).items[record.material_id];
+  await fs.appendFile(item.publication.path,'\n用户在原文尾部的批注。\n');
+  const before=await fs.readFile(item.publication.path,'utf8');
+  const daily=await generateSummaries(f.root,{date:'2026-11-08',mode:'daily'});
+  await fs.writeFile(daily.outputs.daily.path,(await fs.readFile(daily.outputs.daily.path,'utf8')).replace('- [ ] 生成导读卡','- [x] 生成导读卡'));
+  let calls=0;
+  const guideRunner=async request=>{
+    calls++;
+    assert.equal(request.processing_options.translate,false);
+    assert.equal(request.processing_options.include_reading_guide,true);
+    assert.equal(request.processing_options.structure_body,false);
+    return {result:{status:'completed',processing_state:'rendered',artifacts:{target_zone:'local-ir-reading',semantic:{judgments:{value:{level:'high'}}},reading_markdown:'# 标题\n\n## 阅读前置卡\n\n本篇导读。\n\n---\n\n## 正文\n\n此处模拟生成器的正文，禁止用于替换原文件。'}}};
+  };
+  const handled=await processMarkdownDecisions(f.root,{date:'2026-11-08',guideRunner});
+  assert.equal(handled.failures.length,0);
+  const after=await fs.readFile(item.publication.path,'utf8');
+  assert.equal(after.replace(/<!-- subscriptions:reading-guide [^\n]+ -->\n[\s\S]*?<!-- subscriptions:reading-guide-end -->\n\n/u,''),before);
+  await applyDecision(f.root,record.material_id,'selected',{guideRunner});
+  assert.equal(calls,1);
+  const later=await applyDecision(f.root,record.material_id,'deferred',{date:'2026-11-08',vaultRoot:f.root});
+  assert.equal(later.status,'later_handoff_ready');
+  assert.equal(await fs.readFile(item.publication.path,'utf8'),after);
+});
+
+test('guide anchors resolve to saved paragraphs and preserve existing list and annotation anchors',()=>{
+  const body='第一段。\r\n\r\n- 关键步骤。\r\n- 补充步骤。 ^existing-list\r\n\r\n第三段。 ^pr-aaaaaaaaaaaa\r\n';
+  const blocks=[
+    {source_block_key:'a',block_id:'pr-111111111111',type:'paragraph',markdown:'第一段。'},
+    {source_block_key:'b',block_id:'pr-222222222222',type:'list',markdown:'- 关键步骤。\n- 补充步骤。 ^existing-list'},
+    {source_block_key:'c',block_id:'pr-333333333333',type:'paragraph',markdown:'第三段。 ^pr-aaaaaaaaaaaa'}
+  ];
+  const guide=blocks.map(block=>`[[#^${block.block_id}|正文跳转]]`).join('\n');
+  const anchored=attachGuideAnchors(body,guide,blocks);
+  assert.match(anchored.body,/第一段。\r\n\r\n\^pr-111111111111/u);
+  assert.match(anchored.body,/- 关键步骤。 \^pr-222222222222\r\n/u);
+  assert.match(anchored.guide,/#\^pr-aaaaaaaaaaaa/u);
+  assert.doesNotMatch(anchored.guide,/#\^pr-333333333333/u);
+  assert.equal(anchored.body.replace('\r\n\r\n^pr-111111111111','').replace(' ^pr-222222222222',''),body);
+});
+
+test('restriction notifications are once per article even when error details and batch membership change',async()=>{
+  const f=await fixture();
+  const fault={url:'https://blocked.test/a',title:'受限文章',error:'fetched_article_access_restricted_paid_subscribers'};
+  const first=await recordExceptions(f.root,[fault],'rss');
+  assert.equal(first.length,1);
+  await acknowledgeExceptions(f.root,first);
+  assert.deepEqual(await recordExceptions(f.root,[{...fault,error:'paid_subscription_required'},fault],'retry'),[]);
+  const next=await recordExceptions(f.root,[fault,{...fault,url:'https://blocked.test/b',title:'另一文章'}],'rss');
+  assert.equal(next.length,1);
+  const text=await fs.readFile(exceptionFile(f.root),'utf8');
+  assert.equal((text.match(/<!-- subscriptions:exception /gu)||[]).length,2);
+});
+
+test('Obsidian reading links use the registered vault junction and request a new tab',async()=>{
+  const f=await fixture();
+  const vault=path.join(f.root,'vault');
+  const project=path.join(f.root,'external-project');
+  const folder=path.join(vault,'Projects');
+  await fs.mkdir(folder,{recursive:true});
+  await fs.mkdir(project,{recursive:true});
+  await fs.symlink(project,path.join(folder,'Reading'),'junction');
+  const registry=path.join(f.root,'obsidian-vaults.json');
+  await writeJson(registry,{vaults:{'vault-id':{path:vault,open:true}}});
+  const location=await resolveVaultLocation(project,registry);
+  assert.equal(location.id,'vault-id');
+  assert.equal(location.workflow_path,path.join('Projects','Reading'));
+  const item={platform:'rss',route:'long_review',reading_options:{direct_reading:true},publication:{status:'published',path:path.join(project,'阅读区','文章(1).md')}};
+  await refreshObsidianLinks({workflowRoot:project},[item],{vaultRegistry:registry});
+  const link=new URL(item.publication.obsidian_uri);
+  assert.equal(link.searchParams.get('vault'),'vault-id');
+  assert.equal(link.searchParams.get('file'),'Projects/Reading/阅读区/文章(1).md');
+  assert.match(item.publication.obsidian_uri,/%281%29/u);
+  assert.equal(link.searchParams.get('paneType'),'tab');
+});
 
 test('legacy migration keeps routes; edits are revision-checked; Bilibili original mode is rejected',async()=>{
   const f=await fixture();assert.deepEqual(f.config.subscriptions.slice(0,2).map(s=>s.mode),['standard_preprocess','reports']);
@@ -155,7 +336,8 @@ test('weekly rollover resets multi-select, moves unchecked cards and rejects sta
   const multiple=await addText(f,{url:'https://zhuanlan.zhihu.com/p/700'});
   const unchecked=await addText(f,{url:'https://zhuanlan.zhihu.com/p/701'});
   const dismissed=await addText(f,{url:'https://zhuanlan.zhihu.com/p/702'});
-  const first=await generateSummaries(f.root,{mode:'weekly',week:'2026-W44',previewRunner});
+  await generateSummaries(f.root,{mode:'daily',date:'2026-10-30',week:'2026-W44',previewRunner});
+  const first=await generateSummaries(f.root,{mode:'weekly',date:'2026-11-01',week:'2026-W44',previewRunner});
   const old=first.outputs.long_weekly.path;
   const edit=(text,id,modify)=>text.replace(new RegExp(`<!-- rss-reading:item ${id} -->[\\s\\S]*?<!-- rss-reading:end -->`,'u'),modify);
   let original=await fs.readFile(old,'utf8');
@@ -437,18 +619,23 @@ test('short rollover resumes its saved transfer checkpoint without duplicating a
   await assert.rejects(fs.access(generated.outputs.short_weekly.path),{code:'ENOENT'});
 });
 
-test('a daily transferred on its own date remains visible until the following day',async()=>{
+test('same-day intake stays actionable in the daily and transfers only on a later weekly run',async()=>{
   const f=await fixture();
   await addText(f);
   const daily=await generateSummaries(f.root,{mode:'daily',date:'2026-11-08',week:'2026-W45',previewRunner});
-  await generateSummaries(f.root,{mode:'weekly',date:'2026-11-08',week:'2026-W45',previewRunner});
+  const weekly=await generateSummaries(f.root,{mode:'weekly',date:'2026-11-08',week:'2026-W45',previewRunner});
+  assert.equal(weekly.outputs.long_weekly,null);
   await fs.access(daily.outputs.daily.path);
   const next=await processMarkdownDecisions(f.root,{date:'2026-11-09'});
-  assert.equal(next.archived_reports.length,1);
+  assert.equal(next.archived_reports.length,0);
+  await fs.access(daily.outputs.daily.path);
+  const moved=await generateSummaries(f.root,{mode:'weekly',date:'2026-11-15',week:'2026-W46',previewRunner});
+  assert.equal(moved.outputs.long_weekly.item_count,1);
+  assert.equal(moved.archived_reports.length,1);
   await assert.rejects(fs.access(daily.outputs.daily.path),{code:'ENOENT'});
 });
 
-test('weekly rollover carries blocked source entries with historical selections before retiring their daily',async()=>{
+test('blocked source entries are recorded centrally and stay outside daily and weekly reports',async()=>{
   const f=await fixture();
   const blocked=await addText(f,{url:'https://zhuanlan.zhihu.com/p/830',markdown:null});
   const synced=await syncLedger(f.root);
@@ -456,10 +643,113 @@ test('weekly rollover carries blocked source entries with historical selections 
   await writeJson(synced.paths.ledgerPath,synced.ledger);
   const daily=await generateSummaries(f.root,{mode:'daily',date:'2026-11-07',week:'2026-W45'});
   const weekly=await generateSummaries(f.root,{mode:'weekly',date:'2026-11-08',week:'2026-W45'});
-  assert.match(await fs.readFile(weekly.outputs.long_weekly.path,'utf8'),new RegExp(`rss-reading:item ${blocked.material_id}`,'u'));
+  assert.equal(daily.outputs.daily,null);
+  assert.equal(weekly.outputs.long_weekly,null);
+  const log=await fs.readFile(path.join(f.reading.summaryRoot,'订阅异常记录.md'),'utf8');
+  assert.match(log,/https:\/\/zhuanlan.zhihu.com\/p\/830/u);
+  assert.equal((log.match(/<!-- subscriptions:exception /gu)||[]).length,1);
+});
+
+test('a weekly invocation on first intake creates a daily only, including import activity',async()=>{
+  const f=await fixture(),record=await addText(f);
+  const result=await generateSummaries(f.root,{mode:'weekly',date:'2026-11-08',week:'2026-W45',previewRunner});
+  await appendActivity(f.root,result);
+  assert.equal(result.outputs.long_weekly,null);
+  assert.ok((await fs.readFile(result.outputs.daily.path,'utf8')).includes(record.material_id));
   const ledger=await loadLedger(f.root);
-  assert.ok(ledger.report_runs.daily['2026-11-07'].archived_path);
-  await assert.rejects(fs.access(daily.outputs.daily.path),{code:'ENOENT'});
+  assert.equal(ledger.items[record.material_id].delivery.active_review_path,result.outputs.daily.path);
+  assert.equal(ledger.report_runs.weekly['2026-W45'].long_weekly,null);
+  assert.equal(ledger.report_runs.daily['2026-11-08'].path,result.outputs.daily.path);
+  await assert.rejects(fs.access(path.join(f.reading.summaryRoot,'2026-W45 订阅 长文周报.md')),{code:'ENOENT'});
+});
+
+test('RSS publications use subscription folders and organization preserves annotations and asset destinations',async()=>{
+  const f=await fixture(),record=await addText(f);
+  const synced=await syncLedger(f.root),item=synced.ledger.items[record.material_id];
+  const source=f.config.subscriptions.find(source=>source.kind==='rss'&&source.mode==='reports');
+  Object.assign(item,{platform:'rss',subscription_kind:source.kind,subscription_name:source.name,subscription_ids:[source.id],destination:'RSS'});
+  assert.equal(readingDestination(item),path.join('订阅','RSS',source.name));
+  await deliverArticle(f.reading,item,'新文章',{readingRunner:directReadingRunner});
+  assert.equal(path.dirname(item.publication.path),path.join(f.root,'阅读区/订阅/RSS',source.name));
+  const old=path.join(f.root,'阅读区/RSS','旧文章.md');
+  await fs.mkdir(path.dirname(old),{recursive:true});
+  const before='正文与批注。\n\n![图](images/asset.png)\n> 保留的批注。\n';
+  await fs.writeFile(old,before);
+  item.publication={...item.publication,path:old,sha256:digest(before)};
+  await writeJson(f.reading.ledgerPath,synced.ledger);
+  const sidecar=path.join(f.reading.localIrStateRoot,'旧文章.md.browser-ir.json');
+  await writeJson(sidecar,{document:{path:'Projects/Reading/阅读区/RSS/旧文章.md'},browser:{sourceMetadata:{}}});
+  await writeJson(path.join(f.rssHome,'state.json'),{items:{known:{feeds:[source.url],artifacts:[{path:old,sha256:digest(before)}]}}});
+  const moved=await organizeReadingSubscriptions(f.root);
+  assert.equal(moved.moves.length,1);
+  const publication=(await loadLedger(f.root)).items[record.material_id].publication;
+  const after=await fs.readFile(publication.path,'utf8');
+  assert.match(after,/> 保留的批注。/u);assert.match(after,/!\[图\]\(<\.\.\/\.\.\/\.\.\/RSS\/images\/asset.png>\)/u);
+  assert.equal(publication.sha256,digest(after));
+  assert.equal((await readJson(sidecar)).document.path,'Projects/Reading/阅读区/订阅/RSS/'+source.name+'/旧文章.md');
+  await assert.rejects(fs.access(old),{code:'ENOENT'});
+  assert.equal((await organizeReadingSubscriptions(f.root)).moves.length,0);
+});
+
+test('direct-reading overview survives daily-to-weekly transfer without rewriting the article or adding a guide',async()=>{
+  const f=await fixture();await saveSource(f.root,{id:f.source.id,direct_reading:true});
+  const record=await addText(f);let calls=0;
+  const summarize=async input=>{
+    calls++;assert.equal(input.request.processing_options.translate,false);
+    assert.equal(input.request.processing_options.cleaning_mode,'source_voice_structuring');
+    return previewRunner(input);
+  };
+  const daily=await generateSummaries(f.root,{mode:'daily',date:'2026-11-06',readingRunner:directReadingRunner,previewRunner:summarize});
+  const file=(await loadLedger(f.root)).items[record.material_id].publication.path,before=await fs.readFile(file,'utf8');
+  assert.match(await fs.readFile(daily.outputs.daily.path,'utf8'),/\*\*内容概述\*\*：核心命题与推导。/u);
+  const weekly=await generateSummaries(f.root,{mode:'weekly',date:'2026-11-08',week:'2026-W45',previewRunner:summarize});
+  assert.match(await fs.readFile(weekly.outputs.long_weekly.path,'utf8'),/\*\*内容概述\*\*：核心命题与推导。/u);
+  assert.equal(calls,1);assert.equal(await fs.readFile(file,'utf8'),before);assert.doesNotMatch(before,/^## 阅读前置卡/mu);
+});
+
+test('a user edit during summary generation stops report replacement and preserves the edit',async()=>{
+  const f=await fixture();await addText(f);
+  const earlier=await generateSummaries(f.root,{mode:'daily',date:'2026-11-08',previewRunner});
+  const before=await fs.readFile(earlier.outputs.daily.path,'utf8'),edited=before+'\n> 生成期间新增的批注。\n';
+  await addText(f,{url:'https://zhuanlan.zhihu.com/p/9998'});
+  await assert.rejects(generateSummaries(f.root,{mode:'daily',date:'2026-11-08',previewRunner:async input=>{
+    await fs.writeFile(earlier.outputs.daily.path,edited);return previewRunner(input);
+  }}),/report_changed_during_generation/u);
+  assert.equal(await fs.readFile(earlier.outputs.daily.path,'utf8'),edited);
+});
+
+test('weekly transfer excludes new arrivals, preserves card notes and archives only the old daily',async()=>{
+  const f=await fixture(),old=await addText(f);
+  const earlier=await generateSummaries(f.root,{mode:'daily',date:'2026-11-06',previewRunner});
+  const text=await fs.readFile(earlier.outputs.daily.path,'utf8');
+  await fs.writeFile(earlier.outputs.daily.path,text.replace('<!-- rss-reading:end -->','> 阅读时写下的批注。\n<!-- rss-reading:end -->')+'\n> 卡片后的批注。\n');
+  const fresh=await addText(f,{url:'https://zhuanlan.zhihu.com/p/9999'});
+  const result=await generateSummaries(f.root,{mode:'weekly',date:'2026-11-08',week:'2026-W45',previewRunner});
+  assert.equal(result.outputs.long_weekly.item_count,1);
+  const weekly=await fs.readFile(result.outputs.long_weekly.path,'utf8');
+  assert.ok(weekly.includes(old.material_id));assert.ok(!weekly.includes(fresh.material_id));
+  assert.match(weekly,/> 阅读时写下的批注。/u);assert.match(weekly,/> 卡片后的批注。/u);
+  const daily=await fs.readFile(result.outputs.daily.path,'utf8');
+  assert.ok(daily.includes(fresh.material_id));assert.doesNotMatch(daily,/历史快照|请在.*周报/u);
+  await assert.rejects(fs.access(earlier.outputs.daily.path),{code:'ENOENT'});
+  const repeated=await generateSummaries(f.root,{mode:'weekly',date:'2026-11-08',week:'2026-W45',previewRunner});
+  assert.equal(repeated.outputs.long_weekly.item_count,1);
+  assert.match(await fs.readFile(repeated.outputs.long_weekly.path,'utf8'),/> 卡片后的批注。/u);
+});
+
+test('junction aliases of report paths do not prevent old daily archival',async()=>{
+  const f=await fixture(),record=await addText(f);
+  const earlier=await generateSummaries(f.root,{mode:'daily',date:'2026-11-06',previewRunner});
+  const alias=path.join(f.root,'old-workspace');await fs.symlink(f.reading.summaryRoot,alias,'junction');
+  const aliased=path.join(alias,path.basename(earlier.outputs.daily.path));
+  const ledger=await loadLedger(f.root);
+  ledger.report_runs.daily['2026-11-06'].path=aliased;
+  Object.assign(ledger.items[record.material_id].delivery,{daily_report_path:aliased,active_review_path:aliased});
+  await writeJson(f.reading.ledgerPath,ledger);
+  const result=await generateSummaries(f.root,{mode:'weekly',date:'2026-11-08',week:'2026-W45',previewRunner});
+  assert.equal(result.outputs.long_weekly.item_count,1);
+  assert.equal(result.archived_reports.length,1);
+  await assert.rejects(fs.access(earlier.outputs.daily.path),{code:'ENOENT'});
 });
 
 test('changing a video from reports to automatic processing releases the existing waiting item',async()=>{

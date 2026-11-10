@@ -20,15 +20,17 @@ test('new entry imports original, reuses annotated archived RSS source, persists
     else if(url.pathname==='/sitemap.xml')res.end('<urlset><url><loc>'+origin+'/posts/old</loc></url></urlset>');
     else if(url.pathname==='/main.js')res.end('const url:"/reading"; const url:"/catalog"; const articleContent="payload";');
     else if(url.pathname==='/catalog')res.end(JSON.stringify({total:3,items:[{slug:'old'},{slug:'new'},{slug:'secret',private:true}].slice(0,Number(url.searchParams.get('size')))}));
-    else if(url.pathname==='/reading')res.end(JSON.stringify({document:{title:'Independent '+url.searchParams.get('slug'),payload:gzipSync(original).toString('base64')}}));
+    else if(url.pathname==='/reading')res.end(JSON.stringify({document:{slug:url.searchParams.get('slug'),title:'Independent '+url.searchParams.get('slug'),payload:gzipSync(original).toString('base64'),series:{title:'Independent course',entries:[{slug:'old'},{slug:'new'}]},labels:['Topic','Second topic']}}));
     else{res.writeHead(404);res.end('{}');}
   });
   await new Promise(r=>server.listen(0,'127.0.0.1',r));const origin='http://127.0.0.1:'+server.address().port;
-  const planPath=path.join(root,'plan.json');await fs.writeFile(planPath,JSON.stringify({include_paths:['/posts/*'],exclude_paths:[],article_source:{type:'json',url_template:origin+'/reading?slug={path.last}',title_path:'document.title',content_path:'document.payload',encoding:'base64_gzip',content_format:'markdown'},listing:{url:origin+'/catalog?size=1',total_path:'total',items_path:'items',item_url_template:origin+'/posts/{item.slug}',private_path:'private',limit_parameter:'size'}}));
+  const planPath=path.join(root,'plan.json');await fs.writeFile(planPath,JSON.stringify({include_paths:['/posts/*'],exclude_paths:[],article_source:{type:'json',url_template:origin+'/reading?slug={path.last}',title_path:'document.title',content_path:'document.payload',identity_path:'document.slug',encoding:'base64_gzip',content_format:'markdown',taxonomy:{collection_path:'document.series',collection_name_path:'title',collection_items_path:'entries',tags_path:'document.labels'}},listing:{url:origin+'/catalog?size=1',total_path:'total',items_path:'items',item_url_template:origin+'/posts/{item.slug}',private_path:'private',limit_parameter:'size'}}));
   const fixture=await startFixture({sitePlanPath:planPath});let dom,mounted;
   try{
-    const archived=path.join(fixture.workflowRoot,'已归档原文','RSS','annotated.md'),old='---\nsource_url: '+origin+'/posts/old\n---\n\n原有 RSS 文章\n\n==人工高亮== 与批注必须保留。\n';
+    const archived=path.join(fixture.workflowRoot,'已归档原文','RSS','annotated.md'),old='---\nsource_url: '+origin+'/reader?slug=old\n---\n\n原有 RSS 文章\n\n==人工高亮== 与批注必须保留。\n';
     await fs.mkdir(path.dirname(archived),{recursive:true});await fs.writeFile(archived,old);
+    const requestFile=path.join(fixture.workflowRoot,'rss-request.json');await fs.writeFile(requestFile,JSON.stringify({source_metadata:{source_url:origin+'/reader?slug=old',canonical_url:origin+'/reader?slug=old',original_url:origin+'/posts/old',original_source_ref:'item-page-original-markdown'}}));
+    await fs.mkdir(path.join(fixture.workflowRoot,'imports/rss-reading'),{recursive:true});await fs.writeFile(path.join(fixture.workflowRoot,'imports/rss-reading/review-ledger.v1.json'),JSON.stringify({items:{old:{material_id:'old',item_url:origin+'/reader?slug=old',preprocess_request_path:requestFile,publication:{path:archived}}}}));
     for(const route of ['/','/import','/import/']){const response=await fetch(fixture.baseUrl+route,{redirect:'manual'});assert.equal(response.status,302);assert.ok(response.headers.get('location').startsWith('/imports'));}
     const html=await (await fetch(fixture.baseUrl+'/imports')).text();
     const code=(await fs.readFile(new URL('../site-import/web/app.mjs',import.meta.url),'utf8')).replace("'/import/client.mjs'",JSON.stringify(pathToFileURL(path.resolve('scripts/browser-import-web/client.mjs')).href));
@@ -46,7 +48,9 @@ test('new entry imports original, reuses annotated archived RSS source, persists
     const fresh=run.results.find(r=>r.requested_url.endsWith('/new'));assert.equal(fresh.receipt.processing_mode,'original_text');assert.equal(fresh.receipt.llm_used,false);
     const output=fresh.artifacts.find(a=>a.kind==='markdown');const bytes=await fs.readFile(output.path);assert.equal(digest(bytes),output.sha256);assert.ok(bytes.toString('utf8').includes(original.trim()));
     assert.equal(await fs.readFile(archived,'utf8'),old);assert.equal(hits.some(url=>url.includes('slug=secret')),false);assert.equal(run.collection.inventory.excluded_count,1);assert.equal(run.collection.verification.verified,2);
-    assert.match(await fs.readFile(run.collection.verification.index,'utf8'),/已归档原文/u);
+    assert.match(await fs.readFile(run.collection.verification.index,'utf8'),/合集/u);
+    const course=path.join(path.dirname(run.collection.verification.index),'合集','Independent course','目录.md');assert.match(await fs.readFile(course,'utf8'),/已归档原文/u);
+    assert.equal(path.dirname(output.path),path.dirname(course));assert.equal(run.collection.verification.groups.length,3);
     mounted.stop();dom.window.close();dom=new JSDOM(html,{url:fixture.baseUrl+'/imports'});mounted=mountImportCenter(dom.window.document,{fetchImpl,pollMs:100000});await delay(100);await mounted.refresh();
     assert.match(dom.window.document.getElementById('site-sources').textContent,/新增 1 · 复用 1/u);
     await mounted.start(state.sources[0]);

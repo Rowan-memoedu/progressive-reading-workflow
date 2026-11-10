@@ -510,6 +510,11 @@ export class BrowserImportBroker {
     return this.withLock(()=>this.state.requests.filter(request=>!sources||sources.includes(request.source)).slice(-limit).reverse().map(request=>this.requestSummary(request.id)));
   }
 
+  async relocateSourceArtifacts(entries,hashEntries){
+    const {remapReceipts}=await import('../site-import/organization.mjs');
+    return this.withLock(async()=>{const mapping=new Map(entries),hashes=new Map(hashEntries);for(const task of this.state.tasks)if(task.result)task.result=remapReceipts(task.result,mapping,path.dirname(path.dirname(this.stateRoot)),hashes);await this.save();});
+  }
+
   async findSuccessfulResultForUrl(requestedUrl, { excludeTaskId = null } = {}) {
     return this.withLock(async () => {
       const identity = normalizedUrlIdentity(requestedUrl);

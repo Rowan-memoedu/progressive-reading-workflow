@@ -1,11 +1,11 @@
 import fs from "node:fs/promises";
-import {fileURLToPath,pathToFileURL} from "node:url";
-import {readingDestination} from "./reading-options.mjs";
+import {fileURLToPath,pathToFileURL} from 'node:url';
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { digest, loadConfig } from "./config.mjs";
 import { renameWithRetry } from "../rss-source/core.mjs";
 import sanitizeFilename from "sanitize-filename";
+import {readingDestination} from './reading-options.mjs';
 
 export const shortKey = item => digest(`${item.material_id}:${item.source_revision}`);
 const chineseStart = key => `<!-- rss-reading:short ${key} -->`;
@@ -27,7 +27,7 @@ async function readOptional(file) {
   });
 }
 
-async function replaceChecked(file, before, after) {
+export async function replaceChecked(file, before, after) {
   if (before === after) return;
   await fs.mkdir(path.dirname(file),{recursive:true});
   const temp = `${file}.tmp-${randomUUID()}`;
@@ -135,31 +135,6 @@ export async function appendShortReport(file, week, key, chinese, english, label
 
 function archiveRoot(paths) {
   return path.join(paths.workflowRoot,"待归档原文","订阅");
-}
-
-function relocateLinks(text, source, target) {
-  let fence = null;
-  return text.split(/(?<=\n)/u).map(line=>{
-    const delimiter = /^\s{0,3}(`{3,}|~{3,})/u.exec(line)?.[1];
-    if (delimiter) {
-      if (!fence) fence = delimiter;
-      else if (delimiter[0] === fence[0] && delimiter.length >= fence.length) fence = null;
-      return line;
-    }
-    if (fence) return line;
-    return line.replace(/(`+[^\r\n]*?`+)|(\]\()(<[^>\r\n]+>|[^\s()]+)(\))/gu,(match,code,open,destination,close)=>{
-      if (code) return match;
-      const raw = destination.startsWith("<") ? destination.slice(1,-1) : destination;
-      if (/^(?:[a-z][a-z0-9+.-]*:|\/|#)/iu.test(raw)) return match;
-      const [,pathname,suffix] = /^([^#?]*)([\s\S]*)$/u.exec(raw);
-      let decoded;
-      try { decoded = decodeURI(pathname); } catch { return match; }
-      const absolute = path.resolve(path.dirname(source),decoded);
-      const relative = path.relative(path.dirname(target),absolute).replaceAll("\\","/");
-      const encoded = encodeURI(relative).replaceAll("#","%23").replaceAll("?","%3F");
-      return `${open}<${encoded+suffix}>${close}`;
-    });
-  }).join("");
 }
 
 export function relocatedPath(value, mapping, workflowRoot) {
@@ -301,8 +276,8 @@ export async function rollShortReports(paths, ledger, week, save, labelFor) {
           const file = path.join(archiveRoot(paths),ledger.short_archive_sources[owner.id]);
           const before = await fs.readFile(file,"utf8");
           const marker = `<!-- subscriptions:archived-short ${key} -->`;
-          const archivedBody = relocateLinks(body,source,file);
-          const archivedOriginal = original ? relocateLinks(original,source,file) : null;
+          const archivedBody = relocatedMarkdown(body,source,file);
+          const archivedOriginal = original ? relocatedMarkdown(original,source,file) : null;
           const entry = [marker,archivedBody,archivedOriginal ? "**English original**\n\n"+archivedOriginal : "","<!-- subscriptions:archived-short-end -->"].filter(Boolean).join("\n\n");
           if (before.includes(marker) && !before.includes(entry)) throw new Error(`short_archive_entry_changed:${file}:${key}`);
           if (!before.includes(marker)) await replaceChecked(file,before,before+"\n\n"+entry+"\n");
@@ -351,10 +326,11 @@ export async function archiveSummaryReports(paths, ledger, {date,week,rolloverFi
       const ids = [...text.matchAll(/<!-- rss-reading:item\s+([^\s>]+)\s+-->/gu)].map(match=>match[1]);
       if (ids.length !== (text.match(/<!-- rss-reading:item\b/gu) || []).length
         || ids.length !== (text.match(/<!-- rss-reading:end -->/gu) || []).length) throw new Error(`report_archive_malformed_items:${report.path}`);
-      const ready = report.rollover_sha256 === digest(text) || ids.every(id=>{
+      const ready = ids.every(id=>{
         const original = ledger.items[id];
         const item = original?.canonical_material_id ? ledger.items[original.canonical_material_id] : original;
-        return item && (item.decision === "dismissed"
+        return item && ((item.decision === "dismissed" && !item.pending_markdown_action && !item.requested_action
+            && (!item.reading_options?.direct_reading || item.publication?.status === 'archived'))
           || (item.decision === "selected" && item.publication?.status === "published" && !item.pending_markdown_action && !item.requested_action)
           || (item.decision === "deferred" && item.later?.status === "handoff_ready")
           || transferred.has(item.material_id));
@@ -365,7 +341,7 @@ export async function archiveSummaryReports(paths, ledger, {date,week,rolloverFi
         await save();
         continue;
       }
-      report.archive_pending = {sha256:digest(text),destination_sha256:digest(relocateLinks(text,report.path,archive))};
+      report.archive_pending = {sha256:digest(text),destination_sha256:digest(relocatedMarkdown(text,report.path,archive))};
       await save();
     }
     await moveReport(report.path,archive,report.archive_pending.sha256,report.archive_pending.destination_sha256);

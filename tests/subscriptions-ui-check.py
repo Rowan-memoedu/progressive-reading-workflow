@@ -31,6 +31,33 @@ with sync_playwright() as p:
         page.set_viewport_size({"width": width, "height": 1000})
         assert page.evaluate("document.documentElement.scrollWidth<=innerWidth")
         page.screenshot(path=str(output / f"form-{width}.png"), full_page=True)
+    if "--repository" in sys.argv:
+        captured_repository = []
+
+        def capture_repository(route):
+            captured_repository.append(route.request.post_data_json["source"])
+            route.fulfill(json={"status": "saved"})
+
+        page.route("**/api/subscriptions/source", capture_repository)
+        page.locator("#add").click()
+        page.locator("#kind").select_option("github_repository")
+        page.locator("#name").fill("Repository fixture")
+        page.locator("#url").fill("https://github.com/example/translations")
+        page.locator("#repository-root").fill("docs")
+        page.locator("#repository-site").fill("https://example.github.io/translations/")
+        assert page.locator("#mode").input_value() == "original_text"
+        assert page.locator("#history_mode").input_value() == "all"
+        for width in [768, 414, 375, 320]:
+            page.set_viewport_size({"width": width, "height": 1000})
+            assert page.evaluate("document.documentElement.scrollWidth<=innerWidth")
+            page.screenshot(path=str(output / f"repository-{width}.png"), full_page=True)
+        page.locator("#save").click()
+        expect(page.locator("#message")).to_contain_text("已保存")
+        assert captured_repository[-1]["repository"]["content_root"] == "docs"
+        assert captured_repository[-1]["repository"]["public_base"] == "https://example.github.io/translations/"
+        assert captured_repository[-1]["mode"] == "original_text"
+        page.unroute("**/api/subscriptions/source", capture_repository)
+        print(json.dumps({"repository_form": "passed", "real_writes": 0}))
     if "--feedback" in sys.argv:
         state = page.request.get("http://127.0.0.1:37829/api/subscriptions").json()
         state["jobs"] = []
@@ -71,6 +98,37 @@ with sync_playwright() as p:
         assert not page.locator("#earliest_date").is_visible()
         page.screenshot(path=str(output / "feedback-320.png"), full_page=True)
         print(json.dumps({"feedback": "passed", "submissions": submissions}, ensure_ascii=False))
+    if "--settings" in sys.argv:
+        state = page.request.get("http://127.0.0.1:37829/api/subscriptions").json()
+        captured = []
+
+        def capture_settings(route):
+            captured.append(route.request.post_data_json["source"])
+            route.fulfill(json={"status": "saved"})
+
+        page.route("**/api/subscriptions", lambda route: route.fulfill(json=state))
+        page.route("**/api/subscriptions/source", capture_settings)
+        page.goto("http://127.0.0.1:37829/subscriptions", wait_until="networkidle")
+        source = next(source for source in state["subscriptions"] if source["kind"] == "rss" and source["mode"] == "reports")
+        row = page.locator(".source").filter(has=page.get_by_role("heading", name=source["name"], exact=True))
+        row.get_by_role("button", name="编辑", exact=True).click()
+        page.locator("#direct_reading").select_option("false")
+        page.locator("#translation_mode").select_option("plain")
+        page.locator("#generate_guide").select_option("true")
+        page.get_by_role("button", name="保存订阅", exact=True).click()
+        expect(page.locator("#message")).to_contain_text("已保存")
+        assert captured[-1]["direct_reading"] is False
+        assert captured[-1]["translation_mode"] == "plain"
+        assert captured[-1]["generate_guide"] is True
+        page.get_by_role("button", name="添加订阅", exact=True).click()
+        expect(page.locator("#direct_reading")).to_have_value("true")
+        expect(page.locator("#translation_mode")).to_have_value("terminology")
+        expect(page.locator("#generate_guide")).to_have_value("false")
+        for width in [320, 375, 414, 768]:
+            page.set_viewport_size({"width": width, "height": 1000})
+            assert page.evaluate("document.documentElement.scrollWidth<=innerWidth")
+            page.screenshot(path=str(output / f"settings-{width}.png"), full_page=True)
+        print(json.dumps({"settings": "passed", "live_writes": 0}, ensure_ascii=False))
     assert not errors, errors
     browser.close()
     (output / "render-check.json").write_text(json.dumps({"status": "passed", "widths": results, "console_errors": errors}, ensure_ascii=False, indent=2), encoding="utf-8")

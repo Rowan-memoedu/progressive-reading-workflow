@@ -17,7 +17,7 @@ function cleanMathHtml(node) {
 
 // Recover source expressions before Readability/Turndown discard annotations
 // or duplicate the accessible and visual renderings of the same formula.
-export function htmlArticleToMarkdown({ html, sourceUrl, title = "" }) {
+export function htmlArticleToMarkdown({ html, sourceUrl, title = "", extractArticle = true }) {
   const dom = new JSDOM(html, { url: sourceUrl });
   try {
     const doc = dom.window.document;
@@ -97,9 +97,11 @@ export function htmlArticleToMarkdown({ html, sourceUrl, title = "" }) {
       const attr = node.tagName === "A" ? "href" : "src";
       try { node.setAttribute(attr, new URL(node.getAttribute(attr), sourceUrl).href); } catch { /* Preserve original. */ }
     }
-    const fallback = (doc.querySelector("article,main,[role=main]") || doc.body).innerHTML;
+    const explicitBodies = extractArticle ? doc.querySelectorAll('[itemprop~="articleBody"], .h-entry .e-content') : [];
+    const explicitBody = explicitBodies.length === 1 ? explicitBodies[0] : null;
+    const fallback = (extractArticle ? explicitBody || doc.querySelector("article,main,[role=main]") || doc.body : doc.body).innerHTML;
     // Turndown uses language-* classes to preserve fenced-code languages.
-    const article = new Readability(doc, { keepClasses: true }).parse();
+    const article = extractArticle && !explicitBody ? new Readability(doc, { keepClasses: true }).parse() : null;
     const converter = new TurndownService({ headingStyle: "atx", bulletListMarker: "-", codeBlockStyle: "fenced" });
     converter.use(gfm);
     const content = article?.content || fallback;
@@ -111,7 +113,8 @@ export function htmlArticleToMarkdown({ html, sourceUrl, title = "" }) {
       markdown = markdown.split(token).join(formula);
     }
     if (!markdown) throw new Error("empty_page_content");
-    return { method: article?.content ? "readability_html" : "body_html", title: article?.title || title,
+    return { method: explicitBody ? "semantic_article_body" : article?.content ? "readability_html" : "body_html", title: article?.title || title,
+      byline:article?.byline || '',excerpt:article?.excerpt || '',
       markdown, fidelity: { formulas: preserved, warnings: [...new Set(warnings)] } };
   } finally { dom.window.close(); }
 }

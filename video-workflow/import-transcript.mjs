@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { groupTranscriptSegments } from '../scripts/import-youtube-subtitle-canary.mjs';
 import { preprocessNetworkMarkdown } from '../standard-preprocessing/integrations/network-import.mjs';
 import { publishReadingArtifact } from '../standard-preprocessing/index.mjs';
+import { libraryRootForPath, sourceIdentityUrl, findSourcePublication } from '../scripts/reading-source-library.mjs';
 import { layoutInlineAttachments } from './attachment-layout.mjs';
 import { captionMediaSource, extractBookMedia, verifyBookMedia, imageEmbed } from './book-media.mjs';
 import { withCachedMediaRestoration } from './generated-media-projection.mjs';
@@ -110,6 +111,17 @@ export async function importTranscript({ inputDir, outputDir, publishPath, proce
   } else segments = parseTranscript(raw.toString('utf8'));
   if (!metadata.source_url && metadata.video_url) metadata.source_url = metadata.video_url;
   if (!metadata.source_url || !metadata.title) throw new Error('source_url_and_title_required');
+  const libraryRoot = libraryRootForPath(requestedPublishPath);
+  const existingPublication = libraryRoot ? await findSourcePublication(libraryRoot, sourceIdentityUrl(metadata)) : null;
+  if (existingPublication) {
+    const receipt = {status:'completed',preserved_existing:true,processing_status:'idempotent_replay',quality_status:'ready',
+      publication:{status:'published',preserved_existing:true,markdown:existingPublication,assets:[]},
+      model:{calls:0},attachments:[],attachments_verified:0};
+    await fs.mkdir(outputDir,{recursive:true});
+    await fs.writeFile(path.join(outputDir,'publication.json'),JSON.stringify(receipt.publication,null,2)+'\n');
+    await fs.writeFile(path.join(outputDir,'video-receipt.json'),JSON.stringify(receipt,null,2)+'\n');
+    return receipt;
+  }
   // BV ids are transport placeholders. Once metadata is available, publish a
   // readable title while preserving explicitly named targets and mode suffixes.
   publishPath = bookPublicationPath(requestedPublishPath, metadata);
@@ -187,6 +199,11 @@ export async function importTranscript({ inputDir, outputDir, publishPath, proce
     await writeExact(path.join(attachmentRoot, publishedAssetRelative(record.path)), data);
   }
   const publication = await publishReadingArtifact(result, { publishPath, runDir: outputDir });
+  if (publication.preserved_existing && path.resolve(publication.markdown.path) !== path.resolve(publishPath)) {
+    const receipt={status:'completed',preserved_existing:true,quality_status:publication.quality_status,publication,model:run.result.receipt.model,attachments:[],attachments_verified:0};
+    await fs.writeFile(path.join(outputDir,'video-receipt.json'),JSON.stringify(receipt,null,2)+'\n');
+    return receipt;
+  }
   const final = await fs.readFile(publishPath, 'utf8');
   verifyBookMedia(final,extractBookMedia(bookMarkdown,inventory),slug);
   for (const record of inventory) {

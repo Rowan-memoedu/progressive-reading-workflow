@@ -21,7 +21,7 @@ export function resolveProcessingPlan(options, labels) {
   const defaults = {
     spoken_to_written: labels.input_form === "spoken_transcript",
     structure_body: false,
-    translate: labels.source_language === "en",
+    translate: labels.source_language === "en" || labels.source_language === "other",
     include_reading_guide: labels.content_profile === "natural_language"
   };
   return {

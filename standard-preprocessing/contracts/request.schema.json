@@ -53,6 +53,7 @@
         "original_placement": { "const": "after_translation" },
         "cleaning_mode": { "enum": ["semantic_only", "source_voice_structuring", "lossless_spoken_to_written", "source_translation"] },
         "translation_target_language": { "type": "string", "minLength": 2, "maxLength": 32 },
+        "translation_mode": { "enum": ["terminology", "plain"] },
         "preserve_source_voice": { "type": "boolean" },
         "forbid_visible_timestamps": { "type": "boolean" },
         "require_content_headings": { "type": "boolean" },

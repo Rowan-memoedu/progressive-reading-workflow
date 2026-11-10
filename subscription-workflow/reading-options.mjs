@@ -19,7 +19,7 @@ export function obsidianReadingLink(file,vault = null) {
   return 'obsidian://open?'+(vault ? 'vault='+encodeURIComponent(vault)+'&file=' : 'path=')+encoded+'&paneType=tab';
 }
 export function readingDestination(item) {
-  const categories={rss:'RSS',zhihu_column:'知乎专栏',zhihu_author:'知乎作者',bilibili_collection:'B站合集',bilibili_video:'B站多P视频'};
+  const categories={rss:'RSS',zhihu_column:'知乎专栏',zhihu_author:'知乎作者',bilibili_collection:'B站合集',bilibili_video:'B站多P视频',github_repository:'GitHub仓库'};
   const kind=item.subscription_kind || (categories[item.platform] ? item.platform : item.platform==='bilibili'
     ? item.video?.watch?.collection ? 'bilibili_collection' : 'bilibili_video' : item.platform==='zhihu' ? 'zhihu_column' : 'rss');
   let fallback='未命名订阅';try{fallback=new URL(item.feed_url || item.item_url || item.url).hostname;}catch{}

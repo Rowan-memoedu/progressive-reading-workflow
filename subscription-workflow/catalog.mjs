@@ -6,6 +6,7 @@ import { urlImportDedupeKey } from '../scripts/url-import-input.mjs';
 import { buildPreprocessRequest } from '../rss-source/core.mjs';
 import { meaningfulLength } from './content-length.mjs';
 import { includesPublication } from './history.mjs';
+import { readingOptions } from './reading-options.mjs';
 import { findSourcePublication, findSourcePublications } from '../scripts/reading-source-library.mjs';
 
 export const active = root => existsSync(paths(root).marker);
@@ -112,6 +113,7 @@ export async function canonicalCatalog(root, rssItems) {
         preservedSourceRevision: preserved.source_revision } : {}),
       canonicalKey: key, aliasIds: [...new Set([...versions.map(item => item.materialId), ...previous.map(item => item.material_id)])],
       subscriptionIds: ids, platform: latest.platform || 'rss',
+      readingOptions: readingOptions(config.subscriptions.find(source=>source.mode==='reports' && ids.includes(source.id))),
       subscriptionName: config.subscriptions.find(source=>ids.includes(source.id))?.name,
       subscriptionKind: config.subscriptions.find(source=>ids.includes(source.id))?.kind,
       destination: latest.destination || config.subscriptions.find(source => ids.includes(source.id))?.destination || 'RSS' });
