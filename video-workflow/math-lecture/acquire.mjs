@@ -5,10 +5,24 @@ import {createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {fileURLToPath} from 'node:url';
-import {discover,entryPublication} from '../watch-core.mjs';
-import {prepareWatchSource,WATCH_ARTIFACTS} from '../watch-process.mjs';
+import {discover,biliApi,entryPublication} from '../watch-core.mjs';
+import {acquireSource,prepareWatchSource,WATCH_ARTIFACTS} from '../watch-process.mjs';
+import {LiveCookieSnapshot,defaultCookieDataRoot} from '../../scripts/live-cookie-snapshot.mjs';
 const execute=promisify(execFile);
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+
+export function authenticatedApi({snapshot,fetchImpl=fetch}={}){
+  const workflowRoot=path.resolve(import.meta.dirname,'../..');
+  snapshot ??=new LiveCookieSnapshot({workflowRoot,dataRoot:defaultCookieDataRoot(workflowRoot)});
+  return endpoint=>biliApi(endpoint,{fetchImpl:async(url,options)=>{
+    if(new URL(url).origin!=='https://api.bilibili.com')throw Error('bilibili_api_origin_required');
+    snapshot.refresh({force:true});
+    if(!snapshot.health().loaded)throw Error('existing_bilibili_login_unavailable');
+    const cookie=snapshot.headerForUrl(url);
+    if(!cookie)throw Error('existing_bilibili_login_unavailable');
+    return fetchImpl(url,{...options,headers:{...options.headers,Cookie:cookie},redirect:'error'});
+  }});
+}
 
 export function parseParts(text){
   const result=[];
@@ -23,8 +37,9 @@ export function parseParts(text){
   return result.sort((a,b)=>a-b);
 }
 
-export async function acquire({url,parts,board,output,asrIfNeeded=false,discovery=discover,prepare=prepareWatchSource}){
-  const found=await discovery({url,collection:false});
+export async function acquire({url,parts,board,output,asrIfNeeded=false,discovery,prepare=prepareWatchSource,api}){
+  const requestApi=api||authenticatedApi();
+  const found=await (discovery||((watch)=>discover(watch,{api:requestApi})))({url,collection:false});
   const items=parts.map(part=>{
     const item=found.items.find(row=>row.part===part);
     if(!item)throw Error('requested_part_missing:'+part);
@@ -38,7 +53,8 @@ export async function acquire({url,parts,board,output,asrIfNeeded=false,discover
     item.publish_path=entryPublication(path.dirname(output),item); // Used for source title only.
     const cachedAudio=path.resolve(path.dirname(output),'audio-sources',item.bvid+'-cid'+item.cid,'audio','audio.json');
     const audioStarted=asrIfNeeded && await fs.stat(cachedAudio).then(()=>true,e=>{if(e.code==='ENOENT')return false;throw e;});
-    let result=audioStarted?{status:'waiting_source'}:await prepare(item,{public_packages:false},WATCH_ARTIFACTS);
+    let result=audioStarted?{status:'waiting_source'}:await prepare(item,{public_packages:false},WATCH_ARTIFACTS,
+      (sourceItem,watch,jobDir)=>acquireSource(sourceItem,watch,jobDir,{api:requestApi}));
     if(result.status==='waiting_source'){
       if(!asrIfNeeded)throw Error('source_waiting:'+item.part+':'+result.reason);
       const {prepareAudioSource}=await import('./asr-source.mjs');

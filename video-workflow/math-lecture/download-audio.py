@@ -43,7 +43,8 @@ def main():
                'logger': QuietLogger(), 'cookiefile': str(args.cookies_file),
                'outtmpl': str(args.output / 'audio.%(ext)s'), 'progress_hooks': [progress]}
     with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(job['url'], download=False)
+        part_url = f"https://www.bilibili.com/video/{job['bvid']}/?p={job['part']}"
+        info = ydl.extract_info(part_url, download=False)
         expected = {f"{job['bvid']}_p{job['part']}"}
         if job['part'] == 1 and job['parts'] == 1:
             expected.add(job['bvid'])

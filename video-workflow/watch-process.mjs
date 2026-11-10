@@ -25,7 +25,7 @@ export async function publicPackages(){
   }catch{throw Error('public_package_registry_unavailable');}
 }
 
-export async function acquireSource(item,watch,jobDir,{packages=publicPackages}={}){
+export async function acquireSource(item,watch,jobDir,{packages=publicPackages,api=biliApi}={}){
   const sourceDir=path.join(jobDir,'source');
   try{
     const metadata=await read(sourceDir+'/source.json');
@@ -50,7 +50,7 @@ export async function acquireSource(item,watch,jobDir,{packages=publicPackages}=
       return {sourceDir};
     }
   }
-  let view;try{view=await biliApi('x/web-interface/view?bvid='+item.bvid);}
+  let view;try{view=await api('x/web-interface/view?bvid='+item.bvid);}
   catch{return {status:'waiting_source',reason:'bilibili_metadata_temporarily_unavailable'};}
   const page=view.pages?.find(p=>p.cid===item.cid);
   if(!page)throw Error('subscribed_cid_removed');

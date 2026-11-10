@@ -3,12 +3,18 @@ import argparse,json,sys
 from pathlib import Path
 
 
+def exact_part_url(job):
+    # Some authenticated uploads hide the public pagelist. Without explicit p=1,
+    # yt-dlp then treats the first part as a single video and drops its part ID.
+    return f"https://www.bilibili.com/video/{job['bvid']}/?p={job['part']}"
+
+
 def exact_part_info(job,cookies_file,ydl_class):
     # Subtitle metadata is opt-in in yt-dlp even for download=False.
     with ydl_class({'quiet':True,'no_warnings':True,'skip_download':True,
         'writesubtitles':True,'writeautomaticsub':True,
         'noplaylist':True,'cookiefile':str(cookies_file)}) as ydl:
-        info=ydl.extract_info(job['url'],download=False)
+        info=ydl.extract_info(exact_part_url(job),download=False)
     expected={job['bvid']+'_p'+str(job['part'])}
     if job['part']==1 and job['parts']==1:expected.add(job['bvid'])
     if info.get('id') not in expected:raise ValueError('upstream_part_identity_mismatch')
@@ -36,7 +42,7 @@ def main():
     # directory per job; do not touch the pinned source or any shared temp files.
     scraper.__file__=str(out/'extractor-runtime/src/scraper.py')
     (out/'extractor-runtime/src').mkdir(parents=True,exist_ok=True)
-    segments=scraper.fetch_via_ytdlp(job['url'],cookies_file=str(args.cookies_file))
+    segments=scraper.fetch_via_ytdlp(exact_part_url(job),cookies_file=str(args.cookies_file))
     if not segments:raise ValueError('empty_platform_subtitles')
     duration=float(info.get('duration') or job['duration'] or 0)
     def seconds(text):
