@@ -106,16 +106,23 @@ export async function findSourcePublications(root, urls) {
   const identity=await sourceAliasResolver(root,ledger);
   const wanted = new Set(urls.filter(Boolean).map(identity));
   const found = new Map();
+  const aliasPriority=new Map();
   const sourceLocations = new Map();
   if (!wanted.size) return found;
   const retain = async (url, file, extra = {}) => {
     const key = identity(url), zone = libraryZone(root, file);
     const rank={'已归档原文':0,'待归档原文':1,'阅读区':2};
-    if (!wanted.has(key) || !zone || (found.has(key)&&rank[found.get(key).zone]<=rank[zone])) return;
+    if (!wanted.has(key) || !zone || (found.has(key)&&rank[found.get(key).zone]<rank[zone])) return;
     let data;
     try { data = await fs.readFile(file); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
     if (!data.length) return;
+    // A native reader move can precede receipt repair. Prefer the preserved
+    // alias-bearing publication over a later canonical-only duplicate even
+    // when the ledger still points at an obsolete path or the duplicate.
+    const priority=sourceUrls(data.toString('utf8').slice(0,16384)).some(source=>identity(source)===key&&urlImportDedupeKey(source)!==key)?1:0;
+    if(found.has(key)&&rank[found.get(key).zone]===rank[zone]&&(aliasPriority.get(key)||0)>=priority)return;
     found.set(key, { path: path.resolve(file), sha256: digest(data), zone,canonical_url:key, ...extra });
+    aliasPriority.set(key,priority);
   };
   // Weekly short articles already have a durable identity in the existing ledger.
   for (const item of Object.values(ledger?.items || {})) {

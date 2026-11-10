@@ -305,6 +305,29 @@ export class BrowserImportBroker {
     return changed;
   }
 
+  async recoverExitedSourceWorkers(previousOwnerPid, {before=this.now(),isAlive=pid=>{
+    try{process.kill(pid,0);return true;}catch(error){if(error.code==='ESRCH')return false;return true;}
+  }}={}) {
+    if(!Number.isSafeInteger(previousOwnerPid)||previousOwnerPid<=0||previousOwnerPid===process.pid||isAlive(previousOwnerPid))return {recovered:0};
+    return this.withLock(async()=>{
+      let recovered=0;
+      for(const task of this.state.tasks){
+        // Only frozen source captures / repository discovery are model-free.
+        // Ordinary model jobs keep their original lease and retry semantics.
+        if(task.status!=='claimed'||task.processingMode!=='original_text'||!/^local-background-url-fetcher-/u.test(task.workerId||'')
+          || !(task.articleSource?.run_id || task.siteImport?.settings?.repository || (task.siteImport && task.result?.collection?.inventory?.complete))
+          || !(Date.parse(task.claimedAt)<before))continue;
+        task.interruptedClaims=[...(task.interruptedClaims||[]),{previous_owner_pid:previousOwnerPid,claimed_at:task.claimedAt,recovered_at:nowIso(this.now)}].slice(-25);
+        task.status='queued';task.workerId=null;task.claimedAt=null;task.leaseToken=null;task.claimRequestId=null;
+        // A proven process interruption is recorded separately from failed work.
+        task.attempts=Math.max(0,Number(task.attempts||0)-1);
+        task.availableAt=nowIso(this.now);task.updatedAt=task.availableAt;recovered++;
+      }
+      if(recovered){await this.save();this.notifyWaiters();}
+      return {recovered};
+    });
+  }
+
   async claimTask(workerId, claimRequestId = null, { transport = null, requestId = null } = {}) {
     return this.withLock(async () => {
       const recovered = this.recoverExpiredClaims();

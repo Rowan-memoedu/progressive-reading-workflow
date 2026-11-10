@@ -3132,7 +3132,12 @@ async function listen(port) {
 async function start() {
   liveCookieSnapshot.refresh({ force: true });
   await migrateLegacyBrowserCompletedArtifacts();
+  const previousServer=await fs.readFile(path.join(importsRoot,'app-server.json'),'utf8').then(JSON.parse).catch(()=>null);
+  const restartCutoff=Date.now();
   await listen(defaultPort);
+  await browserImportBroker.initialize();
+  const recovery=await browserImportBroker.recoverExitedSourceWorkers(previousServer?.pid,{before:restartCutoff});
+  if(recovery.recovered)console.log(JSON.stringify({event:'source_workers_recovered_after_restart',...recovery}));
   await resumePendingBackgroundImports();
   startSubscriptionWorker(workflowRoot);
 }
