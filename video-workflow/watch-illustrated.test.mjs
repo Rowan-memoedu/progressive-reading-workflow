@@ -73,7 +73,7 @@ test('scheduler calls the shared illustrated entry with unchanged prompt and one
   assert.equal(receipt.status,'completed');assert.equal(calls,1);assert.equal(captures,1);assert.equal(process.env.AI_PRODUCER_CODEX_MODEL,before);
   const identity=JSON.parse(await fs.readFile(root+'/run/watch-pipeline.json','utf8'));
   assert.equal(identity.entry,'importIllustratedStrong');
-  assert.equal(identity.body_prompt_sha256,hash(await fs.readFile('D:/Projects/AudioWorkflow/prompts/refine-non-writing.md')));
+  assert.equal(identity.body_prompt_sha256,hash(await fs.readFile(new URL('../standard-preprocessing/prompts/强结构化整理.md',import.meta.url))));
 });
 test('a prebuilt book is never selected for illustrated automation and exact cid is mandatory',async()=>{
   const root=await makeRoot(),item={bvid:'BV1234567890',cid:42,url:'https://www.bilibili.com/video/BV1234567890/'};
@@ -100,4 +100,9 @@ test('old existing-media configuration and incomplete illustrated output cannot 
     model_route:{provider:'codex_exec',model:WATCH_MODEL},body_prompt_unchanged:true,counts:{images:0,mermaid:0}})}),/unexpected_video_watch_workflow/);
   const waiting=await processWatchItem(item,watch,{artifactRoot:root,acquire,command:async()=>{},runFlow:async()=>{throw Error('target_login_snapshot_unavailable');}});
   assert.equal(waiting.status,'waiting_source');
+});
+test('shared prompt parity tolerates Windows line endings but rejects changed rules',async()=>{
+  const {sameStrongPrompt}=await import('./watch-illustrated.mjs');
+  assert.equal(sameStrongPrompt('rule A\r\nrule B\r\n','rule A\nrule B\n'),true);
+  assert.equal(sameStrongPrompt('rule A\n','changed rule\n'),false);
 });
