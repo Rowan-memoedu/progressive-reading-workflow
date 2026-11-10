@@ -33,6 +33,14 @@ test('a completed RSS article wins over a later site copy and stale reading rece
   await writeJson(path.join(root,'imports/rss-reading/review-ledger.v1.json'),{items:{rss:{item_url:url,publication:{path:stale}}}});
   assert.equal((await findSourcePublication(root,url)).path,completed);
 });
+test('a moved alias publication wins over the canonical duplicate while receipts await repair',async t=>{
+  const root=await fixture(t),reader='https://resume.test/feed?id=1',page='https://resume.test/posts/first';
+  const duplicate=await article(root,'阅读区',page,'later-copy.md'),preserved=await article(root,'阅读区',reader,'category/preserved.md');
+  const request=path.join(root,'request.json');await writeJson(request,{source_metadata:{source_url:reader,original_url:page,original_source_ref:'item-page-original-markdown'}});
+  await writeJson(path.join(root,'imports/rss-reading/review-ledger.v1.json'),{items:{rss:{item_url:reader,preprocess_request_path:request,publication:{path:duplicate}}}});
+  assert.equal((await findSourcePublication(root,page)).path,preserved);
+  assert.equal((await findSourcePublication(root,reader)).path,preserved);
+});
 async function resultForAlias(reader,page){const value=await result(reader);value.source_metadata={...value.source_metadata,original_url:page,original_source_ref:'item-page-original-markdown'};return value;}
 async function fixture(t) {
   await fs.mkdir(base,{recursive:true});
@@ -113,12 +121,15 @@ test('short articles in weekly reports and their archives are reusable by URL im
 });
 test('concurrent processes share the publication lock and produce only one article',async t=>{
   const root=await fixture(t),url='https://race.test/post';
+  const reader='https://race.test/rss/read?id=1',request=path.join(root,'alias.json');
+  await writeJson(request,{source_metadata:{source_url:reader,original_url:url,original_source_ref:'item-page-original-markdown'}});
+  await writeJson(path.join(root,'imports/rss-reading/review-ledger.v1.json'),{items:{rss:{item_url:reader,preprocess_request_path:request}}});
   const deadPid=await new Promise((resolve,reject)=>{const child=spawn(process.execPath,['-e','process.exit(0)'],{windowsHide:true,stdio:'ignore'});child.on('error',reject);child.on('exit',()=>resolve(child.pid));});
   const lockRoot=path.join(root,'.local-ir','source-publication-locks');await fs.mkdir(lockRoot,{recursive:true});
   await fs.writeFile(path.join(lockRoot,createHash('sha256').update(url).digest('hex')+'.json'),JSON.stringify({pid:deadPid,token:'stale-owner'}));
   const moduleUrl=new URL('../scripts/reading-source-library.mjs',import.meta.url).href;
   const worker=path.join(root,'worker.mjs');
-  await fs.writeFile(worker,`import fs from 'node:fs/promises';import path from 'node:path';import {withSourcePublication,findSourcePublication} from ${JSON.stringify(moduleUrl)};const [root,name]=process.argv.slice(2);await withSourcePublication(root,${JSON.stringify(url)},async()=>{if(await findSourcePublication(root,${JSON.stringify(url)}))return;await new Promise(r=>setTimeout(r,80));await fs.writeFile(path.join(root,'阅读区',name+'.md'),${JSON.stringify('---\nsource_url: '+url+'\n---\n正文')});});`);
+  await fs.writeFile(worker,`import fs from 'node:fs/promises';import path from 'node:path';import {withSourcePublication,findSourcePublication} from ${JSON.stringify(moduleUrl)};const [root,name]=process.argv.slice(2),url=name==='rss'?${JSON.stringify(reader)}:${JSON.stringify(url)};await withSourcePublication(root,url,async()=>{if(await findSourcePublication(root,url))return;await new Promise(r=>setTimeout(r,80));await fs.writeFile(path.join(root,'阅读区',name+'.md'),${JSON.stringify('---\nsource_url: ')}+url+${JSON.stringify('\n---\n正文')});});`);
   const launch=name=>new Promise((resolve,reject)=>{const child=spawn(process.execPath,[worker,root,name],{windowsHide:true,stdio:['ignore','ignore','pipe']});let error='';child.stderr.on('data',v=>error+=v);child.on('error',reject);child.on('exit',code=>code===0?resolve():reject(new Error(error)));});
   await Promise.all([launch('site'),launch('rss')]);
   assert.equal((await fs.readdir(path.join(root,'阅读区'))).filter(x=>x.endsWith('.md')).length,1);

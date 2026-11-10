@@ -1,10 +1,12 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from 'node:util';
 import { randomUUID } from "node:crypto";
 import { dataPath } from './runtime-paths.mjs';
 import { ChromeCookieJar, parseChromeCookieSnapshot, CHROME_COOKIE_JAR_MAX_SYNC_BYTES } from "./chrome-cookie-jar.mjs";
+const execute=promisify(execFile);
 
 export const COOKIE_SYNC_EXTENSION_ID = "kkhdelnhoaagpbmgicmdljmplodkioop";
 export const COOKIE_SNAPSHOT_ENDPOINT = "/api/browser-import/cookies/snapshot";
@@ -123,11 +125,11 @@ export class LiveCookieSnapshot {
   async protectDirectory() {
     await fsp.mkdir(this.dataRoot, { recursive: true, mode: 0o700 });
     if (process.platform === "win32") {
-      const identity = execFileSync("whoami.exe", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8", windowsHide: true });
+      const {stdout:identity} = await execute("whoami.exe", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8", windowsHide: true, timeout:15000 });
       const sid = identity.match(/S-1-5-\d+(?:-\d+)+/u)?.[0];
       if (!sid) throw new Error("cookie_sync_storage_acl_failed");
       try {
-        execFileSync("icacls.exe", [this.dataRoot, "/inheritance:r", "/grant:r", `*${sid}:(OI)(CI)F`, "*S-1-5-18:(OI)(CI)F"], { stdio: "pipe", windowsHide: true });
+        await execute("icacls.exe", [this.dataRoot, "/inheritance:r", "/grant:r", `*${sid}:(OI)(CI)F`, "*S-1-5-18:(OI)(CI)F"], { windowsHide: true, timeout:15000 });
       } catch { throw new Error("cookie_sync_storage_acl_failed"); }
     }
   }

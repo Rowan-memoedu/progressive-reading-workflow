@@ -44,14 +44,17 @@ export async function capturedArticle(root,articleSource,url) {
   return captured;
 }
 
-export async function verifySiteCollection(root,settings,collection,runId,{broker}={}) {
+export async function verifySiteCollection(root,settings,collection,runId,{broker,onProgress=async()=>{}}={}) {
   const expected=collection.inventory.articles;
+  await onProgress('核对已有正文与来源别名');
   // A user may complete/archive or edit an article while discovery is running.
   // Refresh physical locations before planning moves; frozen receipts are not
   // authority to resurrect or overwrite a newer reading state.
   const live=await findSourcePublications(root,expected.map(article=>article.url));
   collection.results=collection.results.map(row=>{const current=live.get(urlImportDedupeKey(row.requested_url)),artifact=row.artifacts?.find(a=>a.kind==='markdown');return current&&(artifact?.path!==current.path||artifact.sha256!==current.sha256)?sourceReuseResult(row.requested_url,current):row;});
-  const organization=expected.every(article=>collection.results.some(row=>row.requested_url===article.url&&SUCCESS.has(row.status)))?await organizeSiteFiles(root,settings,collection,runId,{broker}):{};
+  await onProgress('来源核对完成，整理原站目录');
+  const organization=expected.every(article=>collection.results.some(row=>row.requested_url===article.url&&SUCCESS.has(row.status)))?await organizeSiteFiles(root,settings,collection,runId,{broker,onProgress}):{};
+  await onProgress('回读正式正文与目录链接');
   const rows=new Map(collection.results.map(row=>[row.requested_url,row]));
   const records=[];
   for(const article of expected){
@@ -103,5 +106,5 @@ export async function processSiteTask(root,task,{broker,runRequest,planner,fetch
       initial.results=inventory.articles.filter(article=>existing.has(urlImportDedupeKey(article.url))).map(article=>sourceReuseResult(article.url,existing.get(urlImportDedupeKey(article.url))));
       return inventory;
     },
-    verify:collection=>verifySiteCollection(root,settings,collection,id,{broker})});
+    verify:collection=>verifySiteCollection(root,settings,collection,id,{broker,onProgress:async stage=>{run.stage=stage;run.updated_at=now();await saveRun(root,run);}})});
 }
