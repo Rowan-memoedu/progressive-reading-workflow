@@ -33,6 +33,15 @@ test('reference repair updates both publication and document-state body hashes',
   assert.equal(result.artifacts[0].sha256,hash);assert.equal(result.receipt.final_markdown_sha256,hash);assert.equal(result.content.markdownSha256,hash);
 });
 
+test('generated index ownership survives checked relocation and still protects handwritten edits',async()=>{
+  const root=await fs.mkdtemp('D:/Artifacts/ProgressiveReading/index-owner-'),settings={id:'owned',name:'Independent',url:'https://index-owner.test',destination:'整站/Independent'},id=runId('owned'),file=path.join(root,'阅读区',settings.destination,'目录.md'),url='https://index-owner.test/post';
+  await fs.mkdir(path.dirname(file),{recursive:true});const relocated='# Old generated index after relocation\n';await fs.writeFile(file,relocated);
+  await saveRun(root,{id,source_id:settings.id,created_at:'2026-01-01',results:[]});await writeJson(path.join(runPath(root,id),'index.json'),{path:file,sha256:digest('before relocation')});await writeJson(path.join(runPath(root,id),'organization.json'),{status:'completed',owned_index_hashes:[[file,digest(relocated)]]});
+  const inventory={articles:[{url,title:'First',taxonomy:articleTaxonomy({tags:['Topic']})}]},records=[{url,path:path.join(path.dirname(file),'标签/Topic/first.md')}];
+  const written=await writeSiteIndexes(root,settings,inventory,records,runId('owned-next'));assert.equal(written.index,file);assert.match(await fs.readFile(file,'utf8'),/## 标签/u);
+  await fs.appendFile(file,'\nHandwritten note\n');const before=await fs.readFile(file,'utf8'),next=await writeSiteIndexes(root,settings,{articles:[]},[],runId('owned-edited'));assert.notEqual(next.index,file);assert.equal(await fs.readFile(file,'utf8'),before);
+});
+
 test('Windows source tags with different casing do not move a file onto itself',{skip:process.platform!=='win32'},async()=>{
   const env=process.env.NODE_ENV;process.env.NODE_ENV='test';
   const root=await fs.mkdtemp('D:/Artifacts/ProgressiveReading/layout-case-');
