@@ -255,6 +255,8 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'named_color'):
             validate_body('- 关系\n\n  ```mermaid\n  A --> B\n  linkStyle 0 stroke:#a855f7;\n  ```\n',set())
         validate_body('- 关系\n\n  ```mermaid\n  A --> B\n  linkStyle 0 stroke:purple;\n  ```\n',set())
+        with self.assertRaisesRegex(ValueError,'frontmatter_not_supported'):
+            validate_body('- 关系\n\n  ```mermaid\n    ---\n    config: {}\n    ---\n    xychart-beta\n  ```\n',set())
 
     def test_numeric_reconstruction_is_source_bound_visible_and_not_a_flowchart_substitute(self):
         root=Path(self.temp.name)

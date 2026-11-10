@@ -342,6 +342,8 @@ def validate_body(body, allowed_links, require_mermaid=False):
     if require_mermaid and not re.search(r"^\s*(?:-\s+)?```mermaid\s*$", body, re.M):
         raise ValueError("source_diagram_relation_not_preserved")
     for diagram in re.findall(r"```mermaid\s*\n(.*?)```", body, re.S):
+        if diagram.lstrip().startswith("---"):
+            raise ValueError("mermaid_frontmatter_not_supported_in_nested_lecture")
         if re.search(r"^\s*linkStyle[^\n]*#[0-9A-Fa-f]{3,8}", diagram, re.M):
             raise ValueError("mermaid_link_style_requires_named_color")
         for label in re.findall(r'"([^"\n]*)"', diagram):
