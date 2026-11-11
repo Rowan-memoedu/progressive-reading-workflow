@@ -12,6 +12,20 @@ B 站元数据、分 P 列表和字幕默认使用现有用户登录快照；登
 
 原先可直接保留的图若仍有含参坐标或对称轴公式，也可以在同一注册入口提供干净重建图。该单元只允许引用新图，旧图继续作为审核来源；必要位置改用点名，参数表达式在正文用 LaTeX 定义。
 
+## 文字与配图分开生产
+
+新讲义第一次运行时加 `--defer-diagrams`。文字和独立审核仍以字幕、板书及实图为依据，原本需要配图的位置先写 `<!-- lecture-figure:图位ID -->`。公式、条件、推导和理由留在正文。模式记录在运行目录中，续跑沿用这一设置。
+
+```powershell
+python video-workflow/math-lecture/pipeline.py run --output '<运行目录>' --defer-diagrams --workers 2
+python video-workflow/math-lecture/illustrate.py prepare --run '<运行目录>' --output '<配图交付目录>'
+python video-workflow/math-lecture/illustrate.py run --run '<运行目录>' --output '<配图交付目录>' --workers 2
+```
+
+`prepare` 从已审核单元合成带图位的文字稿。`run` 回填原图位，并通读正文找出有教学作用的补图位置。数轴、曲线和几何构形由 `MathTopicPipeline/diagrams` 参数化绘制。条件、分类与证明路线用 Mermaid。图旁保留完整 LaTeX，图内只使用必要标签。长 P 在配图命令使用 `--split-chapters`，此前分章的讲义沿用原分章。
+
+已经验收的讲义可直接使用 `illustrate.py`。它从已审核正文提取原图位，复用已核验的重绘图，并在独立目录交付带图 Markdown、图片附件与 HTML 预览。原有 Mermaid 继续保留。各单元分别记录图的计划和产物，失败时只重新规划受影响单元。交付前逐单元确认去掉新增图后仍是同一正文，并用现有阅读渲染器检查全部章节。旧 `assemble` 和 `verify` 命令继续服务原流程。
+
 ## 输入准备
 
 ```powershell

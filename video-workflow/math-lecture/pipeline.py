@@ -22,6 +22,7 @@ import time
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 POLICY = "mathematical-lecture/nested-lossless-v1"
+DIAGRAM_MARKER = re.compile(r"^(?P<prefix> *(?:- )?)<!-- lecture-figure:(?P<id>[a-z][a-z0-9-]*) -->$", re.M)
 
 
 def encode(value):
@@ -409,6 +410,17 @@ def requires_mermaid(payload):
     return any(i.get("diagram_required") and not i.get("reconstructed_diagram") for i in payload["mixed_images"])
 
 
+def validate_unit_body(body, payload):
+    if "diagram_slots" not in payload:
+        return validate_body(body, {i["link"] for i in payload["allowed_images"]}, requires_mermaid(payload))
+    markers = [match["id"] for match in DIAGRAM_MARKER.finditer(body)]
+    if sorted(markers) != sorted(i["id"] for i in payload["diagram_slots"]):
+        raise ValueError("diagram_markers_must_match_assigned_slots_once")
+    if re.search(r"^\s*(?:-\s+)?```mermaid\s*$", body, re.M):
+        raise ValueError("diagram_rendering_is_deferred")
+    return validate_body(body, set())
+
+
 def catalog_only_change(previous, saved_source, payload, visual):
     if saved_source.get("fingerprint") != previous["source_fingerprint"]:
         return False
@@ -421,7 +433,7 @@ def catalog_only_change(previous, saved_source, payload, visual):
 
 
 class Engine:
-    def __init__(self, output, client=None, model=None, syntax_checker=validate_math_syntax):
+    def __init__(self, output, client=None, model=None, syntax_checker=validate_math_syntax, defer_diagrams=False):
         self.root = Path(output).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         if client is None:
@@ -432,6 +444,7 @@ class Engine:
             client = module.BatchClient(model=model)
         self.client = client
         self.syntax_checker = syntax_checker
+        self.defer_diagrams = defer_diagrams
         self.calls = 0
         self.count_lock = threading.Lock()
 
@@ -708,6 +721,9 @@ class Engine:
                    "course_units": [{k: u[k] for k in ("id", "chapter", "title")} for u in plan["units"]],
                    "unit": unit, "transcript": part["cues"][unit["start"]:unit["end"] + 1],
                    "board_blocks": blocks, "allowed_images": allowed, "mixed_images": mixed}
+        if self.defer_diagrams:
+            payload["diagram_slots"] = allowed + [i for i in mixed if i.get("diagram_required")
+                                                  and not i.get("reconstructed_diagram")]
         visual = [i for i in material["pages"] if i["page"] in pages] + owned_images + reconstructed
         context_file = self.root / "unit-context.json"
         if context_file.exists():
@@ -779,8 +795,7 @@ class Engine:
                     raise ValueError("accepted_body_modified: " + unit["id"])
                 structure_issues = []
                 try:
-                    validate_body(body, {i["link"] for i in payload["allowed_images"]},
-                                  requires_mermaid(payload))
+                    validate_unit_body(body, payload)
                 except ValueError as error:
                     structure_issues = [{"kind": "structure", "description": str(error)}]
                 review = read_json(previous["review_file"])
@@ -850,8 +865,7 @@ class Engine:
             save(body_file, body, frozen=True)
             review = {"issues": []}
             try:
-                validate_body(body, {i["link"] for i in payload["allowed_images"]},
-                              requires_mermaid(payload))
+                validate_unit_body(body, payload)
                 syntax_issues = self.syntax_checker(body)
                 if syntax_issues:
                     review = {"issues": syntax_issues}
@@ -917,6 +931,8 @@ class Engine:
         return receipt
 
     def assemble(self, material, plan, media, *, split_chapters=False):
+        if self.defer_diagrams:
+            raise ValueError("marked_text_ready_use_illustrate_py")
         accepted, bodies, assets = {}, {}, {}
         for unit in plan["units"]:
             state_file = self.root / "units" / unit["id"] / "state.json"
@@ -1089,6 +1105,7 @@ def main():
     parser.add_argument("--recheck-math", action="store_true", help="Review accepted mathematics with the current reviewer; preserve the body when it passes")
     parser.add_argument("--refresh", action="store_true", help="Reopen explicitly selected units after a general prompt repair")
     parser.add_argument("--split-chapters", action="store_true", help="Deliver long parts as complete chapter files, preserving unit boundaries")
+    parser.add_argument("--defer-diagrams", action="store_true", help="Write diagram markers for the separate illustration pass")
     args = parser.parse_args()
     if args.refresh and not args.units:
         parser.error("--refresh requires --units; entire-lecture regeneration is not implicit")
@@ -1120,7 +1137,14 @@ def main():
         if args.command == "verify":
             print(json.dumps(verify_delivery(args.output), ensure_ascii=False, indent=2))
             return 0
-        engine = Engine(args.output, model=args.model)
+        diagram_mode = args.output / "diagram-mode.json"
+        if args.command == "run" and args.defer_diagrams and not diagram_mode.exists():
+            existing = list((args.output / "units").glob("*/accepted.json"))
+            if any("diagram_slots" not in read_json(p.parent / "source.json")["payload"] for p in existing):
+                raise ValueError("use_illustrate_py_for_already_accepted_lectures")
+            save(diagram_mode, {"defer_diagrams": True}, frozen=True)
+        deferred = diagram_mode.exists() and read_json(diagram_mode)["defer_diagrams"]
+        engine = Engine(args.output, model=args.model, defer_diagrams=deferred or args.defer_diagrams)
         plan = engine.plan(material)
         if args.command == "plan":
             print(json.dumps(plan, ensure_ascii=False, indent=2))
