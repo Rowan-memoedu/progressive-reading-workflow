@@ -2,10 +2,10 @@
 
 标准预处理的显式强结构化、视频完整字幕、视频后台图文、数理讲义的大纲阶段，以及百度本地视频接入，直接使用共享非写作规则，不经过写作分类。
 
-规则源为 AsyncWorkflow 的 `refine-common.md` 和 `refine-non-writing.md`；按顺序组合，保留在 AudioWorkflow 的 `prompts/refine-non-writing.md` 和本项目 `standard-preprocessing/prompts/强结构化整理.md`。AudioWorkflow 的 `prompt_alignment.py` 检查组合与两处副本一致。运行时仍使用独立项目内的产品提示词，不依赖后台录音的决策模块。
+规则源为 AudioWorkflow 原有的 `prompts/refine.md`，渐进阅读副本位于 `standard-preprocessing/prompts/强结构化整理.md`。后台视频入口校验两份内容一致，跨平台换行差异不影响校验。正文直接使用本项目内的提示词。
 
-批量录音精修与旧视频 `refine-once.py` 读取 AudioWorkflow 的新文件；标准预处理、图文与数理讲义读取渐进阅读的副本。百度本地视频通过原 VideoBook/渐进阅读入口继承，不复制另一份提示词。普通书面化、导读、媒体规划和数学专用讲义规则保持各自职责。
+批量录音精修与视频 `refine-once.py` 读取 AudioWorkflow 原提示词。标准预处理、图文与数理讲义读取渐进阅读副本。百度本地视频通过 VideoBook 入口继承此规则。
 
-讲解内容保留中间推导、不同方法、例子和有教学意义的重复解释；清理无信息口癖与机械重复，保留改变含义的程度、频率、否定和限定。现有图片、Mermaid、LaTeX、代码与引用保护协议优先适用，数学来源冲突不得靠合理补全消除。
+原规则清理口癖、合并重复并按主题重组层级。图片、Mermaid、LaTeX、代码与引用适用原文保护协议。数学来源冲突保留待核对的证据。
 
 新请求的提示词哈希进入现有缓存身份；旧冻结 prompt、模型回执和成功产物保留，不重放发布。既有冻结运行若与新提示词冲突，应保留原运行并报告身份冲突，不覆盖它来伪造续跑。

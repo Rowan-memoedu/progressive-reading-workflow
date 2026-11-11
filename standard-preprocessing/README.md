@@ -12,7 +12,7 @@ VideoBook图文模式已统一接入此路由，并额外要求Codex Exec：媒�
 
 DeepSeek 继续使用 `AI_PRODUCER_BASE_URL`、`AI_PRODUCER_MODEL` 和专用 `DEEPSEEK_READING_API_KEY`。Codex 默认固定使用 `gpt-6-luna`，可单独设置 `AI_PRODUCER_CODEX_MODEL` 覆盖；已有 DeepSeek 模型名不会传给 Codex。`AI_PRODUCER_CODEX_BIN` 可指定 codex.exe。Codex 运行在 D 盘临时目录，以只读模式接收 stdin，并从最终消息文件读取结果。原始模型响应缓存按后端与模型隔离；已完成材料的幂等结果保留，不自动重做旧导入。`pr-preprocess --json doctor` 可核对当前后端及登录状态。CLI 也支持 `--provider deepseek` 或 `--provider codex_exec`，仅覆盖本次调用，例如 `pr-preprocess --provider deepseek --json doctor`。
 
-全文调用另使用 `prompts/source-preservation-protocol-v1.md` 说明原文保护标记的保留规则，并冻结协议、实际调用提示词及各自哈希。“强结构化整理”现对齐共享非写作提示词，直接进入整理，不调用写作判断；图片、公式、代码的保留协议继续优先适用。缓存身份包含提示词和协议哈希，既有失败响应不自动重发。缺失或重复原文片段仍停止发布；该约束同时用于普通书面化和强结构化。
+全文调用另使用 `prompts/source-preservation-protocol-v1.md` 保护原文片段，并冻结协议、实际调用提示词及各自哈希。强结构化直接使用 AudioWorkflow 的原规则。图片、公式和代码的原文保护协议优先适用。缓存身份包含提示词和协议哈希。缺失或重复原文片段仍停止发布，此约束同时用于普通书面化和强结构化。
 
 视频配套图文：普通书面化与强结构化整理都将输入已有的 Mermaid、LaTeX、代码与图片嵌入作为保护片段原样保留。只有字幕文字、而图表位于配套 `book.md` 的材料，须先走 [VideoBook 图文保留补丁](../video-workflow/README.md#配套-bookmd-的图文保留补丁)，把原生图块与正文图片嵌入带入同一输入。视频发布采用 `<标题>/<标题>.md` 与同级 `images/`，图片使用 `![说明](images/文件.png)`；其他文件按需用附件链接，未用文件只保留。该步骤不改提示词、不增加模型调用，也不生成文末附件列表。下文一般资料的发布目录规则不覆盖这一视频目录约定。
 
