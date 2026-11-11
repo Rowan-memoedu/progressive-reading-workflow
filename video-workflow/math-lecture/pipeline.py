@@ -22,6 +22,7 @@ import time
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 POLICY = "mathematical-lecture/nested-lossless-v1"
+DIAGRAM_MARKER = re.compile(r"^(?P<prefix> *(?:- )?)<!-- lecture-figure:(?P<id>[a-z][a-z0-9-]*) -->$", re.M)
 
 
 def encode(value):
@@ -114,6 +115,58 @@ def parse_selection(text, *, minimum=0):
     return values
 
 
+def board_fragment_map(plan, material):
+    """Split mixed OCR text at unique source quotes, never model-counted offsets."""
+    units = {u["id"] for u in plan["units"]}
+    original = {b["index"]: b for b in material["board_blocks"]}
+    result = {}
+    for row in plan.get("board_splits", []):
+        index = row.get("index")
+        if index not in original or index in result:
+            raise ValueError("board_split_index_invalid")
+        block = original[index]
+        text = block.get("text", "")
+        pieces = row.get("pieces", [])
+        if block.get("type") == "image" or block.get("img_path") or not isinstance(text, str) or not text or len(pieces) < 2:
+            raise ValueError(f"board_split_requires_mixed_text: {index} ({block.get('type')})")
+        starts = []
+        for n, piece in enumerate(pieces):
+            if piece.get("unit") not in units:
+                raise ValueError("board_split_unknown_unit")
+            quote = piece.get("at")
+            if n == 0:
+                if quote is not None:
+                    raise ValueError("board_split_must_start_at_origin")
+                starts.append(0)
+            elif not isinstance(quote, str) or not quote or text.count(quote) != 1:
+                raise ValueError("board_split_quote_not_unique")
+            else:
+                starts.append(text.index(quote))
+        if starts != sorted(set(starts)) or starts[-1] >= len(text):
+            raise ValueError("board_split_order_invalid")
+        owners = {p["unit"] for p in pieces}
+        owner = next(u["id"] for u in plan["units"] if index in span_indices(u["board_ranges"]))
+        if owner not in owners:
+            raise ValueError("board_split_owner_mismatch")
+        result[index] = [{"unit": piece["unit"], "block": {**block,
+                          "text": text[start:starts[n + 1] if n + 1 < len(starts) else len(text)],
+                          "source_text_range": [start, starts[n + 1] if n + 1 < len(starts) else len(text)]}}
+                         for n, (piece, start) in enumerate(zip(pieces, starts))]
+    return result
+
+
+def source_board_blocks(plan, material, unit):
+    indices = set(span_indices(unit["board_ranges"]))
+    splits = board_fragment_map(plan, material)
+    blocks = []
+    for block in material["board_blocks"]:
+        if block["index"] in splits:
+            blocks.extend(p["block"] for p in splits[block["index"]] if p["unit"] == unit["id"])
+        elif block["index"] in indices:
+            blocks.append(block)
+    return blocks
+
+
 def validate_plan(plan, material):
     if not isinstance(plan.get("title"), str) or not plan["title"].strip():
         raise ValueError("plan_title_required")
@@ -144,6 +197,7 @@ def validate_plan(plan, material):
     compressed = [v for i, v in enumerate(used) if i == 0 or used[i - 1] != v]
     if compressed != chapter_ids:
         raise ValueError("chapter_order_or_contiguity_invalid")
+    board_fragment_map(plan, material)
     return plan
 
 
@@ -186,7 +240,8 @@ def apply_boundary_patch(plan, proposal, material, selected):
             or {r.get("id") for r in rows} != selected):
         raise ValueError("boundary_repair_scope_invalid")
     patches = {r["id"]: r for r in rows}
-    if any(set(r) != {"id", "start", "board_ranges"} for r in rows):
+    if any(not {"id", "start", "board_ranges"}.issubset(r) or set(r) - {"id", "start", "board_ranges", "title"}
+           or ("title" in r and (not isinstance(r["title"], str) or not r["title"].strip())) for r in rows):
         raise ValueError("boundary_repair_may_only_change_source_ranges")
     candidate = json.loads(json.dumps(plan))
     for unit in candidate["units"]:
@@ -287,6 +342,14 @@ def validate_body(body, allowed_links, require_mermaid=False):
         raise ValueError("required_source_diagram_missing")
     if require_mermaid and not re.search(r"^\s*(?:-\s+)?```mermaid\s*$", body, re.M):
         raise ValueError("source_diagram_relation_not_preserved")
+    for diagram in re.findall(r"```mermaid\s*\n(.*?)```", body, re.S):
+        if diagram.lstrip().startswith("---"):
+            raise ValueError("mermaid_frontmatter_not_supported_in_nested_lecture")
+        if re.search(r"^\s*linkStyle[^\n]*#[0-9A-Fa-f]{3,8}", diagram, re.M):
+            raise ValueError("mermaid_link_style_requires_named_color")
+        for label in re.findall(r'"([^"\n]*)"', diagram):
+            if "$" not in label and re.search(r"[A-Za-z0-9]\s*[=≠<>≤≥∈]", label):
+                raise ValueError("diagram_formula_requires_latex_or_adjacent_body")
     fence = None
     for line in body.splitlines():
         match = re.match(r"^\s*(?:-\s+)?(`{3,}|~{3,})(.*)$", line)
@@ -300,8 +363,77 @@ def validate_body(body, allowed_links, require_mermaid=False):
     return body.strip() + "\n"
 
 
+def math_expressions(body):
+    text = re.sub(r"(?ms)^\s*(?:-\s+)?(`{3,}|~{3,})[^\n]*\n.*?^\s*\1\s*$", "", body)
+    rows = []
+    def display(match):
+        rows.append({"tex": match[1], "display": True})
+        return ""
+    text = re.sub(r"\$\$([\s\S]+?)\$\$", display, text)
+    rows += [{"tex": m[1], "display": False}
+             for m in re.finditer(r"(?<!\\)\$(?!\$)([^\n$]+?)(?<!\\)\$", text)]
+    return rows
+
+
+def validate_math_syntax(body):
+    expressions = math_expressions(body)
+    if not expressions:
+        return []
+    library = os.environ.get("PR_KATEX_LIBRARY", "D:/Caches/ProgressiveReading/render-assets/katex-0.16.11.min.js")
+    if not Path(library).is_file():
+        raise RuntimeError("math_syntax_runtime_unavailable: configure PR_KATEX_LIBRARY")
+    result = subprocess.run([os.environ.get("PR_READING_NODE", "node"), str(HERE / "validate-math.mjs"), library],
+        input=json.dumps(expressions, ensure_ascii=False), text=True, encoding="utf-8", capture_output=True,
+        timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if result.returncode:
+        raise RuntimeError("math_syntax_validation_failed")
+    return json.loads(result.stdout)
+
+
+def compose_lecture(plan, bodies):
+    lines = ["# " + plan["title"], ""]
+    for chapter in plan["chapters"]:
+        promote = len(plan["chapters"]) == 1 and chapter["title"].strip() == plan["title"].strip()
+        if not promote:
+            lines += ["- " + chapter["title"]]
+        units = [u for u in plan["units"] if u["chapter"] == chapter["id"]]
+        for unit in units:
+            indent = (2 if len(units) == 1 else 4) - (2 if promote else 0)
+            if len(units) > 1:
+                lines += [(" " * (indent - 2)) + "- " + unit["title"]]
+            lines += [(" " * indent + line) if line else "" for line in bodies[unit["id"]].splitlines()]
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def requires_mermaid(payload):
+    return any(i.get("diagram_required") and not i.get("reconstructed_diagram") for i in payload["mixed_images"])
+
+
+def validate_unit_body(body, payload):
+    if "diagram_slots" not in payload:
+        return validate_body(body, {i["link"] for i in payload["allowed_images"]}, requires_mermaid(payload))
+    markers = [match["id"] for match in DIAGRAM_MARKER.finditer(body)]
+    if sorted(markers) != sorted(i["id"] for i in payload["diagram_slots"]):
+        raise ValueError("diagram_markers_must_match_assigned_slots_once")
+    if re.search(r"^\s*(?:-\s+)?```mermaid\s*$", body, re.M):
+        raise ValueError("diagram_rendering_is_deferred")
+    return validate_body(body, set())
+
+
+def catalog_only_change(previous, saved_source, payload, visual):
+    if saved_source.get("fingerprint") != previous["source_fingerprint"]:
+        return False
+    old = {"payload": saved_source["payload"], "visual": saved_source["images"], "policy": POLICY}
+    if digest(old) != previous["source_fingerprint"]:
+        return False
+    def own_source(p, images):
+        return {"payload": {k: v for k, v in p.items() if k != "course_units"}, "visual": images, "policy": POLICY}
+    return digest(own_source(saved_source["payload"], saved_source["images"])) == digest(own_source(payload, visual))
+
+
 class Engine:
-    def __init__(self, output, client=None, model=None):
+    def __init__(self, output, client=None, model=None, syntax_checker=validate_math_syntax, defer_diagrams=False):
         self.root = Path(output).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         if client is None:
@@ -311,6 +443,8 @@ class Engine:
             spec.loader.exec_module(module)
             client = module.BatchClient(model=model)
         self.client = client
+        self.syntax_checker = syntax_checker
+        self.defer_diagrams = defer_diagrams
         self.calls = 0
         self.count_lock = threading.Lock()
 
@@ -375,26 +509,41 @@ class Engine:
             return validate_plan(saved["plan"], material)
         text, receipt = self.call("plan", {"transcripts": material["transcripts"], "board_blocks": material["board_blocks"]})
         plan = compile_plan(parse_json(text), material)
-        if material["board_blocks"]:
-            # Source binding is its own stage, so a binding repair does not redo the
-            # transcript segmentation or any subsequently accepted authoring unit.
-            align_text, alignment_receipt = self.call("align", {
-                "units": [{k: v for k, v in u.items() if k != "board_ranges"} for u in plan["units"]],
-                "transcripts": material["transcripts"], "board_blocks": material["board_blocks"]})
-            plan = compile_plan({**plan, **parse_json(align_text)}, material)
-        else:
+        findings = None
+        review_file = self.root / "plan-review.json"
+        if review_file.exists() and read_json(review_file)["review"].get("verdict") == "fail":
+            findings = read_json(review_file)["review"].get("issues", [])
+        for revision in range(3):
             alignment_receipt = None
-        source_units = []
-        for unit in plan["units"]:
-            transcript = next(t for t in material["transcripts"] if t["part"] == unit["part"])
-            indices = set(span_indices(unit["board_ranges"]))
-            source_units.append({"unit": unit, "transcript": transcript["cues"][unit["start"]:unit["end"] + 1],
-                "board_blocks": [b for b in material["board_blocks"] if b["index"] in indices]})
-        review_text, review_receipt = self.call("plan-review", {"plan": plan, "source_units": source_units})
-        review = parse_json(review_text)
-        save(self.root / "plan-review.json", {"review": review, "receipt": review_receipt})
-        if review.get("verdict") != "pass" or review.get("issues") != []:
-            raise ValueError("plan_semantic_review_failed: " + json.dumps(review.get("issues", []), ensure_ascii=False))
+            if material["board_blocks"]:
+                payload = {"units": [{k: v for k, v in u.items() if k != "board_ranges"} for u in plan["units"]],
+                           "transcripts": material["transcripts"], "board_blocks": material["board_blocks"]}
+                if findings is not None:
+                    payload["review_findings"] = findings
+                align_text, alignment_receipt = self.call("align", payload)
+                try:
+                    candidate = compile_plan({**plan, "board_splits": [], **parse_json(align_text)}, material)
+                except ValueError as error:
+                    findings = [{"kind": "alignment_format", "description": str(error)}]
+                    save(self.root / "alignment-errors" / (alignment_receipt["request_key"] + ".json"),
+                         {"issues": findings, "receipt": alignment_receipt}, frozen=True)
+                    if revision == 2:
+                        raise
+                    continue
+                plan = candidate
+            source_units = []
+            for unit in plan["units"]:
+                transcript = next(t for t in material["transcripts"] if t["part"] == unit["part"])
+                source_units.append({"unit": unit, "transcript": transcript["cues"][unit["start"]:unit["end"] + 1],
+                    "board_blocks": source_board_blocks(plan, material, unit)})
+            review_text, review_receipt = self.call("plan-review", {"plan": plan, "source_units": source_units})
+            review = parse_json(review_text)
+            save(review_file, {"review": review, "receipt": review_receipt})
+            if review.get("verdict") == "pass" and review.get("issues") == []:
+                break
+            if not material["board_blocks"] or revision == 2:
+                raise ValueError("plan_semantic_review_failed: " + json.dumps(review.get("issues", []), ensure_ascii=False))
+            findings = review.get("issues", [])
         save(file, {"plan": plan, "source_fingerprint": fingerprint, "receipt": receipt,
                     "alignment_receipt": alignment_receipt, "review_receipt": review_receipt}, frozen=True)
         return plan
@@ -414,7 +563,7 @@ class Engine:
         for unit in units:
             cue_indices.setdefault(unit["part"], set()).update(range(unit["start"], unit["end"] + 1))
             board_indices.update(span_indices(unit["board_ranges"]))
-        payload = {"units": units, "review_findings": findings,
+        payload = {"units": units, "chapters": plan["chapters"], "review_findings": findings,
                    "transcripts": [{"part": p["part"], "cues": [c for n, c in enumerate(p["cues"])
                                     if n in cue_indices[p["part"]]]}
                                    for p in material["transcripts"] if p["part"] in cue_indices],
@@ -426,9 +575,8 @@ class Engine:
             if unit["id"] not in selected:
                 continue
             part = next(p for p in material["transcripts"] if p["part"] == unit["part"])
-            indices = set(span_indices(unit["board_ranges"]))
             source_units.append({"unit": unit, "transcript": part["cues"][unit["start"]:unit["end"] + 1],
-                "board_blocks": [b for b in material["board_blocks"] if b["index"] in indices]})
+                "board_blocks": source_board_blocks(candidate, material, unit)})
         review_text, review_receipt = self.call("plan-review", {"plan": candidate, "source_units": source_units})
         review = parse_json(review_text)
         record = {"receipt": receipt, "review": review, "review_receipt": review_receipt,
@@ -448,6 +596,61 @@ class Engine:
             save(self.root / "units" / key / "state.json", {"status": "pending", "reason": "source_boundary_repaired"})
         return {"status": "boundaries_repaired", "changed_units": changed, "model_calls_this_run": self.calls}
 
+    def merge_units(self, material, plan, selected):
+        selected = list(selected)
+        ids = [u["id"] for u in plan["units"]]
+        if len(selected) < 2 or len(selected) != len(set(selected)) or any(k not in ids for k in selected):
+            raise ValueError("unit_merge_scope_invalid")
+        positions = [ids.index(k) for k in selected]
+        if positions != list(range(positions[0], positions[0] + len(positions))):
+            raise ValueError("unit_merge_requires_adjacent_units_in_order")
+        units = [plan["units"][n] for n in positions]
+        if len({u["part"] for u in units}) != 1 or len({u["chapter"] for u in units}) != 1:
+            raise ValueError("unit_merge_requires_same_part_and_chapter")
+        failure = read_json(self.root / "integration-review.json")["review"]
+        if failure.get("verdict") != "fail" or not any(set(selected).issubset(i.get("unit_ids", [])) for i in failure.get("issues", [])):
+            raise ValueError("unit_merge_requires_localized_integration_failure")
+        candidate = json.loads(json.dumps(plan))
+        kept, retired = selected[0], set(selected[1:])
+        merged = candidate["units"][positions[0]]
+        indices = sorted(n for u in units for n in span_indices(u["board_ranges"]))
+        ranges = []
+        for n in indices:
+            if ranges and n == ranges[-1][1] + 1:
+                ranges[-1][1] = n
+            else:
+                ranges.append([n, n])
+        merged["board_ranges"] = ranges
+        candidate["units"] = [u for u in candidate["units"] if u["id"] not in retired]
+        splits = []
+        for split in candidate.get("board_splits", []):
+            pieces = []
+            for piece in split["pieces"]:
+                piece = {**piece, "unit": kept if piece["unit"] in retired else piece["unit"]}
+                if not pieces or piece["unit"] != pieces[-1]["unit"]:
+                    pieces.append(piece)
+            if len(pieces) > 1:
+                splits.append({**split, "pieces": pieces})
+        if "board_splits" in candidate:
+            candidate["board_splits"] = splits
+        candidate = compile_plan(candidate, material)
+        previous_units = {u["id"]: u for u in plan["units"]}
+        if any(u != previous_units[u["id"]] for u in candidate["units"] if u["id"] != kept):
+            raise ValueError("unit_merge_changed_unselected_source")
+        file = self.root / "plan.json"
+        previous = read_json(file)
+        if previous["plan"] != plan:
+            raise ValueError("unit_merge_plan_changed")
+        save(self.root / "plan-history" / (digest(previous) + ".json"), previous, frozen=True)
+        event = {"kept": kept, "retired": sorted(retired), "previous_plan_sha256": digest(previous),
+                 "integration_issue": [i for i in failure["issues"] if set(selected).issubset(i.get("unit_ids", []))]}
+        save(file, {**previous, "plan": candidate, "unit_merges": previous.get("unit_merges", []) + [event]})
+        save(self.root / "units" / kept / "state.json", {"status": "pending", "reason": "adjacent_source_units_merged"})
+        for key in retired:
+            save(self.root / "units" / key / "state.json", {"status": "merged", "into": kept})
+        return {"status": "source_units_merged", "regenerate": kept, "retired": sorted(retired),
+                "preserved_units": [u["id"] for u in candidate["units"] if u["id"] != kept]}
+
     def media(self, material):
         if not material["images"]:
             return []
@@ -466,7 +669,7 @@ class Engine:
     def unit_payload(self, material, plan, unit, media):
         part = next(p for p in material["transcripts"] if p["part"] == unit["part"])
         indices = set(span_indices(unit["board_ranges"]))
-        blocks = [b for b in material["board_blocks"] if b["index"] in indices]
+        blocks = source_board_blocks(plan, material, unit)
         pages = {b["page"] for b in blocks}
         owned_images = [i for i in material["images"] if i["block"] in indices]
         actions = {r["id"]: r["action"] for r in media}
@@ -475,11 +678,85 @@ class Engine:
         mixed = [{**i, "diagram_required": classifications[i["id"]].get("diagram_required", False),
                   "diagram_description": classifications[i["id"]].get("diagram_description", "")}
                  for i in owned_images if actions[i["id"]] == "transcribe"]
+        reconstructed = []
+        reconstruction_file = self.root / "diagram-reconstructions.json"
+        if reconstruction_file.exists():
+            rows = read_json(reconstruction_file).get("images", [])
+            ids = [r["source_image_id"] for r in rows]
+            if len(ids) != len(set(ids)) or set(ids) - {i["id"] for i in material["images"]}:
+                raise ValueError("diagram_reconstruction_scope_invalid")
+            for original_image in owned_images:
+                image = next((i for i in mixed if i["id"] == original_image["id"]), None)
+                if image is None:
+                    image = {**original_image, "diagram_required": True,
+                             "diagram_description": "保留原示意关系，图内参数表达式移入正文。"}
+                row = next((r for r in rows if r["source_image_id"] == image["id"]), None)
+                if row is None:
+                    continue
+                receipt_file = Path(row["receipt"])
+                if digest(receipt_file.read_bytes()) != row["receipt_sha256"]:
+                    raise ValueError("diagram_reconstruction_receipt_changed")
+                receipt = read_json(receipt_file)
+                if (receipt.get("source_image_id") != image["id"] or receipt.get("source_sha256") != image["sha256"]
+                        or receipt.get("renderer") != "MathTopicPipeline/diagrams"):
+                    raise ValueError("diagram_reconstruction_source_mismatch")
+                if digest(Path(receipt["plan_path"]).read_bytes()) != receipt["plan_sha256"]:
+                    raise ValueError("diagram_reconstruction_plan_changed")
+                if digest(Path(receipt["path"]).read_bytes()) != receipt["hashes"]["png"]:
+                    raise ValueError("diagram_reconstruction_asset_changed")
+                if not receipt.get("checks") or any(c.get("passed") is not True for c in receipt["checks"]):
+                    raise ValueError("diagram_reconstruction_constraints_not_passed")
+                asset = {"id": "reconstructed-" + image["id"], "page": image["page"], "block": image["block"],
+                         "path": receipt["path"], "sha256": receipt["hashes"]["png"],
+                         "link": "images/reconstructed-" + image["id"] + ".png",
+                         "source_image_id": image["id"], "plan_sha256": receipt["plan_sha256"],
+                         "receipt_sha256": row["receipt_sha256"]}
+                allowed = [i for i in allowed if i["id"] != image["id"]]
+                if not any(i["id"] == image["id"] for i in mixed):
+                    mixed.append(image)
+                allowed.append(asset)
+                reconstructed.append(asset)
+                image["reconstructed_diagram"] = {"id": asset["id"], "link": asset["link"]}
         payload = {"course_title": plan["title"], "chapters": plan["chapters"],
                    "course_units": [{k: u[k] for k in ("id", "chapter", "title")} for u in plan["units"]],
                    "unit": unit, "transcript": part["cues"][unit["start"]:unit["end"] + 1],
                    "board_blocks": blocks, "allowed_images": allowed, "mixed_images": mixed}
-        visual = [i for i in material["pages"] if i["page"] in pages] + owned_images
+        if self.defer_diagrams:
+            payload["diagram_slots"] = allowed + [i for i in mixed if i.get("diagram_required")
+                                                  and not i.get("reconstructed_diagram")]
+        visual = [i for i in material["pages"] if i["page"] in pages] + owned_images + reconstructed
+        context_file = self.root / "unit-context.json"
+        if context_file.exists():
+            references = read_json(context_file).get("units", {}).get(unit["id"], [])
+            order = [u["id"] for u in plan["units"]]
+            contexts = []
+            if len(references) != len(set(references)):
+                raise ValueError("duplicate_lecture_context")
+            for key in references:
+                if key not in order or order.index(key) >= order.index(unit["id"]):
+                    raise ValueError("lecture_context_must_be_previously_defined")
+                context_unit = next(u for u in plan["units"] if u["id"] == key)
+                context_payload, context_visual = self.unit_payload(material, plan, context_unit, media)
+                folder = self.root / "units" / key
+                if read_json(folder / "state.json").get("status") != "accepted":
+                    raise ValueError("lecture_context_not_accepted")
+                record = read_json(folder / "accepted.json")
+                context_fingerprint = digest({"payload": context_payload, "visual": context_visual, "policy": POLICY})
+                if record["source_fingerprint"] != context_fingerprint and not catalog_only_change(
+                        record, read_json(folder / "source.json"), context_payload, context_visual):
+                    raise ValueError("lecture_context_source_changed")
+                for kind in ("lecture", "review", "math_review"):
+                    if digest(Path(record[kind + "_file"]).read_bytes()) != record[kind + "_sha256"]:
+                        raise ValueError("lecture_context_evidence_changed")
+                self.validate_review(read_json(record["review_file"]))
+                self.validate_math_review(read_json(record["math_review_file"]))
+                contexts.append({"unit_id": key, "title": context_unit["title"],
+                    "body": Path(record["lecture_file"]).read_text(encoding="utf-8"),
+                    "sha256": record["lecture_sha256"], "own_source_identity": digest({
+                        "payload": {k: v for k, v in context_payload.items() if k != "course_units"},
+                        "visual": context_visual, "policy": POLICY})})
+            if contexts:
+                payload["previous_lecture_context"] = contexts
         return payload, visual
 
     def math_review(self, body, folder):
@@ -507,17 +784,28 @@ class Engine:
         findings = None
         if accepted.exists() and not refresh and state.get("status") == "accepted":
             previous = read_json(accepted)
-            if previous["source_fingerprint"] == fingerprint and previous["policy"] == POLICY:
+            rebind = None
+            if previous["source_fingerprint"] != fingerprint and previous["policy"] == POLICY and (folder / "source.json").exists():
+                saved_source = read_json(folder / "source.json")
+                if catalog_only_change(previous, saved_source, payload, visual):
+                    rebind = saved_source
+            if (previous["source_fingerprint"] == fingerprint or rebind is not None) and previous["policy"] == POLICY:
                 body = Path(previous["lecture_file"]).read_text(encoding="utf-8")
                 if digest(body.encode()) != previous["lecture_sha256"]:
                     raise ValueError("accepted_body_modified: " + unit["id"])
-                validate_body(body, {i["link"] for i in payload["allowed_images"]},
-                              any(i.get("diagram_required") for i in payload["mixed_images"]))
+                structure_issues = []
+                try:
+                    validate_unit_body(body, payload)
+                except ValueError as error:
+                    structure_issues = [{"kind": "structure", "description": str(error)}]
                 review = read_json(previous["review_file"])
                 if digest(Path(previous["review_file"]).read_bytes()) != previous["review_sha256"]:
                     raise ValueError("accepted_review_modified: " + unit["id"])
                 self.validate_review(review)
-                if previous.get("math_review_file") and not recheck_math:
+                syntax_issues = structure_issues or self.syntax_checker(body)
+                if syntax_issues:
+                    math_check, math_receipt = {"verdict": "fail", "issues": syntax_issues}, None
+                elif previous.get("math_review_file") and not recheck_math:
                     file = Path(previous["math_review_file"])
                     if digest(file.read_bytes()) != previous["math_review_sha256"]:
                         raise ValueError("accepted_math_review_modified: " + unit["id"])
@@ -529,10 +817,29 @@ class Engine:
                     if math_receipt:
                         self.validate_math_review(math_check)
                         previous.update(math_receipt)
+                    if rebind is not None:
+                        old_fingerprint = previous["source_fingerprint"]
+                        save(folder / ("source-history-" + old_fingerprint + ".json"), rebind, frozen=True)
+                        save(folder / "source.json", {"fingerprint": fingerprint, "payload": payload, "images": visual})
+                        previous.update(source_fingerprint=fingerprint, context_rebinding={
+                            "previous_source_fingerprint": old_fingerprint, "changed_field": "course_units",
+                            "own_source_verified_unchanged": True, "global_context_requires_integration_review": True})
+                        save(folder / ("acceptance-" + digest(previous)[:16] + ".json"), previous, frozen=True)
+                        save(state_file, {"status": "accepted", "source_fingerprint": fingerprint,
+                                          "lecture_sha256": previous["lecture_sha256"]})
+                    if math_receipt or rebind is not None:
                         save(accepted, previous)
                     print(json.dumps({"unit": unit["id"], "status": "reused_accepted"}), flush=True)
                     return previous
                 findings = math_check.get("issues", [])
+        integration_file = self.root / "integration-review.json"
+        if integration_file.exists():
+            integration = read_json(integration_file).get("review", {})
+            if integration.get("verdict") == "fail":
+                local_findings = [i for i in integration.get("issues", [])
+                                  if unit["id"] in i.get("unit_ids", [])]
+                if local_findings:
+                    findings = (findings or []) + local_findings
         save(state_file, {"status": "pending", "source_fingerprint": fingerprint})
         save(folder / "source.json", {"fingerprint": fingerprint, "payload": payload, "images": visual})
         if verify_board and payload["board_blocks"]:
@@ -553,15 +860,21 @@ class Engine:
             if findings is not None:
                 generation["review_findings"] = findings
             body, body_receipt = self.call("lecture", generation, visual)
-            body = validate_body(body, {i["link"] for i in payload["allowed_images"]},
-                                 any(i.get("diagram_required") for i in payload["mixed_images"]))
+            body = body.strip() + "\n"
             body_file = folder / ("lecture-" + body_receipt["request_key"][:16] + ".md")
             save(body_file, body, frozen=True)
-            text, review_receipt = self.call("review", {**payload, "candidate_lecture": body}, visual)
-            review = parse_json(text)
-            review_file = folder / ("review-" + review_receipt["request_key"][:16] + ".json")
-            save(review_file, review, frozen=True)
+            review = {"issues": []}
             try:
+                validate_unit_body(body, payload)
+                syntax_issues = self.syntax_checker(body)
+                if syntax_issues:
+                    review = {"issues": syntax_issues}
+                    save(folder / ("syntax-" + body_receipt["request_key"][:16] + ".json"), review, frozen=True)
+                    raise ValueError("lecture_math_syntax_invalid")
+                text, review_receipt = self.call("review", {**payload, "candidate_lecture": body}, visual)
+                review = parse_json(text)
+                review_file = folder / ("review-" + review_receipt["request_key"][:16] + ".json")
+                save(review_file, review, frozen=True)
                 self.validate_review(review)
                 math_check, math_receipt = self.math_review(body, folder)
                 try:
@@ -570,10 +883,10 @@ class Engine:
                     review = math_check
                     raise
                 break
-            except ValueError:
+            except ValueError as error:
                 if revision == revisions:
                     raise
-                findings = review.get("issues", [])
+                findings = review.get("issues", []) or [{"kind": "structure", "description": str(error)}]
                 print(json.dumps({"unit": unit["id"], "status": "regenerating_from_sources",
                                   "revision": revision + 1}), flush=True)
         result = {"status": "accepted", "policy": POLICY, "unit_id": unit["id"],
@@ -617,8 +930,10 @@ class Engine:
         save(self.root / "last-run.json", receipt)
         return receipt
 
-    def assemble(self, material, plan, media):
-        accepted, bodies = {}, {}
+    def assemble(self, material, plan, media, *, split_chapters=False):
+        if self.defer_diagrams:
+            raise ValueError("marked_text_ready_use_illustrate_py")
+        accepted, bodies, assets = {}, {}, {}
         for unit in plan["units"]:
             state_file = self.root / "units" / unit["id"] / "state.json"
             if state_file.exists() and read_json(state_file).get("status") != "accepted":
@@ -626,13 +941,16 @@ class Engine:
             file = self.root / "units" / unit["id"] / "accepted.json"
             record = read_json(file)
             payload, visual = self.unit_payload(material, plan, unit, media)
+            assets.update({i["link"]: i for i in payload["allowed_images"]})
             if record["source_fingerprint"] != digest({"payload": payload, "visual": visual, "policy": POLICY}):
                 raise ValueError("accepted_source_changed: " + unit["id"])
             body = Path(record["lecture_file"]).read_text(encoding="utf-8")
             if digest(body.encode()) != record["lecture_sha256"]:
                 raise ValueError("accepted_body_modified: " + unit["id"])
             validate_body(body, {i["link"] for i in payload["allowed_images"]},
-                          any(i.get("diagram_required") for i in payload["mixed_images"]))
+                          requires_mermaid(payload))
+            if self.syntax_checker(body):
+                raise ValueError("accepted_math_syntax_invalid: " + unit["id"])
             if digest(Path(record["review_file"]).read_bytes()) != record["review_sha256"]:
                 raise ValueError("accepted_review_modified: " + unit["id"])
             self.validate_review(read_json(record["review_file"]))
@@ -640,19 +958,7 @@ class Engine:
                 raise ValueError("accepted_math_review_modified: " + unit["id"])
             self.validate_math_review(read_json(record["math_review_file"]))
             accepted[unit["id"]], bodies[unit["id"]] = record, body
-        lines = ["# " + plan["title"], ""]
-        for chapter in plan["chapters"]:
-            promote = len(plan["chapters"]) == 1 and chapter["title"].strip() == plan["title"].strip()
-            if not promote:
-                lines += ["- " + chapter["title"]]
-            units = [u for u in plan["units"] if u["chapter"] == chapter["id"]]
-            for unit in units:
-                indent = (2 if len(units) == 1 else 4) - (2 if promote else 0)
-                if len(units) > 1:
-                    lines += [(" " * (indent - 2)) + "- " + unit["title"]]
-                lines += [(" " * indent + line) if line else "" for line in bodies[unit["id"]].splitlines()]
-            lines.append("")
-        markdown = "\n".join(lines).rstrip() + "\n"
+        markdown = compose_lecture(plan, bodies)
         text, receipt = self.call("integration", {"title": plan["title"], "chapters": plan["chapters"],
             "units": [{"id": u["id"], "title": u["title"], "chapter": u["chapter"], "body": bodies[u["id"]]}
                       for u in plan["units"]]})
@@ -663,11 +969,24 @@ class Engine:
         destination = self.root / "lecture"
         file = destination / "lecture.md"
         previous = read_json(self.root / "publication.json") if (self.root / "publication.json").exists() else None
-        if file.exists() and (not previous or digest(file.read_bytes()) != previous["sha256"]):
+        if file.exists() and digest(file.read_bytes()) not in {digest(markdown.encode()), (previous or {}).get("sha256")}:
             raise ValueError("published_lecture_modified_refuse_overwrite")
+        documents = []
+        split_chapters = split_chapters or bool((previous or {}).get("documents"))
+        previous_documents = {d["path"]: d for d in (previous or {}).get("documents", [])}
+        if split_chapters:
+            for n, chapter in enumerate(plan["chapters"], 1):
+                units = [u for u in plan["units"] if u["chapter"] == chapter["id"]]
+                scoped = {"title": chapter["title"], "chapters": [chapter], "units": units}
+                body = compose_lecture(scoped, bodies)
+                target = destination / f"chapter-{n:02d}.md"
+                identity = digest(body.encode())
+                if target.exists() and digest(target.read_bytes()) not in {
+                        identity, previous_documents.get(str(target), {}).get("sha256")}:
+                    raise ValueError("published_chapter_modified_refuse_overwrite: " + chapter["id"])
+                documents.append({"chapter": chapter["id"], "title": chapter["title"], "path": str(target),
+                                  "sha256": identity, "unit_ids": [u["id"] for u in units], "body": body})
         used = set(re.findall(r"!\[[^\]]*\]\(([^)]+)\)", markdown))
-        allowed_ids = {m["id"] for m in media if m["action"] == "keep_diagram"}
-        assets = {i["link"]: i for i in material["images"] if i["id"] in allowed_ids}
         if used - assets.keys():
             raise ValueError("publication_contains_unapproved_media")
         for link in used:
@@ -677,15 +996,21 @@ class Engine:
                 raise ValueError("publication_image_changed")
             shutil.copyfile(assets[link]["path"], target)
         save(file, markdown)
+        for document in documents:
+            save(document["path"], document["body"])
         publication = {"status": "content_accepted_render_pending", "path": str(file),
                        "sha256": digest(markdown.encode()), "units": len(accepted), "parts": len(material["transcripts"]),
                        "images": sorted(used), "integration_receipt": receipt, "policy": POLICY,
+                       "image_sources": {link: assets[link]["sha256"] for link in sorted(used)},
                        "reading_guide": "disabled", "video_capture_calls": 0,
                        "material_sha256": digest((self.root / "material.json").read_bytes()),
                        "plan_sha256": digest((self.root / "plan.json").read_bytes()),
                        "unit_sources": {key: {field: record[field] for field in
                            ("source_fingerprint", "lecture_sha256", "review_sha256", "math_review_sha256")}
                            for key, record in accepted.items()}}
+        if documents:
+            publication.update(delivery_mode="chapters", documents=[{k: v for k, v in d.items() if k != "body"}
+                                                                    for d in documents])
         save(self.root / "publication.json", publication)
         return publication
 
@@ -696,6 +1021,9 @@ def verify_delivery(root):
     markdown = Path(publication["path"])
     if digest(markdown.read_bytes()) != publication["sha256"]:
         raise ValueError("publication_modified_before_render")
+    for link, identity in publication.get("image_sources", {}).items():
+        if digest((markdown.parent / link).read_bytes()) != identity:
+            raise ValueError("published_image_modified_before_render: " + link)
     for field, filename in [("material_sha256", "material.json"), ("plan_sha256", "plan.json")]:
         if digest((root / filename).read_bytes()) != publication.get(field):
             raise ValueError("publication_source_binding_changed")
@@ -703,6 +1031,7 @@ def verify_delivery(root):
     if set(publication["unit_sources"]) != {u["id"] for u in plan["units"]}:
         raise ValueError("publication_unit_coverage_changed")
     models = set()
+    bodies = {}
     for key, identity in publication["unit_sources"].items():
         folder = root / "units" / key
         if (folder / "state.json").exists() and read_json(folder / "state.json").get("status") != "accepted":
@@ -716,6 +1045,18 @@ def verify_delivery(root):
         Engine.validate_review(read_json(record["review_file"]))
         Engine.validate_math_review(read_json(record["math_review_file"]))
         models.add(record["math_review_receipt"]["model"])
+        bodies[key] = Path(record["lecture_file"]).read_text(encoding="utf-8")
+    if publication.get("documents"):
+        documents = publication["documents"]
+        if ([key for d in documents for key in d["unit_ids"]] != [u["id"] for u in plan["units"]]
+                or [d["chapter"] for d in documents] != [c["id"] for c in plan["chapters"]]):
+            raise ValueError("chapter_document_coverage_changed")
+        for document, chapter in zip(documents, plan["chapters"]):
+            scoped = {"title": chapter["title"], "chapters": [chapter],
+                      "units": [u for u in plan["units"] if u["chapter"] == chapter["id"]]}
+            if (digest(compose_lecture(scoped, bodies).encode()) != document["sha256"]
+                    or digest(Path(document["path"]).read_bytes()) != document["sha256"]):
+                raise ValueError("chapter_document_modified_or_source_changed: " + chapter["id"])
     output = root / "render"
     python = os.environ.get("PROGRESSIVE_READING_VIDEO_PYTHON", "D:/Caches/ProgressiveReading/videobook-python/Scripts/python.exe")
     subprocess.run([python, str(REPO / "video-workflow" / "verify-rendering.py"),
@@ -729,13 +1070,25 @@ def verify_delivery(root):
                   "independent_source_review": True, "independent_math_review": True,
                   "math_review_models": sorted(models), "rendering": rendering,
                   "reading_guide": "disabled", "video_capture_calls": 0}
+    if publication.get("documents"):
+        accepted_documents = []
+        for n, document in enumerate(publication["documents"], 1):
+            chapter_output = output / f"chapter-{n:02d}"
+            subprocess.run([python, str(REPO / "video-workflow" / "verify-rendering.py"),
+                            "--markdown", document["path"], "--output", str(chapter_output)], check=True, timeout=360)
+            chapter_rendering = read_json(chapter_output / "render-verification.json")
+            if chapter_rendering.get("status") != "passed" or chapter_rendering.get("errors"):
+                raise ValueError("chapter_rendering_failed: " + document["chapter"])
+            accepted_documents.append({**document, "preview": str(chapter_output / "preview.html"),
+                                       "rendering": chapter_rendering})
+        acceptance.update(delivery_mode="chapters", documents=accepted_documents)
     save(root / "acceptance.json", acceptance)
     return acceptance
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["prepare", "plan", "repair-boundaries", "run", "assemble", "verify", "status"])
+    parser.add_argument("command", choices=["prepare", "plan", "repair-boundaries", "merge-units", "run", "assemble", "verify", "status"])
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model", help="Explicit per-run Codex model; omitted preserves the existing transport default")
     parser.add_argument("--inventory", type=Path)
@@ -751,11 +1104,13 @@ def main():
     parser.add_argument("--verify-board-transcription", action="store_true", help="Resolve concrete handwriting/OCR errors from actual board images before authoring")
     parser.add_argument("--recheck-math", action="store_true", help="Review accepted mathematics with the current reviewer; preserve the body when it passes")
     parser.add_argument("--refresh", action="store_true", help="Reopen explicitly selected units after a general prompt repair")
+    parser.add_argument("--split-chapters", action="store_true", help="Deliver long parts as complete chapter files, preserving unit boundaries")
+    parser.add_argument("--defer-diagrams", action="store_true", help="Write diagram markers for the separate illustration pass")
     args = parser.parse_args()
     if args.refresh and not args.units:
         parser.error("--refresh requires --units; entire-lecture regeneration is not implicit")
-    if args.command == "repair-boundaries" and not args.units:
-        parser.error("repair-boundaries requires --units")
+    if args.command in ("repair-boundaries", "merge-units") and not args.units:
+        parser.error(args.command + " requires --units")
     if args.command == "prepare":
         if not args.inventory or not args.board_content or not args.page_template:
             parser.error("prepare requires --inventory, --board-content and --page-template")
@@ -782,13 +1137,23 @@ def main():
         if args.command == "verify":
             print(json.dumps(verify_delivery(args.output), ensure_ascii=False, indent=2))
             return 0
-        engine = Engine(args.output, model=args.model)
+        diagram_mode = args.output / "diagram-mode.json"
+        if args.command == "run" and args.defer_diagrams and not diagram_mode.exists():
+            existing = list((args.output / "units").glob("*/accepted.json"))
+            if any("diagram_slots" not in read_json(p.parent / "source.json")["payload"] for p in existing):
+                raise ValueError("use_illustrate_py_for_already_accepted_lectures")
+            save(diagram_mode, {"defer_diagrams": True}, frozen=True)
+        deferred = diagram_mode.exists() and read_json(diagram_mode)["defer_diagrams"]
+        engine = Engine(args.output, model=args.model, defer_diagrams=deferred or args.defer_diagrams)
         plan = engine.plan(material)
         if args.command == "plan":
             print(json.dumps(plan, ensure_ascii=False, indent=2))
             return 0
         if args.command == "repair-boundaries":
             print(json.dumps(engine.repair_boundaries(material, plan, args.units.split(",")), ensure_ascii=False, indent=2))
+            return 0
+        if args.command == "merge-units":
+            print(json.dumps(engine.merge_units(material, plan, args.units.split(",")), ensure_ascii=False, indent=2))
             return 0
         media = engine.media(material)
         if args.command == "run":
@@ -797,7 +1162,7 @@ def main():
                                 verify_board=args.verify_board_transcription, recheck_math=args.recheck_math)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 1 if result["failures"] else 0
-        print(json.dumps(engine.assemble(material, plan, media), ensure_ascii=False, indent=2))
+        print(json.dumps(engine.assemble(material, plan, media, split_chapters=args.split_chapters), ensure_ascii=False, indent=2))
         return 0
 
 

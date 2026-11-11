@@ -15,11 +15,18 @@ class SubtitleMetadataTests(unittest.TestCase):
             def __enter__(self):return self
             def __exit__(self,*args):pass
             def extract_info(self,url,download):
-                case.assertEqual(url,case.job['url']);case.assertFalse(download);return info
+                case.requested_url=url
+                case.assertFalse(download);return info
         return Ydl
     def test_metadata_requests_captions_without_downloading_media(self):
         info={'id':'BV1234567890_p2','subtitles':{'ai-zh':[{'ext':'srt'}]}}
         self.assertIs(module.exact_part_info(self.job,'unused',self.factory(info)),info)
+        self.assertEqual(self.requested_url,self.job['url'])
+    def test_first_of_multiple_parts_is_explicit_even_when_public_pagelist_is_hidden(self):
+        self.job.update(part=1,url='https://www.bilibili.com/video/BV1234567890/')
+        info={'id':'BV1234567890_p1','subtitles':{'zh':[{'ext':'json'}]}}
+        module.exact_part_info(self.job,'unused',self.factory(info))
+        self.assertEqual(self.requested_url,'https://www.bilibili.com/video/BV1234567890/?p=1')
     def test_danmaku_is_not_subtitles(self):
         with self.assertRaisesRegex(ValueError,'not_yet_available'):
             module.exact_part_info(self.job,'unused',self.factory({'id':'BV1234567890_p2','subtitles':{'danmaku':[{'ext':'xml'}]}}))
