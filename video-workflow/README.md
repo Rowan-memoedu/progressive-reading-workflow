@@ -30,6 +30,8 @@ python video-workflow/fetch-public.py code
 
 字幕元数据必须与明确的分 P 一致，临时字幕目录隔离。旧书稿和图片不能混入新来源。`run-authenticated.mjs` 将已有登录快照转换成范围受限的临时 Cookie 文件。
 
+尚未完成的任务在来源字幕、提示词、模型、处理选项或工作流实现变化后，使用最新版本开始一次独立处理。旧目录与证据保留，同一版本重试继续同一目录。新处理只带入该分 P 的原始字幕与来源元数据，不混入旧书稿；已完成的文章继续复用，保留已有正文及批注。
+
 `import-transcript.mjs` 是字幕标准入口；`illustrated-strong.mjs` 处理图文模式。正文、导读、截图和板书校订使用一致的模型路由，模型缓存身份包含实际指令适配版本。Codex CLI 只有报告 `turn.completed` 才能接受结果；无已验证等价项的旧 API 参数不能宣称已应用。
 
 媒体证据按 `source_segment_index` / `result_segment_index` 选择字幕，程序逐字回填引文。时间编译只在已声明窗口内后移或缩短，不扩展场景。Mermaid 和 LaTeX 保留原生 Markdown 语义，不把稀疏配图当作完整公式证据。

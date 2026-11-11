@@ -27,13 +27,17 @@ async function api(url,body){
   } finally {clearTimeout(timeout);}
 }
 function message(text,error=false){$('message').textContent=text;$('message').className=error?'error':'success';}
-async function busy(button,action){const before=button.textContent;button.disabled=true;button.setAttribute('aria-busy','true');button.dataset.state='loading';button.textContent='正在处理…';try{await action();button.dataset.state='success';}catch(error){button.dataset.state='error';message(readableError(error.message),true);}finally{button.disabled=false;button.removeAttribute('aria-busy');button.textContent=before;}}
+async function busy(button,action){const before=button.textContent,peers=[...(button.closest('.actions')?.querySelectorAll('button')||[button])].map(node=>[node,node.disabled]);for(const [node]of peers)node.disabled=true;button.setAttribute('aria-busy','true');button.dataset.state='loading';button.textContent='正在处理…';try{await action();button.dataset.state='success';}catch(error){button.dataset.state='error';message(readableError(error.message),true);}finally{for(const [node,disabled]of peers)node.disabled=disabled;button.removeAttribute('aria-busy');button.textContent=before;}}
 function button(text,action,cls='secondary'){const node=element('button',text,cls);node.type='button';node.onclick=()=>busy(node,action);return node;}
 async function importWarning(item){
   const key='subscriptions.warning-import:'+item.id;let id;try{id=localStorage.getItem(key);}catch{}
   id||='warning-import-'+crypto.randomUUID();try{localStorage.setItem(key,id);}catch{}
   await api('/api/subscriptions/import-warning',{id:item.id,client_request_id:id});
   try{localStorage.removeItem(key);}catch{}message('已加入导入队列，来源信息的提示会保留。');await refresh();
+}
+async function deleteWarning(item){
+  await api('/api/subscriptions/import-warning/delete',{id:item.id});
+  message('已从队列删除，不再导入。');await refresh();
 }
 function modeHelp(){const kind=$('kind').value,video=kind.startsWith('bilibili_'),repository=kind==='github_repository';const option=[...$('mode').options].find(o=>o.value==='original_text');option.disabled=video;if(video&&$('mode').value==='original_text')$('mode').value='reports';
   document.querySelectorAll('[data-repository-setting]').forEach(node=>node.hidden=!repository);
@@ -143,7 +147,21 @@ function render(data){current=data;if(!data.initialized){$('health').textContent
   $('report-list').replaceChildren();for(const file of data.reports){const row=element('li',undefined,'report-row');row.append(element('span',file.split(/[\\/]/).at(-1)),button('编辑',async()=>{await api('/api/subscriptions/open-report',{path:file});message('已打开报告原文件。勾选后请保存。');}));$('report-list').append(row);}if(!data.reports.length)$('report-list').append(element('li','尚未生成报告。','empty'));
   const items=[...data.pending,...(data.import_issues||data.failures),...Object.entries(data.zhihu_sources).filter(([id,s])=>s.error&&data.subscriptions.some(source=>source.id===id&&source.enabled)).map(([id,s])=>({title:data.subscriptions.find(x=>x.id===id).name,status:'blocked',severity:'blocking',error:s.error}))];
   const blocking=items.filter(i=>i.severity==='blocking'||(!i.severity&&['blocked','source_blocked','verification_failed'].includes(i.status))).length,warnings=items.filter(i=>i.severity==='warning'&&i.status!=='imported_with_warnings').length;
-  $('queue-summary').textContent=`${blocking} 项需先修复，${warnings} 项可带提示导入；${data.pending_job_count??data.jobs.filter(j=>['running','queued'].includes(j.status)).length} 个任务正在运行或排队。`;$('queue').replaceChildren();for(const item of items){const row=element('div',undefined,'queue-row'+(item.severity?' issue-'+item.severity:''));row.append(element('h3',item.title||'订阅任务'),element('p',item.severity==='blocking'?'暂不能导入':states[item.status]||item.status,'hint'));if(item.message||item.error)row.append(element('p',item.message||readableError(item.error),item.severity==='warning'?'hint':'error'));if(item.source_paused)row.append(element('p','来源已停用；单篇导入不会重新启用订阅。','hint'));const actions=element('div',undefined,'actions');if(item.can_import)actions.append(button('仍要导入原文',()=>importWarning(item),''));if(item.import_pending){const pending=button('正在导入原文',()=>{});pending.disabled=true;pending.setAttribute('aria-busy','true');actions.append(pending);}if(item.publication?.path){const a=element('a','打开已入库文章');a.href='obsidian://open?path='+encodeURIComponent(item.publication.path);actions.append(a);}if(actions.childElementCount)row.append(actions);$('queue').append(row);}if(!items.length)$('queue').append(element('p','当前没有堵塞项。','empty'));
+  $('queue-summary').textContent=`${blocking} 项需先修复，${warnings} 项可带提示导入；${data.pending_job_count??data.jobs.filter(j=>['running','queued'].includes(j.status)).length} 个任务正在运行或排队。`;
+  $('queue').replaceChildren();
+  for(const item of items){
+    const row=element('div',undefined,'queue-row'+(item.severity?' issue-'+item.severity:''));
+    row.append(element('h3',item.title||'订阅任务'),element('p',item.severity==='blocking'?'暂不能导入':states[item.status]||item.status,'hint'));
+    if(item.message||item.error)row.append(element('p',item.message||readableError(item.error),item.severity==='warning'?'hint':'error'));
+    if(item.source_paused)row.append(element('p','来源已停用；单篇导入不会重新启用订阅。','hint'));
+    const actions=element('div',undefined,'actions');
+    if(item.can_import)actions.append(button('仍要导入原文',()=>importWarning(item),''));
+    if(item.can_delete)actions.append(button('删除',()=>deleteWarning(item),'secondary danger'));
+    if(item.import_pending){const pending=button('正在导入原文',()=>{});pending.disabled=true;pending.setAttribute('aria-busy','true');actions.append(pending);}
+    if(item.publication?.path){const a=element('a','打开已入库文章');a.href='obsidian://open?path='+encodeURIComponent(item.publication.path);actions.append(a);}
+    if(actions.childElementCount)row.append(actions);$('queue').append(row);
+  }
+  if(!items.length)$('queue').append(element('p','当前没有堵塞项。','empty'));
   $('jobs').replaceChildren();for(const job of data.jobs){
     const row=element('li',`${jobNames[job.kind]} · ${states[job.status]||job.status} · ${new Date(job.created_at).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}`);
     if(job.error)row.append(element('p',readableError(job.error),'error'));
