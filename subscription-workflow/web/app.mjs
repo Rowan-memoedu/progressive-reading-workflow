@@ -1,8 +1,8 @@
 const $=id=>document.getElementById(id);
-// Hallmark · scope: component; existing form controls and tokens retained.
+// Hallmark · component critique: P4 H5 E4 S5 R5 V4; existing tokens retained.
 const kinds={rss:'RSS / Atom',bilibili_video:'B 站多 P 视频',bilibili_collection:'B 站合集',zhihu_author:'知乎作者',zhihu_column:'知乎专栏',github_repository:'GitHub Markdown 仓库'};
 const modes={standard_preprocess:'标准流程，自动入库',original_text:'提取原文，自动入库',reports:'日报 / 周报与阅读操作'};
-const states={queued:'排队中',pending:'待处理',processing:'处理中',running:'运行中',waiting_source:'等待来源',blocked:'处理受阻',source_blocked:'来源受限',verification_failed:'待重新核验',retry_wait:'等待下个周期重试',completed:'完成',completed_with_issues:'完成，部分待处理',failed:'失败',route_conflict:'需要选择模式',awaiting_review:'等待勾选',imported:'已入库',imported_with_warnings:'已入库，有提示'};
+const states={queued:'排队中',pending:'待处理',processing:'处理中',running:'运行中',waiting_source:'等待来源',blocked:'处理受阻',source_blocked:'来源受限',verification_failed:'待重新核验',retry_wait:'等待下个周期重试',completed:'完成',completed_with_issues:'完成，部分待处理',failed:'失败',route_conflict:'需要选择模式',awaiting_review:'等待勾选',imported:'已入库',imported_with_warnings:'已入库，有提示',warning:'可导入，有提示'};
 let current=null,editing=null,refreshing=false;
 const jobNames={rss:'RSS 检查',bilibili:'B 站检查',zhihu:'知乎检查',daily:'日报',weekly:'周报',decisions:'勾选处理',retry:'堵塞项重试',video_import:'视频图文导入'};
 const stepNames={scan:'检查来源',previews:'处理材料',decisions:'处理勾选',report:'生成报告',activity:'写入入库动态',
@@ -12,7 +12,7 @@ const stepNames={scan:'检查来源',previews:'处理材料',decisions:'处理�
 const trackedRuns=new Map();
 const sourceGroupOpen=new Map();
 function element(tag,text,cls){const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(cls)node.className=cls;return node;}
-function readableError(value){const text=String(value||'');if(/paid_subscribers/u.test(text))return '来源正文需要付费订阅，现有访问条件只能取得摘要。';if(/platform_subtitles_not_yet_available/u.test(text))return '平台尚未提供字幕，下个周期会再次检查。';if(/target_login_snapshot_unavailable/u.test(text))return '当前来源的登录快照不可用，等待浏览器登录状态同步后重试。';if(/zhihu_http_403/u.test(text))return '知乎接口拒绝访问（403），当前未取得可用正文。';return text;}
+function readableError(value){const text=String(value||'');if(/paid_subscribers|paywall/u.test(text))return '来源正文需要付费订阅，现有访问条件只能取得摘要。';if(/platform_subtitles_not_yet_available/u.test(text))return '平台尚未提供字幕，下个周期会再次检查。';if(/target_login_snapshot_unavailable/u.test(text))return '当前来源的登录快照不可用，等待浏览器登录状态同步后重试。';if(/zhihu_http_403/u.test(text))return '知乎接口拒绝访问（403），当前未取得可用正文。';if(/source_metadata|missingProperty/u.test(text))return '来源记录缺少部分可选信息。';if(/identity_changed|source.*mismatch/u.test(text))return '来源或处理流程已变化，需要重新核对。';if(/[{}\n]|pr_preprocess_|result_contract|\\u[0-9a-f]{4}/iu.test(text)||!/[\u3400-\u9fff]/u.test(text))return '处理未完成，请重试。详细原因已保留在异常记录中。';return text.slice(0,240);}
 async function api(url,body){
   const controller=new AbortController();
   const timeout=setTimeout(()=>controller.abort(),20000);
@@ -27,8 +27,14 @@ async function api(url,body){
   } finally {clearTimeout(timeout);}
 }
 function message(text,error=false){$('message').textContent=text;$('message').className=error?'error':'success';}
-async function busy(button,action){const before=button.textContent;button.disabled=true;button.setAttribute('aria-busy','true');button.textContent='正在处理…';try{await action();}catch(error){message(error.message,true);}finally{button.disabled=false;button.removeAttribute('aria-busy');button.textContent=before;}}
+async function busy(button,action){const before=button.textContent;button.disabled=true;button.setAttribute('aria-busy','true');button.dataset.state='loading';button.textContent='正在处理…';try{await action();button.dataset.state='success';}catch(error){button.dataset.state='error';message(readableError(error.message),true);}finally{button.disabled=false;button.removeAttribute('aria-busy');button.textContent=before;}}
 function button(text,action,cls='secondary'){const node=element('button',text,cls);node.type='button';node.onclick=()=>busy(node,action);return node;}
+async function importWarning(item){
+  const key='subscriptions.warning-import:'+item.id;let id;try{id=localStorage.getItem(key);}catch{}
+  id||='warning-import-'+crypto.randomUUID();try{localStorage.setItem(key,id);}catch{}
+  await api('/api/subscriptions/import-warning',{id:item.id,client_request_id:id});
+  try{localStorage.removeItem(key);}catch{}message('已加入导入队列，来源信息的提示会保留。');await refresh();
+}
 function modeHelp(){const kind=$('kind').value,video=kind.startsWith('bilibili_'),repository=kind==='github_repository';const option=[...$('mode').options].find(o=>o.value==='original_text');option.disabled=video;if(video&&$('mode').value==='original_text')$('mode').value='reports';
   document.querySelectorAll('[data-repository-setting]').forEach(node=>node.hidden=!repository);
   for(const item of $('mode').options)if(item.value!=='original_text')item.disabled=repository;
@@ -135,11 +141,12 @@ function render(data){current=data;if(!data.initialized){$('health').textContent
   $('schedule').replaceChildren();for(const [label,time] of [['RSS',data.schedule.rss],['知乎',data.schedule.zhihu],['B 站',data.schedule.bilibili],['日报',data.schedule.daily],['短文周报','逐篇追加'],['长文周报','周日 '+data.schedule.weekly]])$('schedule').append(element('dt',label),element('dd',time));
   $('conflict-section').hidden=!data.conflicts.length;$('conflicts').replaceChildren();for(const item of data.conflicts){const row=element('div',undefined,'queue-row');row.append(element('h3',item.title));const actions=element('div',undefined,'actions');for(const [mode,label] of [['standard_preprocess','用标准流程'],['original_text','只提取原文']])actions.append(button(label,async()=>{await api('/api/subscriptions/resolve',{id:item.id,mode});message('处理方式已确定，材料重新入队。');await refresh();}));row.append(actions);$('conflicts').append(row);}
   $('report-list').replaceChildren();for(const file of data.reports){const row=element('li',undefined,'report-row');row.append(element('span',file.split(/[\\/]/).at(-1)),button('编辑',async()=>{await api('/api/subscriptions/open-report',{path:file});message('已打开报告原文件。勾选后请保存。');}));$('report-list').append(row);}if(!data.reports.length)$('report-list').append(element('li','尚未生成报告。','empty'));
-  const items=[...data.pending,...data.failures,...Object.entries(data.zhihu_sources).filter(([id,s])=>s.error&&data.subscriptions.some(source=>source.id===id&&source.enabled)).map(([id,s])=>({title:data.subscriptions.find(x=>x.id===id).name,status:'blocked',error:s.error}))];
-  $('queue-summary').textContent=`${items.length} 项待处理或需要关注；${data.pending_job_count??data.jobs.filter(j=>['running','queued'].includes(j.status)).length} 个任务正在运行或排队。`;$('queue').replaceChildren();for(const item of items){const row=element('div',undefined,'queue-row');row.append(element('h3',item.title||'订阅任务'),element('p',states[item.status]||item.status,'hint'));if(item.error)row.append(element('p',readableError(item.error),'error'));$('queue').append(row);}if(!items.length)$('queue').append(element('p','当前没有堵塞项。','empty'));
+  const items=[...data.pending,...(data.import_issues||data.failures),...Object.entries(data.zhihu_sources).filter(([id,s])=>s.error&&data.subscriptions.some(source=>source.id===id&&source.enabled)).map(([id,s])=>({title:data.subscriptions.find(x=>x.id===id).name,status:'blocked',severity:'blocking',error:s.error}))];
+  const blocking=items.filter(i=>i.severity==='blocking'||(!i.severity&&['blocked','source_blocked','verification_failed'].includes(i.status))).length,warnings=items.filter(i=>i.severity==='warning'&&i.status!=='imported_with_warnings').length;
+  $('queue-summary').textContent=`${blocking} 项需先修复，${warnings} 项可带提示导入；${data.pending_job_count??data.jobs.filter(j=>['running','queued'].includes(j.status)).length} 个任务正在运行或排队。`;$('queue').replaceChildren();for(const item of items){const row=element('div',undefined,'queue-row'+(item.severity?' issue-'+item.severity:''));row.append(element('h3',item.title||'订阅任务'),element('p',item.severity==='blocking'?'暂不能导入':states[item.status]||item.status,'hint'));if(item.message||item.error)row.append(element('p',item.message||readableError(item.error),item.severity==='warning'?'hint':'error'));if(item.source_paused)row.append(element('p','来源已停用；单篇导入不会重新启用订阅。','hint'));const actions=element('div',undefined,'actions');if(item.can_import)actions.append(button('仍要导入原文',()=>importWarning(item),''));if(item.import_pending){const pending=button('正在导入原文',()=>{});pending.disabled=true;pending.setAttribute('aria-busy','true');actions.append(pending);}if(item.publication?.path){const a=element('a','打开已入库文章');a.href='obsidian://open?path='+encodeURIComponent(item.publication.path);actions.append(a);}if(actions.childElementCount)row.append(actions);$('queue').append(row);}if(!items.length)$('queue').append(element('p','当前没有堵塞项。','empty'));
   $('jobs').replaceChildren();for(const job of data.jobs){
     const row=element('li',`${jobNames[job.kind]} · ${states[job.status]||job.status} · ${new Date(job.created_at).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}`);
-    if(job.error)row.append(element('p',job.error,'error'));
+    if(job.error)row.append(element('p',readableError(job.error),'error'));
     if(job.kind==='video_import'){
       row.append(element('p','分 P：'+job.request.parts.join('、'),'hint'));
       if(job.status==='running'&&job.progress)row.append(element('p',`P${job.progress.part} · ${stepNames[job.progress.stage]||'处理中'}`,'hint'));

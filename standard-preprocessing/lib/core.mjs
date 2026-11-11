@@ -259,7 +259,7 @@ function promptVersionFor(request) {
     : MATH_LECTURE_STANDARDIZATION_PROMPT_VERSION;
 }
 
-function normalizeMetadata(metadata, embeddedFrontmatter) {
+export function normalizeMetadata(metadata, embeddedFrontmatter = {}) {
   const explicit = metadata && typeof metadata === "object" ? structuredClone(metadata) : {};
   const translation = explicit.translation && typeof explicit.translation === "object"
     ? structuredClone(explicit.translation)

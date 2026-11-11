@@ -117,6 +117,18 @@ test("uncertainty saves a pending result without production or publication and r
   assert.equal(producer.calls, 1);
 });
 
+test('sparse original translation metadata cannot invalidate a pending classification result',async()=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'pr-sparse-metadata-'));
+  const input=request({translate:false,include_reading_guide:false},{translation:{is_translation:false}});
+  const before=JSON.stringify(input);
+  const producer={async classifyWorkflow(){return {output:{input_form:null,confidence:0.2,reason:'材料形态待判断。'},needs_classification:true,provider:'test',model:'router',api_calls:1,attempts:[],call_ledger:[]};},generate(){throw Error('must wait');}};
+  const pending=await runPreprocessingRequest(input,{producer,outputDir:path.join(root,'audit'),cacheDir:path.join(root,'cache')});
+  assert.equal(pending.result.status,'needs_classification');
+  assert.equal((await validateResultContract(pending.result)).valid,true);
+  assert.equal(pending.publication,null);
+  assert.equal(JSON.stringify(input),before);
+});
+
 test("translation is cached independently from a toggled or failing guide, including explicit request ids", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "pr-stage-cache-"));
   const producer = stageProducer();

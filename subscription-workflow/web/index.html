@@ -47,6 +47,6 @@
     <section class="section" id="reports" aria-labelledby="reports-title"><div class="section-head"><h2 id="reports-title">日报与周报</h2></div><p class="hint">点击“编辑”会打开 Markdown 原文件。每条只勾选一项，保存后自动入队。未勾选或多选的条目会在新一期重新提供空白选框。</p><div class="actions"><button class="secondary" data-run="daily" type="button">生成日报</button><button class="secondary" data-run="weekly" type="button">生成周报</button></div><p id="report-run-status" class="run-status hint" role="status" hidden></p><ul id="report-list"></ul></section>
   </div>
   <section class="section" aria-labelledby="queue-title"><div class="section-head"><h2 id="queue-title">队列与运行记录</h2><div class="actions"><button id="open-exceptions" class="secondary" type="button" hidden>异常记录</button><button class="secondary" data-run="retry" type="button">重试堵塞项</button><button id="refresh" class="secondary" type="button">刷新状态</button></div></div><p id="retry-run-status" class="run-status hint" role="status" hidden></p><p id="queue-summary" class="hint"></p><div id="queue"></div><details id="job-history"><summary>最近的任务</summary><ol id="jobs"></ol></details></section>
-  <footer>停用订阅会停止接收新内容。删除已停用的订阅会移除订阅配置，已有正文、批注和选择记录保留。</footer>
+  <footer>正文完整的条目可以带提示导入原文，来源信息缺失会保留。正文缺失或来源不一致时需先修复。停用订阅会停止接收新内容，单篇导入不会重新启用订阅。删除已停用的订阅会移除订阅配置，已有正文、批注和选择记录保留。</footer>
 </main>
 </body></html>

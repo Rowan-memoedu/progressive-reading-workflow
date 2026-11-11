@@ -1338,11 +1338,13 @@ async function writeBrowserDraftCommitUnlocked(rawBody, destination = "reading",
         quality_status: preprocessing.qualityStatus,
         readable_with_warnings: preprocessing.readableWithWarnings,
         warning_codes: preprocessing.warningCodes
-      } : originalImport ? {processing_mode:'original_text',llm_used:false,quality_status:'ready'} : {}),
+      } : originalImport ? {processing_mode:'original_text',llm_used:false,
+        quality_status:draft.sourceMetadata.accepted_import_warnings?.length?'warning':'ready',
+        warning_codes:(draft.sourceMetadata.accepted_import_warnings||[]).map(w=>w.code)} : {}),
       raw_markdown_sha256: rawMarkdownSha256,
       final_markdown_sha256: finalMarkdownSha256
     },
-    warnings: [...(preprocessing?.warningCodes || []), ...(converted.fidelity?.warnings || [])],
+    warnings: [...(preprocessing?.warningCodes || []), ...(converted.fidelity?.warnings || []), ...(originalImport?(draft.sourceMetadata.accepted_import_warnings||[]).map(w=>w.code):[])],
     errors: []
   };
 }
@@ -1636,7 +1638,8 @@ async function processBackgroundImportWorker(requestId, workerIndex) {
         if (task.capture_mode === "page_snapshot" && !retainedRss) {
           await onProgress({ stage: "capture_conversion" });
           const snapshot = await browserImportBroker.getTaskSnapshot(task.id);
-          const result = await writeBrowserDraftCommit(snapshot, "reading", { standardize: true, onProgress });
+          const result = await writeBrowserDraftCommit(snapshot, "reading", { standardize: task.processing_mode!=='original_text', onProgress, cachedRssMarkdown:snapshot.draft?.cachedRssMarkdown });
+          if(result.receipt?.quality_status==='warning')result.status='imported_with_warnings';
           await browserImportBroker.completeTask(task.id, { ok: true, result, leaseToken: task.lease_token });
           return;
         }
@@ -2561,7 +2564,7 @@ function browserHighlightTestHtml() {
 
 async function handle(req, res) {
   const url = new URL(req.url || "/", "http://127.0.0.1");
-  if (await handleSubscriptions(req, res, workflowRoot)) return;
+  if (await handleSubscriptions(req, res, workflowRoot,{broker:browserImportBroker,runRequest:processBackgroundImportRequest})) return;
   if (req.method === 'POST' && url.pathname.startsWith('/api/rss-reading/') && existsSync(path.join(workflowRoot, 'imports', 'subscriptions', 'active.json'))) {
     return sendJson(res, 409, { error: '已切换统一订阅流程，请在 /subscriptions 管理订阅，并在 Markdown 报告中勾选材料。' });
   }

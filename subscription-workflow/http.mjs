@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { codeRoot, loadConfig, saveSource, deleteSource } from './config.mjs';
 import { status, enqueue, enqueueVideoRequest, launchWorker, resolveMode, JOB_KINDS } from './service.mjs';
+import {importWithWarnings} from './import-issues.mjs';
 
 const assets = new Map([['/subscriptions',['index.html','text/html']],['/subscriptions/',['index.html','text/html']],
   ['/subscriptions/app.mjs',['app.mjs','text/javascript']],['/subscriptions/style.css',['style.css','text/css']]]);
@@ -19,7 +20,7 @@ async function body(req) {
   let text=''; for await(const chunk of req){text+=chunk;if(Buffer.byteLength(text)>32768)throw new Error('请求过大');}
   return JSON.parse(text || '{}');
 }
-export async function handleSubscriptions(req,res,root=codeRoot) {
+export async function handleSubscriptions(req,res,root=codeRoot,context={}) {
   const url=new URL(req.url,'http://127.0.0.1');
   if(!assets.has(url.pathname)&&!url.pathname.startsWith('/api/subscriptions'))return false;
   try {
@@ -30,10 +31,12 @@ export async function handleSubscriptions(req,res,root=codeRoot) {
         'Content-Security-Policy':"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",'Referrer-Policy':'no-referrer'});
       res.end(content);return true;
     }
-    if(req.method==='GET'&&url.pathname==='/api/subscriptions'){json(res,200,await status(root));return true;}
+    if(req.method==='GET'&&url.pathname==='/api/subscriptions'){json(res,200,await status(root,context));return true;}
     if(req.method!=='POST'){json(res,405,{error:'此操作不支持该请求方法'});return true;}
     const input=await body(req);
-    if(url.pathname==='/api/subscriptions/source') {
+    if(url.pathname==='/api/subscriptions/import-warning'){
+      json(res,202,await importWithWarnings(root,input,context));
+    } else if(url.pathname==='/api/subscriptions/source') {
       const result=await saveSource(root,input.source,{expectedRevision:input.revision});
       json(res,200,result);
     } else if(url.pathname==='/api/subscriptions/source/delete') {
