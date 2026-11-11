@@ -18,6 +18,7 @@ import { refreshObsidianLinks } from '../subscription-workflow/obsidian-links.mj
 import { loadSubscriptionRegistry } from '../rss-source/subscriptions.mjs';
 import { active as unifiedActive, canonicalCatalog, mergeIdentity, findExistingPublication } from '../subscription-workflow/catalog.mjs';
 import { findSourcePublication, withSourcePublication } from '../scripts/reading-source-library.mjs';
+import {savedReadingBody} from '../subscription-workflow/reading-body.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_WORKFLOW_ROOT = path.resolve(__dirname, "..");
@@ -850,13 +851,14 @@ async function buildConsumerRequest(item, mode) {
   if (!request) throw new Error(`preview_request_missing:${item.material_id}`);
   if(mode==='saved_reading') {
     const saved=await fs.readFile(item.publication.path,'utf8');
-    const body=parseReadingSections(saved).translated;
+    const {body,structured:standard}=savedReadingBody(saved);
     if(!body)throw new Error(`saved_reading_body_missing:${item.material_id}`);
+    const language=standard?'zh':request.source_metadata?.language;
     return {...request,material:{markdown:boundedScreeningExcerpt(body)},
-      source_metadata:{...request.source_metadata,language:'zh'},
+      source_metadata:{...request.source_metadata,...(language?{language}:{})},
       user_instruction:consumerInstruction('long_review_excerpt',request.user_instruction),
       processing_options:standardWorkflowOptions({workflow_mode:'single_stage',cleaning_mode:'source_voice_structuring',
-        input_form:'written',source_language:'zh',content_profile:'natural_language',
+        input_form:'written',...(language?{source_language:language}:{}),content_profile:'natural_language',
         spoken_to_written:false,structure_body:false,translate:false,include_reading_guide:true,
         insight_soft_min:1,insight_soft_max:3,insight_safety_cap:5})};
   }
@@ -1939,7 +1941,8 @@ export async function prepareSubscriptionPreviews(workflowRoot = DEFAULT_WORKFLO
     await recordBlockedArticles(synced.paths,synced.ledger);
   }
   const activeIds = new Set(synced.catalog.items.map(item => item.materialId));
-  const items = Object.values(synced.ledger.items).filter(item => activeIds.has(item.material_id) && item.eligible_for_preprocess
+  const selectedIds=options.materialIds?new Set(options.materialIds):null;
+  const items = Object.values(synced.ledger.items).filter(item => (!selectedIds||selectedIds.has(item.material_id)) && activeIds.has(item.material_id) && item.eligible_for_preprocess
     && (item.decision === 'unresolved' || (directArticle(item) && item.decision === 'selected' && !item.publication)) && (!platform || (item.platform || 'rss') === platform)
     && (item.route === 'long_review' || item.route === 'short_aggregate'));
   const result = await ensureReviewPreviews(synced.paths, items, {

@@ -243,6 +243,22 @@ test('unchanged full text does not trigger a revision merely because metadata ch
   const after=await syncLedger(f.root);assert.equal(after.ledger.items[record.material_id].available_revision,undefined);
 });
 
+test('targeted previews recognize saved original bodies, retain language and never rewrite the article',async()=>{
+  const f=await fixture();f.source.direct_reading=true;await writeJson(paths(f.root).config,f.config);
+  const record=await addText(f),other=await addText(f,{url:'https://zhuanlan.zhihu.com/p/456'});
+  const synced=await syncLedger(f.root),item=synced.ledger.items[record.material_id];
+  const request=await readJson(item.preprocess_request_path);request.source_metadata.language='en';await writeJson(item.preprocess_request_path,request);
+  const article=path.join(f.root,'阅读区','原文.md'),content='---\nsource_url: '+item.item_url+'\n---\n# Original\n\n'+('Complete source evidence and concrete examples.\n\n').repeat(80)+'\n> Retained annotation.\n';
+  await fs.writeFile(article,content);item.publication={status:'published',path:article};item.review_preview={status:'failed',error:'saved_reading_body_missing'};
+  await writeJson(f.reading.ledgerPath,synced.ledger);
+  let calls=0;
+  await prepareSubscriptionPreviews(f.root,'zhihu',{materialIds:[record.material_id],previewRunner:async context=>{
+    calls++;assert.equal(context.item.material_id,record.material_id);assert.equal(context.variant,'saved_reading');assert.equal(context.request.source_metadata.language,'en');assert.equal(context.request.processing_options.source_language,'en');assert.match(context.request.material.markdown,/Complete source evidence/u);return previewRunner(context);
+  }});
+  assert.equal(calls,1);assert.equal(await fs.readFile(article,'utf8'),content);
+  const after=await loadLedger(f.root);assert.equal(after.items[record.material_id].review_preview.status,'ready');assert.equal(after.items[other.material_id].review_preview,undefined);
+});
+
 test('saved checkbox becomes a durable action and uses existing article without changing annotations',async()=>{
   const f=await fixture(),record=await addText(f);const report=await generateSummaries(f.root,{date:'2026-11-06',mode:'daily',previewRunner});
   const target=report.outputs.daily.path,body=await fs.readFile(target,'utf8');await fs.writeFile(target,body.replace('- [ ] 正式入库','- [x] 正式入库'));

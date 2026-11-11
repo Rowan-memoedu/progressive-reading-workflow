@@ -205,9 +205,11 @@ export class BrowserImportBroker {
     processingOptions = {},
     browserSnapshot = null,
     siteImport = null,
-    articleSource = null
+    articleSource = null,
+    subscriptionMaterialId = null
   } = {}) {
     const normalizedMode = normalizeProcessingMode(processingMode);
+    if(subscriptionMaterialId!==null&&!/^[A-Za-z0-9_.-]{1,120}$/u.test(subscriptionMaterialId))throw new Error('invalid_subscription_material_id');
     const normalizedOptions = await checkedProcessingOptions(processingOptions);
     return this.withLock(async () => {
       const normalized = [...new Set((urls || []).map((value) => String(value || "").trim()).filter(Boolean))];
@@ -217,6 +219,7 @@ export class BrowserImportBroker {
       if (normalizedClientRequestId) {
         const existing = this.state.requests.find((item) => item.clientRequestId === normalizedClientRequestId);
         if (existing) {
+          if((existing.subscriptionMaterialId||null)!==subscriptionMaterialId)throw new Error('browser_import_client_request_context_conflict');
           if (normalizeProcessingMode(existing.processingMode)!==normalizedMode) throw new Error('browser_import_client_request_mode_conflict');
           if (stableJson(existing.processingOptions || {}) !== stableJson(normalizedOptions)) throw new Error('browser_import_client_request_options_conflict');
           return this.requestSummary(existing.id);
@@ -234,6 +237,7 @@ export class BrowserImportBroker {
         destinationFolder: String(destinationFolder || ""),
         processingMode: normalizedMode,
         processingOptions: normalizedOptions,
+        ...(subscriptionMaterialId?{subscriptionMaterialId}:{}),
         createdAt,
         updatedAt: createdAt
       };
@@ -451,6 +455,7 @@ export class BrowserImportBroker {
     return {
       request_id: request.id,
       source: request.source,
+      ...(request.subscriptionMaterialId?{subscription_material_id:request.subscriptionMaterialId}:{}),
       client_request_id: request.clientRequestId || null,
       entry_route: request.entryRoute || "default",
       destination_folder: request.destinationFolder || "",

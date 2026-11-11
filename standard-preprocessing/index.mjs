@@ -12,6 +12,7 @@ import {
   REQUEST_SCHEMA_VERSION,
   RESULT_SCHEMA_VERSION,
   materialIdentityForRequest,
+  normalizeMetadata,
   processMaterial,
   renderReadingMarkdown,
   sha256,
@@ -885,7 +886,7 @@ export async function runStandardPreprocessingWorkflow(request, options = {}) {
       schema_version: RESULT_SCHEMA_VERSION, contract_version: CONTRACT_VERSION,
       status: "needs_classification", processing_state: "needs_classification",
       material_id: materialId, idempotency_key: request.idempotency_key || null,
-      translation_state: "unknown", artifacts: {}, source_metadata: request.source_metadata,
+      translation_state: "unknown", artifacts: {}, source_metadata: normalizeMetadata(request.source_metadata),
       receipt: {
         processor_version: PROCESSOR_VERSION, prompt_version: PROMPT_VERSION,
         created_at: options.now || new Date().toISOString(),

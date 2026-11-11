@@ -9,6 +9,7 @@ import { generateSummaries, prepareSubscriptionPreviews, processMarkdownDecision
 import { publicationMetadata } from './publication-time.mjs';
 import { recordExceptions, acknowledgeExceptions, exceptionFile } from './exception-log.mjs';
 import { normalizeVideoRequest, runVideoRequest } from './video-request.mjs';
+import {subscriptionImportIssues,readableImportError} from './import-issues.mjs';
 
 const execute = promisify(execFile);
 export const JOB_KINDS = ['rss','bilibili','zhihu','daily','weekly','decisions','retry','video_import'];
@@ -377,7 +378,7 @@ export async function resolveMode(root,id,mode) {
   });
 }
 
-export async function status(root = codeRoot) {
+export async function status(root = codeRoot,{broker}={}) {
   const p=paths(root),config=await loadConfig(root),jobs=await jobList(root);
   if(!config)return {initialized:false};
   const text=await readJson(path.join(config.rss_home,'state.json'),{items:{}}),video=await readJson(path.join(config.video_home,'state.json'),{entries:{}});
@@ -396,8 +397,7 @@ export async function status(root = codeRoot) {
   const reports=[...new Set([...(ledger.report_runs?.daily?Object.values(ledger.report_runs.daily).map(r=>r.path):[]),
     ...Object.values(ledger.report_runs?.weekly||{}).flatMap(r=>[r.long_weekly?.path,r.short_weekly?.path]),
     ...jobs.flatMap(j=>Object.values(j.result?.outputs||{}).filter(o=>o?.path&&o.path.endsWith('.md')).map(o=>o.path))].filter(file=>file && existsSync(file)))].sort((a,b)=>reportDate(b)-reportDate(a)||a.localeCompare(b)).slice(0,8);
-  const failures=reportRows.filter(i=>i.route!=='import_activity'&&(i.publication_failure||i.review_preview?.status==='failed'||(!i.eligible_for_preprocess&&i.decision==='unresolved')))
-    .map(i=>({id:i.material_id,title:i.title,error:i.publication_failure?.error||i.review_preview?.error||i.review_preview?.reason||i.source_errors?.[0]?.message||i.content_status,status:'blocked'}));
+  const failures=await subscriptionImportIssues(root,reportRows.filter(i=>i.route!=='import_activity'&&(i.publication_failure||i.review_preview?.status==='failed'||(!i.eligible_for_preprocess&&i.decision==='unresolved'))),{broker});
   return {initialized:true,enabled:config.enabled,revision:config.revision,schedule:config.schedule,
     exception_path:existsSync(exceptionFile(root)) ? exceptionFile(root) : null,
     subscriptions:config.subscriptions.map(({watch,...s})=>s), heartbeat:await readJson(path.join(p.home,'heartbeat.json')),
@@ -405,7 +405,7 @@ export async function status(root = codeRoot) {
     pending_job_count:jobs.filter(j=>['running','queued'].includes(j.status)).length,
     jobs:[...jobs.filter(j=>j.status==='running'),...jobs.filter(j=>j.status==='queued'),...jobs.filter(j=>!['running','queued'].includes(j.status)).reverse()].slice(0,25)
       .map(({steps,...job})=>({...job,steps:Object.entries(steps||{}).map(([name,s])=>({name,done:s.done}))})),
-    conflicts:entries.filter(i=>i.status==='route_conflict'), pending:entries.filter(i=>['pending','processing','running','waiting_source','blocked','source_blocked','verification_failed','retry_wait'].includes(i.status)),
-    failures, zhihu_sources:zhihu.sources, zhihu_validation:await readJson(path.join(p.home,'zhihu-validation.json')), reports, updates:reportRows.filter(i=>i.available_revision).map(i=>({title:i.title,url:i.item_url})),
+    conflicts:entries.filter(i=>i.status==='route_conflict'), pending:entries.filter(i=>['pending','processing','running','waiting_source','blocked','source_blocked','verification_failed','retry_wait'].includes(i.status)).map(i=>({...i,error:i.error?readableImportError(i.error):null,severity:['blocked','source_blocked','verification_failed','waiting_source'].includes(i.status)?'blocking':undefined})),
+    failures,import_issues:failures, zhihu_sources:zhihu.sources, zhihu_validation:await readJson(path.join(p.home,'zhihu-validation.json')), reports, updates:reportRows.filter(i=>i.available_revision).map(i=>({title:i.title,url:i.item_url})),
     counts:entries.reduce((a,i)=>{a[i.status]=(a[i.status]||0)+1;return a;},{}), config_path:p.config};
 }
