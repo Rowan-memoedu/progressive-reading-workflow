@@ -8,7 +8,7 @@ import { artifactPath } from '../scripts/runtime-paths.mjs';
 import{scopedNetscapeCookies}from'./run-authenticated.mjs';
 import{biliApi,canonicalUrl}from'./watch-core.mjs';
 import{verifyUpstream}from'./import-transcript.mjs';
-import{assertIllustratedWatch,watchJobDir,runWatchedIllustrated,VIDEO_PYTHON}from'./watch-illustrated.mjs';
+import{assertIllustratedWatch,watchJobDir,runWatchedIllustrated,prepareIllustratedAttempt,VIDEO_PYTHON}from'./watch-illustrated.mjs';
 const execute=promisify(execFile),root=import.meta.dirname;
 export const WATCH_ARTIFACTS=artifactPath('ProgressiveReading','video-watch');
 export const PROCESSING_OPTIONS={workflow_mode:'standard',input_form:'spoken_transcript',content_profile:'natural_language',
@@ -106,17 +106,22 @@ export async function prepareWatchSource(item,watch,artifactRoot,acquire=acquire
 
 export async function processWatchItem(item,watch,{artifactRoot=WATCH_ARTIFACTS,acquire,runFlow=runWatchedIllustrated,command=execute,onProgress=async()=>{}}={}){
   assertIllustratedWatch(watch);
-  const jobDir=watchJobDir(artifactRoot,item),runDir=jobDir+'/run';
+  const jobDir=watchJobDir(artifactRoot,item),legacyRun=jobDir+'/run';
+  let runDir=legacyRun;
   // Fail before any body/guide call if the post-publication renderer is absent.
   try{await command(VIDEO_PYTHON,[
     '-c','import markdown_it, playwright.sync_api, PIL, yt_dlp'],{windowsHide:true});}
   catch{throw Error('video_render_runtime_unavailable: install video-workflow/render-requirements.txt');}
   const acquired=await prepareWatchSource(item,watch,artifactRoot,acquire);
   if(acquired.status==='waiting_source')return acquired;
-  const sourceDir=acquired.sourceDir;
+  let sourceDir=acquired.sourceDir;
   // Preserve a completed receipt; never rerun an already published article.
   let receipt;
   try{receipt=await read(runDir+'/illustrated-receipt.json');}catch(error){if(error.code!=='ENOENT')throw error;}
+  if(receipt?.status!=='completed'&&item.resume_mode!=='verification_only'){
+    ({sourceDir,runDir}=await prepareIllustratedAttempt({item,watch,sourceDir,runDir,processingOptions:PROCESSING_OPTIONS}));
+    receipt=await read(runDir+'/illustrated-receipt.json').catch(error=>{if(error.code==='ENOENT')return null;throw error;});
+  }
   if(!receipt&&item.resume_mode==='verification_only')throw Error('saved_receipt_missing_no_regeneration_allowed');
   if(!receipt){
     try{await fs.access(item.publish_path);throw Error('publication_already_exists_without_matching_receipt');}
@@ -132,7 +137,7 @@ export async function processWatchItem(item,watch,{artifactRoot=WATCH_ARTIFACTS,
   if(receipt.output_type!=='illustrated'||receipt.model_route?.provider!=='codex_exec'||receipt.model_route?.model!==watch.model
     ||!receipt.body_prompt_unchanged||!(receipt.counts?.images>0)||!(receipt.counts?.mermaid>0)
     ||receipt.capture?.frame_review?.status!=='passed')throw Error('unexpected_video_watch_workflow');
-  const actualRun=receipt.board_correction?.run_dir||runDir,actualSource=receipt.board_correction?.source_dir||sourceDir;
+  const actualRun=receipt.board_correction?.run_dir||receipt.watch_attempt?.runDir||runDir,actualSource=receipt.board_correction?.source_dir||receipt.watch_attempt?.sourceDir||sourceDir;
   const publication=await read(actualRun+'/video-receipt.json');
   if(publication.refinement?.mode!=='strong_structuring'||publication.reading_guide?.status!=='generated')throw Error('unexpected_video_watch_body_or_guide');
   await onProgress({stage:'verify_publication',part:item.part});
@@ -140,6 +145,11 @@ export async function processWatchItem(item,watch,{artifactRoot=WATCH_ARTIFACTS,
   await command(VIDEO_PYTHON,[root+'/verify-rendering.py','--markdown',receipt.publication.path,'--output',jobDir+'/rendering'],{windowsHide:true,maxBuffer:4*1024*1024});
   const rendered=await read(jobDir+'/rendering/render-verification.json');
   if(rendered.status!=='passed')throw Error('video_watch_rendering_not_passed');
+  if(runDir!==legacyRun){
+    const file=path.join(legacyRun,'illustrated-receipt.json');
+    try{await fs.writeFile(file,JSON.stringify({...receipt,watch_attempt:{...receipt.watch_attempt,runDir,sourceDir}},null,2)+'\n',{flag:'wx'});}
+    catch(error){if(error.code!=='EEXIST')throw error;}
+  }
   return {status:'completed',publication:receipt.publication.path,runDir:actualRun,workflow:'illustrated',model:watch.model,
     media:receipt.counts,rendering:rendered.status};
 }
@@ -148,8 +158,8 @@ export async function verifyPublishedForResume(item){
   const jobDir=watchJobDir(WATCH_ARTIFACTS,item);
   const illustrated=await read(jobDir+'/run/illustrated-receipt.json');
   if(illustrated.status!=='completed'||illustrated.output_type!=='illustrated')throw Error('completed_illustrated_publication_required');
-  const runDir=illustrated.board_correction?.run_dir||jobDir+'/run';
-  const sourceDir=illustrated.board_correction?.source_dir||jobDir+'/source';
+  const runDir=illustrated.board_correction?.run_dir||illustrated.watch_attempt?.runDir||jobDir+'/run';
+  const sourceDir=illustrated.board_correction?.source_dir||illustrated.watch_attempt?.sourceDir||jobDir+'/source';
   const receipt=await read(runDir+'/video-receipt.json');
   if(receipt.status!=='completed'||path.resolve(receipt.publication.markdown.path)!==path.resolve(item.publish_path)
     ||receipt.refinement?.mode!=='strong_structuring'||receipt.reading_guide?.status!=='generated')throw Error('matching_completed_publication_required');

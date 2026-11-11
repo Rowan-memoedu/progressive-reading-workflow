@@ -8,6 +8,7 @@ import {diagnoseImportIssue,subscriptionImportIssues} from '../subscription-work
 import {savedReadingBody} from '../subscription-workflow/reading-body.mjs';
 import {startFixture} from '../scripts/browser-import-web/fixture.mjs';
 import {JSDOM} from 'jsdom';
+import {syncLedger,setDecision,publicationGate,LEDGER_SCHEMA} from '../rss-reading/core.mjs';
 
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
 async function until(fn){for(let i=0;i<200;i++){const result=await fn();if(result)return result;await wait(100);}throw Error('fixture_timeout');}
@@ -23,6 +24,7 @@ test('optional provenance warnings can publish through the real background worke
     await fs.writeFile(path.join(f.root,'rss','RSS 自动导入.md'),'```json\n{"enabled":false}\n```\n## ① 标准流程导入\n## ② 原文直接导入\n## ③ 日报与周报\n');
     await writeJson(path.join(f.root,'video','watchlist.json'),{watches:[]});
     await writeJson(path.join(f.root,'video','state.json'),{entries:{}});
+    await writeJson(path.join(f.workflowRoot,'imports/rss/legacy-v0/review-decisions.json'),{schema_version:'progressive-reading.rss-legacy-review-ledger/v1',decisions:Array.from({length:22},(_,i)=>({decision_id:'legacy-'+i,item_url:'https://legacy.test/'+i,title:'历史 '+i,decision:i<14?'formal_selected':'unresolved'}))});
     const config=await initialize(f.workflowRoot,{home:path.join(f.root,'subscriptions'),rssHome:path.join(f.root,'rss'),videoHome:path.join(f.root,'video')});
     config.enabled=true;
     const source=normalizeSource({kind:'zhihu_author',name:'合成停用来源',url:'https://www.zhihu.com/people/fixture',mode:'reports',enabled:false});
@@ -67,6 +69,29 @@ test('optional provenance warnings can publish through the real background worke
     assert.equal(await fs.readFile(publication.path,'utf8'),annotated);
     assert.equal((await loadConfig(f.workflowRoot)).subscriptions[0].enabled,false);
     const current=await (await fetch(f.baseUrl+'/api/subscriptions')).json();assert.equal(current.import_issues[0].can_import,false);assert.equal(current.import_issues[0].status,'imported_with_warnings');
+    assert.equal(current.import_issues[0].can_delete,false);
+    const remove=async id=>{const response=await fetch(f.baseUrl+'/api/subscriptions/import-warning/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});return {response,data:await response.json()};};
+    assert.equal((await remove(item.material_id)).response.status,400,'an accepted import cannot be silently removed');
+    const deletedItem={...item,material_id:'fixture-delete',item_url:'https://fixture.test/deleted',preprocess_request_path:path.join(f.root,'delete-request.json')};
+    await writeJson(deletedItem.preprocess_request_path,{...request,source_metadata:{...request.source_metadata,source_url:deletedItem.item_url}});
+    const ledgerFile=path.join(f.workflowRoot,'imports/rss-reading/review-ledger.v1.json');
+    await writeJson(ledgerFile,{schema_version:LEDGER_SCHEMA,items:{[deletedItem.material_id]:deletedItem}});
+    const deletedDom=new JSDOM(html,{url:f.baseUrl+'/subscriptions',runScripts:'outside-only'});
+    let deletionError;deletedDom.window.fetch=async(url,options)=>{const response=await fetch(new URL(url,f.baseUrl),options);if(!response.ok)deletionError=(await response.clone().json()).error;return response;};deletedDom.window.AbortController=AbortController;deletedDom.window.setInterval=()=>0;
+    await deletedDom.window.eval('(async()=>{'+code+'})()');
+    const deleteButton=deletedDom.window.document.querySelector('#queue button.danger');assert.equal(deleteButton.textContent,'删除');deleteButton.click();
+    assert.ok(deletedDom.window.document.querySelector('#queue button:not(.danger)').disabled,'paired import button is disabled during deletion');
+    await until(()=>deletedDom.window.document.querySelector('#message').textContent);
+    assert.equal(deletedDom.window.document.querySelector('#message').textContent,'已从队列删除，不再导入。',deletionError);
+    await until(()=>!deletedDom.window.document.querySelector('#queue button.danger'));
+    assert.deepEqual((await (await fetch(f.baseUrl+'/api/subscriptions')).json()).import_issues,[]);
+    assert.equal((await remove(deletedItem.material_id)).response.status,200,'deletion retries are idempotent');
+    await syncLedger(f.workflowRoot);
+    const deletedState=(await readJson(ledgerFile)).items[deletedItem.material_id];assert.equal(deletedState.decision,'dismissed');assert.ok(deletedState.import_queue_dismissed);assert.equal(publicationGate({...deletedState,decision:'selected',publication_authorized:true}).allowed,false);
+    await assert.rejects(setDecision(f.workflowRoot,deletedItem.material_id,'selected'),/已从导入队列删除/u);
+    const rejectedImport=await post({id:deletedItem.material_id,client_request_id:randomUUID()});assert.equal(rejectedImport.response.status,400);assert.match(rejectedImport.data.error,/已删除/u);
+    assert.equal(await fs.readFile(deletedItem.preprocess_request_path,'utf8'),JSON.stringify({...request,source_metadata:{...request.source_metadata,source_url:deletedItem.item_url}},null,2)+'\n');
+    assert.equal(await fs.readFile(publication.path,'utf8'),annotated);deletedDom.window.close();
     const badItem={...missing,material_id:'missing-body'};
     await writeJson(path.join(f.workflowRoot,'imports/rss-reading/review-ledger.v1.json'),{items:{[badItem.material_id]:badItem}});
     const blocked=await post({id:badItem.material_id,client_request_id:randomUUID()});assert.equal(blocked.response.status,400);assert.match(blocked.data.error,/完整正文/u);

@@ -19,6 +19,35 @@ const hash=value=>createHash('sha256').update(value).digest('hex');
 export const sameStrongPrompt=(left,right)=>String(left).replace(/\r\n/gu,'\n')===String(right).replace(/\r\n/gu,'\n');
 export const watchJobDir=(artifactRoot,item)=>path.join(artifactRoot,item.bvid+'-cid'+item.cid,'illustrated');
 
+// Frozen attempts are reusable only for the same source and workflow. A newer
+// source, prompt or setting gets its own attempt, preserving earlier evidence.
+export async function prepareIllustratedAttempt({item,watch,sourceDir,runDir,processingOptions={}}){
+  const prompt=await fs.readFile(path.join(root,'../standard-preprocessing/prompts/强结构化整理.md'));
+  if(!sameStrongPrompt(prompt,await fs.readFile('D:/Projects/AudioWorkflow/prompts/refine.md')))throw Error('strong_prompt_alignment_mismatch');
+  const transcript=await fs.readFile(path.join(sourceDir,'transcript.json'));
+  const implementation=await Promise.all(['watch-illustrated.mjs','illustrated-strong.mjs','import-transcript.mjs','automate-board-correction.mjs'].map(name=>fs.readFile(path.join(root,name))));
+  const identity={version:'video-watch-illustrated/v2',entry:'importIllustratedStrong',provider:'codex_exec',model:watch.model,
+    source:'full_part_transcript',body_prompt_sha256:hash(prompt),media_policy:watch.media_policy,
+    frame_policy:watch.frame_policy||WATCH_FRAME_POLICY,processing_options:processingOptions,
+    workflow_sha256:hash(Buffer.concat(implementation)),key:item.key,subtitle_sha256:hash(transcript)};
+  const bytes=JSON.stringify(identity,null,2)+'\n',fingerprint=hash(bytes);
+  const previous=await fs.readFile(path.join(runDir,'watch-pipeline.json'),'utf8').catch(error=>{if(error.code==='ENOENT')return null;throw error;});
+  if(previous!==null&&previous!==bytes){
+    const attempt=path.join(path.dirname(runDir),'revisions',fingerprint.slice(0,24));
+    const originalSource=sourceDir;sourceDir=path.join(attempt,'source');runDir=path.join(attempt,'run');
+    await fs.mkdir(sourceDir,{recursive:true});
+    for(const name of ['transcript.json','source.json']){
+      const data=name==='transcript.json'?transcript:await fs.readFile(path.join(originalSource,name));
+      const file=path.join(sourceDir,name);
+      try{await fs.writeFile(file,data,{flag:'wx'});}catch(error){if(error.code!=='EEXIST'||!(await fs.readFile(file)).equals(data))throw Error('frozen_attempt_source_conflict');}
+    }
+  }
+  await fs.mkdir(runDir,{recursive:true});
+  const file=path.join(runDir,'watch-pipeline.json');
+  try{await fs.writeFile(file,bytes,{flag:'wx'});}catch(error){if(error.code!=='EEXIST'||await fs.readFile(file,'utf8')!==bytes)throw Error('frozen_attempt_identity_conflict');}
+  return {sourceDir,runDir,identity_sha256:fingerprint};
+}
+
 export function assertIllustratedWatch(watch){
   if(watch.workflow!==WATCH_WORKFLOW||watch.media_policy!=='generated_and_reviewed'||watch.body_mode!=='strong_structuring'
     ||watch.provider!=='codex_exec'||!watch.model)throw Error('watch_requires_explicit_illustrated_workflow');
@@ -54,15 +83,8 @@ export async function captureAndReview({inputDir,outputDir,cookiesFile,command=e
 export async function runWatchedIllustrated({item,watch,sourceDir,runDir,processingOptions,
   importFlow=importIllustratedStrong,cookies=withCaptureCookies,capture=captureAndReview,completeBoard=automateBoardCorrection,onProgress=async()=>{}}){
   assertIllustratedWatch(watch);
-  const prompt=await fs.readFile(path.join(root,'../standard-preprocessing/prompts/强结构化整理.md'));
-  if(!sameStrongPrompt(prompt,await fs.readFile('D:/Projects/AudioWorkflow/prompts/refine.md')))throw Error('strong_prompt_alignment_mismatch');
-  await fs.mkdir(runDir,{recursive:true});
-  const identity={version:'video-watch-illustrated/v1',entry:'importIllustratedStrong',provider:'codex_exec',model:watch.model,
-    source:'full_part_transcript',body_prompt_sha256:hash(prompt),media_policy:watch.media_policy,
-    key:item.key,subtitle_sha256:hash(await fs.readFile(path.join(sourceDir,'transcript.json')))};
-  const file=path.join(runDir,'watch-pipeline.json'),bytes=JSON.stringify(identity,null,2)+'\n';
-  try{await fs.writeFile(file,bytes,{flag:'wx'});}
-  catch(error){if(error.code!=='EEXIST'||await fs.readFile(file,'utf8')!==bytes)throw Error('watch_pipeline_identity_changed');}
+  const attempt=await prepareIllustratedAttempt({item,watch,sourceDir,runDir,processingOptions});
+  ({sourceDir,runDir}=attempt);
   const settings={AI_PRODUCER_PROVIDER:'codex_exec',AI_PRODUCER_CODEX_MODEL:watch.model,
     AI_PRODUCER_TIMEOUT_MS:process.env.AI_PRODUCER_TIMEOUT_MS||'1800000',
     PR_GUIDE_RESPONSE_CACHE_DIR:path.join(path.dirname(runDir),'provider-responses')};
@@ -80,7 +102,7 @@ export async function runWatchedIllustrated({item,watch,sourceDir,runDir,process
         await onProgress({stage:'generate_body_and_guide',part:item.part});
         receipt=await importFlow(args);
       }
-      return receipt;
+      return {...receipt,watch_attempt:attempt};
     });
   }finally{for(const [key,value]of Object.entries(old))if(value===undefined)delete process.env[key];else process.env[key]=value;}
 }

@@ -1575,14 +1575,24 @@ export async function generateSummaries(workflowRoot = DEFAULT_WORKFLOW_ROOT, op
 
 export async function setDecision(workflowRoot, materialId, decision, options = {}) {
   if (!DECISIONS.has(decision)) throw new Error(`decision_invalid:${decision}`);
-  const { paths, ledger } = await syncLedger(workflowRoot);
+  const { paths, ledger } = options.syncCatalog===false
+    ? {paths:workflowPaths(workflowRoot),ledger:await loadLedger(workflowRoot)}
+    : await syncLedger(workflowRoot);
   const item = ledger.items[materialId];
   if (!item) throw new Error(`material_not_found:${materialId}`);
+  if(item.import_queue_dismissed&&decision!=='dismissed')throw new Error('该条目已从导入队列删除。');
   const authorize = Boolean(options.authorize);
   if (authorize && decision !== "selected") throw new Error("publication_authorization_requires_selected");
   item.decision = decision;
   item.decision_source = options.source || "summary_panel";
   item.decision_at = nowIso();
+  if(options.dismissImport&&decision==='dismissed'){
+    item.import_queue_dismissed={at:item.decision_at,source:options.source||'subscription_queue'};
+    item.delivery ||= {};
+    item.delivery.active_review_path=null;
+    delete item.pending_markdown_action;
+    delete item.requested_action;
+  }
   item.publication_authorized = authorize;
   item.publication_authorization_source = authorize ? (options.source || "summary_panel") : null;
   addHistory(item, {
@@ -1598,6 +1608,7 @@ export async function setDecision(workflowRoot, materialId, decision, options = 
 
 export function publicationGate(item) {
   if (!item) return { allowed: false, reason: "material_not_found" };
+  if(item.import_queue_dismissed)return {allowed:false,reason:'import_queue_deleted'};
   if (item.decision !== "selected") return { allowed: false, reason: `decision_${item.decision}` };
   if (!item.publication_authorized) return { allowed: false, reason: "summary_publication_not_authorized" };
   if (!new Set(["summary_markdown", "summary_panel", "isolated_test"]).has(item.publication_authorization_source)) {

@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { codeRoot, loadConfig, saveSource, deleteSource } from './config.mjs';
 import { status, enqueue, enqueueVideoRequest, launchWorker, resolveMode, JOB_KINDS } from './service.mjs';
-import {importWithWarnings} from './import-issues.mjs';
+import {importWithWarnings,deleteQueuedImport} from './import-issues.mjs';
 
 const assets = new Map([['/subscriptions',['index.html','text/html']],['/subscriptions/',['index.html','text/html']],
   ['/subscriptions/app.mjs',['app.mjs','text/javascript']],['/subscriptions/style.css',['style.css','text/css']]]);
@@ -36,6 +36,8 @@ export async function handleSubscriptions(req,res,root=codeRoot,context={}) {
     const input=await body(req);
     if(url.pathname==='/api/subscriptions/import-warning'){
       json(res,202,await importWithWarnings(root,input,context));
+    } else if(url.pathname==='/api/subscriptions/import-warning/delete'){
+      json(res,200,await deleteQueuedImport(root,input,context));
     } else if(url.pathname==='/api/subscriptions/source') {
       const result=await saveSource(root,input.source,{expectedRevision:input.revision});
       json(res,200,result);

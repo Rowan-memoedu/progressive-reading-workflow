@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {reviewCapturedFrames} from './review-captured-frames.mjs';
-import {runWatchedIllustrated,captureAndReview,WATCH_MODEL,watchJobDir} from './watch-illustrated.mjs';
+import {runWatchedIllustrated,captureAndReview,WATCH_MODEL,watchJobDir,prepareIllustratedAttempt} from './watch-illustrated.mjs';
 import {prepareWatchSource,processWatchItem} from './watch-process.mjs';
 
 const hash=value=>createHash('sha256').update(value).digest('hex');
@@ -105,4 +105,18 @@ test('shared prompt parity tolerates Windows line endings but rejects changed ru
   const {sameStrongPrompt}=await import('./watch-illustrated.mjs');
   assert.equal(sameStrongPrompt('rule A\r\nrule B\r\n','rule A\nrule B\n'),true);
   assert.equal(sameStrongPrompt('rule A\n','changed rule\n'),false);
+});
+
+test('changed workflow or subtitles starts a resumable current attempt without overwriting frozen evidence',async()=>{
+  const root=await makeRoot(),sourceDir=root+'/source',runDir=root+'/run';await fs.mkdir(sourceDir,{recursive:true});await fs.mkdir(runDir,{recursive:true});
+  await fs.writeFile(sourceDir+'/transcript.json','{"segments":["original"]}');await fs.writeFile(sourceDir+'/source.json','{"source":"fixture"}');await fs.writeFile(sourceDir+'/book.md','obsolete generated book');
+  const old='{"version":"old","body_prompt_sha256":"previous"}\n';await fs.writeFile(runDir+'/watch-pipeline.json',old);await fs.writeFile(runDir+'/old-evidence.json','preserve');
+  const args={item:{key:'fixture-current'},watch,sourceDir,runDir,processingOptions:{structure_body:true}};
+  const latest=await prepareIllustratedAttempt(args);assert.notEqual(latest.runDir,runDir);assert.notEqual(latest.sourceDir,sourceDir);
+  assert.equal(await fs.readFile(runDir+'/watch-pipeline.json','utf8'),old);assert.equal(await fs.readFile(runDir+'/old-evidence.json','utf8'),'preserve');
+  assert.equal(await fs.readFile(latest.sourceDir+'/transcript.json','utf8'),'{"segments":["original"]}');assert.equal(await fs.stat(latest.sourceDir+'/book.md').then(()=>true,()=>false),false);
+  assert.deepEqual(await prepareIllustratedAttempt(args),latest,'same revision resumes the same attempt');
+  await fs.writeFile(sourceDir+'/transcript.json','{"segments":["newest"]}');
+  const newer=await prepareIllustratedAttempt(args);assert.notEqual(newer.runDir,latest.runDir);assert.equal(await fs.readFile(latest.sourceDir+'/transcript.json','utf8'),'{"segments":["original"]}');
+  const changedSetting=await prepareIllustratedAttempt({...args,processingOptions:{structure_body:false}});assert.notEqual(changedSetting.runDir,newer.runDir);
 });
