@@ -1,4 +1,4 @@
-"""Use AudioWorkflow's unmodified prompt and single-call implementation."""
+"""Use AudioWorkflow's original strong-structuring prompt and single-call implementation."""
 import argparse
 import hashlib
 import importlib.util

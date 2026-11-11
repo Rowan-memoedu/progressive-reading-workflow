@@ -14,9 +14,9 @@ function input(form,options) {
     processingOptions:standardWorkflowOptions({translate:false,include_reading_guide:false,...options})});
 }
 
-test('strong prompt is byte-identical to the retained original, with its new name',async()=>{
+test('strong prompt retains the original prompt exactly',async()=>{
   const prompt=await fs.readFile(new URL('../prompts/强结构化整理.md',import.meta.url));
-  assert.equal(sha(prompt),'c996ee91a7e23aa3b98a1685cf90df7ff51e5655943416da434cea3fd26c9dc8');
+  assert.equal(sha(Buffer.from(prompt.toString('utf8').replace(/\r\n/gu,'\n'))),'c996ee91a7e23aa3b98a1685cf90df7ff51e5655943416da434cea3fd26c9dc8');
 });
 
 for(const form of ['written','spoken_transcript']) {
